@@ -1,0 +1,109 @@
+name: Commit policy
+
+# Enforces the "no AI-attribution notes" rule from CONTRIBUTING.md.
+# Scans ONLY the commits newly introduced by this push / PR, plus the PR body.
+# It deliberately does NOT scan pre-existing history: the base of the range is
+# excluded, so commits that predate this policy are never re-judged.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  no-ai-notes:
+    name: no AI-attribution notes
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Need full history so base..HEAD ranges resolve to real commits.
+          fetch-depth: 0
+
+      - name: Check new commit messages and PR body
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          PUSH_AFTER: ${{ github.sha }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          set -euo pipefail
+
+          # --- Banned patterns (case-insensitive ERE). Mirrors CONTRIBUTING.md. ---
+          # 1. Co-Authored-By: lines naming an AI/assistant or a bot account.
+          # 2. "Co-authored with Claude/ChatGPT/Copilot".
+          # 3. "Generated with/by <AI tool>" machine-attribution lines (an AI
+          #    tool MUST be named, so innocent "generated with protoc" is fine).
+          # 4. The robot marker (literal emoji).
+          # 5. Bot commit emails: noreply@anthropic.com, or any [bot]@users.noreply.github.com
+          #    address. Human GitHub privacy emails (N+name@users.noreply.github.com)
+          #    are NOT banned.
+          BANNED='co-authored-by:.*(claude|anthropic|chatgpt|gpt|openai|copilot|gemini|bard|cursor|codex|codeium|windsurf|assistant|\[bot\])|co-authored with (claude|chatgpt|copilot|cursor)|generated (with|by) (claude|chatgpt|gpt|openai|copilot|gemini|bard|cursor|codex|codeium|windsurf|anthropic)|🤖|noreply@anthropic\.com|\[bot\]@users\.noreply\.github\.com'
+
+          # --- Resolve the exclusive commit range to scan. ---
+          range=""
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            # PR: every commit the PR adds on top of the base-branch commit it
+            # targets. github.event.pull_request.base.sha is the base-branch tip
+            # the PR targets, recorded at event time. Using it as the exclusive
+            # left side of the range guarantees the pre-existing base commits are
+            # never re-scanned (they are ancestors of, or equal to, this SHA).
+            range="${PR_BASE_SHA}..HEAD"
+          else
+            # push: only the commits this push added.
+            if [ "$PUSH_BEFORE" = "0000000000000000000000000000000000000000" ]; then
+              # First push of a new branch (no "before" commit). Nothing prior
+              # to diff against, so there is no in-range history to scan.
+              echo "First push (all-zero before SHA) — no prior commits to compare; skipping commit scan."
+              range=""
+            else
+              range="${PUSH_BEFORE}..${PUSH_AFTER}"
+            fi
+          fi
+
+          fail=0
+
+          # --- Scan in-range commit messages (subject + body). ---
+          if [ -n "$range" ]; then
+            echo "Scanning commit range: $range"
+            commits="$(git rev-list "$range")"
+            if [ -z "$commits" ]; then
+              echo "No new commits in range."
+            else
+              for sha in $commits; do
+                msg="$(git log -1 --format=%B "$sha")"
+                if printf '%s' "$msg" | grep -iEq "$BANNED"; then
+                  echo "::error::Banned AI-attribution note in commit $sha"
+                  echo "----- commit $sha -----"
+                  printf '%s\n' "$msg" | grep -iEn "$BANNED" || true
+                  echo "-----------------------"
+                  fail=1
+                fi
+              done
+            fi
+          fi
+
+          # --- Scan the PR body (only present on pull_request events). ---
+          if [ "$EVENT_NAME" = "pull_request" ] && [ -n "${PR_BODY:-}" ]; then
+            if printf '%s' "$PR_BODY" | grep -iEq "$BANNED"; then
+              echo "::error::Banned AI-attribution note in the pull request body"
+              echo "----- PR body offending line(s) -----"
+              printf '%s\n' "$PR_BODY" | grep -iEn "$BANNED" || true
+              echo "-------------------------------------"
+              fail=1
+            fi
+          fi
+
+          if [ "$fail" -ne 0 ]; then
+            echo ""
+            echo "Commit policy check failed. Remove AI-attribution notes (see CONTRIBUTING.md)."
+            exit 1
+          fi
+
+          echo "Commit policy check passed."

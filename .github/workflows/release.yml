@@ -14,15 +14,48 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Create GitHub Release
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Verify tag matches cc_usage.__version__
+        env:
+          GIT_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          # Install only enough to import the package and read its version.
+          python -m pip install --upgrade pip
+          python -m pip install -e .
+          pkg_version="$(python -c 'import cc_usage; print(cc_usage.__version__)')"
+          expected="v${pkg_version}"
+          echo "Pushed tag:        ${GIT_TAG}"
+          echo "Package version:   ${pkg_version}"
+          echo "Expected tag:      ${expected}"
+          if [ "${GIT_TAG}" != "${expected}" ]; then
+            echo "::error::Tag ${GIT_TAG} does not match cc_usage.__version__ (${expected}). Aborting release."
+            exit 1
+          fi
+          echo "Tag and package version are consistent."
+
+      - name: Build sdist + wheel
+        run: |
+          python -m pip install --upgrade build
+          python -m build
+
+      - name: Create GitHub Release (with built artifacts attached)
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
+          files: |
+            dist/*.whl
+            dist/*.tar.gz
 
   pypi-publish:
     # Build + publish to PyPI ONLY when a PYPI_API_TOKEN secret is configured.
     # The gate below makes the job a no-op (skipped) on repos without the secret,
-    # so PyPI is never hard-required.
+    # so PyPI is never hard-required. Runs after the GitHub Release (which already
+    # carries the wheel + sdist), so installs/updates never depend on PyPI.
     needs: github-release
     runs-on: ubuntu-latest
     steps:

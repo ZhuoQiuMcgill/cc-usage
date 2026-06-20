@@ -9,34 +9,42 @@ transcripts, a compact usage **heartbeat**, rolling spend windows, plus your off
 configuration — with arrow keys + Enter. There are no flags to memorize.**
 
 ```
-╭─ CC Usage ──────────────────────────────────────────────────────────╮
-│                                                                     │
-│  5-HOUR   ▓▓░░░░░░░░░░░░   1%  resets in 3h14m                       │
-│  WEEKLY   ▓▓░░░░░░░░░░░░  13%  resets in 5d03h                       │
-│  ─────────────────────────────────────────────────────────────────  │
-│  Spend      1h      5h      24h       7d   all-time                 │
-│  tokens   9.2M   51.0M   128.0M   402.0M       3.7B                 │
-│  cost    $8.40  $52.10  $131.50  $455.00  $4,120.00                 │
-│  ─────────────────────────────────────────────────────────────────  │
-│  heartbeat cost · 24h   (←/→ window · ↑/↓ metric)                   │
-│    $12.40 ⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⡇⠀⠀⠀⠀⠀⢠⠀⠀⠀                                  │
-│           ⠀⠀⠀⠀⠀⠀⠀⠀⠀⡆⢸⠀⠀⠀⣿⡆⢸⡇⠀⠀⣸⠀⠀⠀                                  │
-│      $6.20 ⠀⠀⠀⠀⠀⠀⠀⠀⠀⡇⢸⠀⠀⠀⣿⡇⣿⡇⠀⠀⣿⢰⡇⠀                                  │
-│     $4.10 ⠀⠀⠀⠀⠀⠀⠀⠀⠀⣿⣸⠀⠀⠀⣿⡇⣿⡇⠀⠀⣿⢸⡇⢸                                  │
-│         0 ⣀⣀⣀⣀⣀⣀⣀⣀⣠⣿⣿⣀⣀⣀⣿⣷⣿⣿⣠⣇⣿⣿⣇⣸                                  │
-│           -24h  -18h  -12h -6h now                                  │
-│           peak $12.40/bucket · 14:30 (3h ago)                       │
-│  ─────────────────────────────────────────────────────────────────  │
-│  By model · all-time                                                │
-│  Model        In    Out   Cache       Cost                          │
-│  Opus 4.8   2.6M  18.0M    2.7B  $2,600.00                          │
-│  Fable 5    610K   4.6M  920.0M  $1,510.00                          │
-│  Haiku 4.5   30K   210K   45.0M      $9.99                          │
-│  Total      3.2M  22.8M    3.7B  $4,120.00                          │
-│                                                                     │
-│  cost = API-equivalent value of tokens · you are on a subscription  │
-╰──────────────────────────────────────────────────────────────────────╯
+CC Usage
+─────────────────────────────────────────────────────────────────────
+
+5-HOUR   ▓▓░░░░░░░░░░░░   1%  resets in 3h14m
+WEEKLY   ▓▓░░░░░░░░░░░░  13%  resets in 5d03h
+─────────────────────────────────────────────────────────────────────
+
+Spend      1h      5h      24h       7d   all-time
+tokens   9.2M   51.0M   128.0M   402.0M       3.7B
+cost    $8.40  $52.10  $131.50  $455.00  $4,120.00
+─────────────────────────────────────────────────────────────────────
+
+heartbeat cost · 24h   (left/right = window · up/down = metric)
+$12.40 ⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⡇⠀⠀⠀⠀⠀⢠⠀⠀⠀
+       ⠀⠀⠀⠀⠀⠀⠀⠀⠀⡆⢸⠀⠀⠀⣿⡆⢸⡇⠀⠀⣸⠀⠀⠀
+ $6.20 ⠀⠀⠀⠀⠀⠀⠀⠀⠀⡇⢸⠀⠀⠀⣿⡇⣿⡇⠀⠀⣿⢰⡇⠀
+ $4.10 ⠀⠀⠀⠀⠀⠀⠀⠀⠀⣿⣸⠀⠀⠀⣿⡇⣿⡇⠀⠀⣿⢸⡇⢸
+     0 ⣀⣀⣀⣀⣀⣀⣀⣀⣠⣿⣿⣀⣀⣀⣿⣷⣿⣿⣠⣇⣿⣿⣇⣸
+       -24h  -18h  -12h  -6h  now
+       peak $12.40/bucket · 14:30 (3h ago)
+─────────────────────────────────────────────────────────────────────
+
+By model · all-time
+Model        In    Out   Cache       Cost
+Opus 4.8   2.6M  18.0M    2.7B  $2,600.00
+Fable 5    610K   4.6M  920.0M  $1,510.00
+Haiku 4.5   30K   210K   45.0M      $9.99
+Total      3.2M  22.8M    3.7B  $4,120.00
+─────────────────────────────────────────────────────────────────────
+
+cost = API-equivalent value of tokens · you are on a subscription
 ```
+
+*Illustrative mock with scrubbed numbers — the live panel is a Textual TUI; braille
+heights, axis labels, and timers update in place. On GitHub the heartbeat braille may not
+render at exact monospace width; in a real terminal the columns line up.*
 
 ## Install
 
@@ -255,5 +263,3 @@ byte-identical by sha256 — plus incremental parsing.
   statusline settings/script, and only reversibly, with backups.
 - Out of scope: the OAuth `/api/oauth/usage` endpoint, multi-user, remote, historical
   charts.
-```
-
