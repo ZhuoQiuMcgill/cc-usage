@@ -1,14 +1,19 @@
 """Command-line entry point (T3 R4) — deliberately tiny.
 
-    cc-usage                 launch the full interactive TUI (default; keyboard-only)
-    cc-usage --once          print a single static frame and exit (for scripts/statusline)
-    cc-usage --version       print the version
-    cc-usage --help          usage
+    ccusage                 launch the full interactive TUI (default; keyboard-only)
+    ccusage --once          print a single static frame and exit (for scripts/statusline)
+    ccusage --check-update  report current vs latest GitHub release (installs nothing)
+    ccusage --update        upgrade to the latest GitHub release via pip
+    ccusage --version       print the version
+    ccusage --help          usage
 
 No flag is *required* for normal use: everything — viewing, switching the heartbeat,
 and ALL configuration (incl. the statusline install/restore) — happens inside the TUI
 with arrow keys + Enter (the overriding T3 principle). The statusline install/restore
 flags survive only as **hidden** scriptable aliases; the in-app Settings path is primary.
+
+The --update / --check-update commands are explicit user actions and may reach the
+network; the passive panel/data path remains strictly no-network.
 """
 
 from __future__ import annotations
@@ -21,15 +26,25 @@ from .config import load_config
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        prog="cc-usage",
+        prog="ccusage",
         description="Interactive panel of Claude Code usage (tokens + API-equivalent "
         "cost) across all sessions, plus the 5h/7d subscription limits. "
         "Launch it and drive everything with arrow keys + Enter — no flags to memorize.",
     )
     p.add_argument("--once", action="store_true", help="print a single static frame and exit")
-    p.add_argument("--version", action="version", version=f"cc-usage {__version__}")
+    p.add_argument("--version", action="version", version=f"ccusage {__version__}")
+    p.add_argument(
+        "--check-update",
+        action="store_true",
+        help="check whether a newer ccusage release is available (installs nothing)",
+    )
+    p.add_argument(
+        "--update",
+        action="store_true",
+        help="upgrade ccusage to the latest GitHub release",
+    )
     # Hidden scriptable aliases for the reversible statusline capture. The primary,
-    # documented path is in-app: cc-usage -> Settings -> Statusline 5h/7d capture.
+    # documented path is in-app: ccusage -> Settings -> Statusline 5h/7d capture.
     p.add_argument("--install-statusline", action="store_true", help=argparse.SUPPRESS)
     p.add_argument("--restore-statusline", action="store_true", help=argparse.SUPPRESS)
     return p
@@ -49,6 +64,17 @@ def run_once(config) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+
+    # Explicit self-update commands (network allowed; never the panel/data path).
+    if args.check_update:
+        from .update import check_update
+
+        return check_update()
+
+    if args.update:
+        from .update import perform_update
+
+        return perform_update()
 
     if args.install_statusline or args.restore_statusline:
         from .statusline import format_result, install, restore

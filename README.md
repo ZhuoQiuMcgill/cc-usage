@@ -1,4 +1,4 @@
-# cc-usage
+# ccusage
 
 A keyboard-first, interactive terminal app for your **Claude Code** usage across **all**
 sessions — per-model token counts and **API-equivalent dollar cost** parsed from local
@@ -41,30 +41,61 @@ configuration — with arrow keys + Enter. There are no flags to memorize.**
 ## Install
 
 Requires **Python 3.10+** and `jq` (used by the statusline wrapper; you almost certainly
-already have it). From the project directory:
+already have it).
+
+Install straight from GitHub — this creates the `ccusage` command on your `PATH`:
+
+```bash
+pip install git+https://github.com/ZhuoQiuMcgill/cc-usage.git
+```
+
+Then just run:
+
+```bash
+ccusage
+```
+
+(Once published to PyPI you'll be able to `pip install ccusage` instead.)
+
+### Staying up to date
+
+`ccusage` can update itself from the latest GitHub release:
+
+```bash
+ccusage --check-update   # report current vs latest release; install nothing
+ccusage --update         # upgrade to the latest release (via pip)
+ccusage --version        # print the installed version
+```
+
+`--check-update` and `--update` are the *only* commands that reach the network; they are
+explicit user actions. The panel itself never makes a network call.
+
+### Run from source (development)
+
+To hack on it, install editable into a venv:
 
 ```bash
 python3 -m venv .venv
 .venv/bin/python -m pip install -e .        # installs textual + rich, pinned
 ```
 
-That's it. Run it with the bundled launcher (no venv activation needed):
+You can run it with the bundled launcher (no venv activation needed):
 
 ```bash
-./cc-usage
+./ccusage
 ```
 
 To call it from anywhere, symlink the launcher onto your `PATH`:
 
 ```bash
-ln -s "$PWD/cc-usage" ~/.local/bin/cc-usage   # then just: cc-usage
+ln -s "$PWD/ccusage" ~/.local/bin/ccusage   # then just: ccusage
 ```
 
-(`pip install -e .` also creates a `cc-usage` entry point inside `.venv/bin/`.)
+(`pip install -e .` also creates a `ccusage` entry point inside `.venv/bin/`.)
 
 ## Usage — keyboard only
 
-Just run `cc-usage`. The whole app is operable with **arrow keys + Enter** (plus a quit
+Just run `ccusage`. The whole app is operable with **arrow keys + Enter** (plus a quit
 key). No flag is required for anything.
 
 | Key | What it does |
@@ -83,9 +114,11 @@ timers and the heartbeat update live.
 
 | Command | What it does |
 |---|---|
-| `cc-usage` | Launch the interactive TUI (default). |
-| `cc-usage --once` | Print a single static frame and exit (handy for scripts / a statusline). |
-| `cc-usage --version` / `--help` | Version / usage. |
+| `ccusage` | Launch the interactive TUI (default). |
+| `ccusage --once` | Print a single static frame and exit (handy for scripts / a statusline). |
+| `ccusage --check-update` | Report your version vs the latest GitHub release (installs nothing). |
+| `ccusage --update` | Upgrade to the latest release via pip. |
+| `ccusage --version` / `--help` | Version / usage. |
 
 (`--install-statusline` / `--restore-statusline` still exist as **hidden** scriptable
 aliases, but the primary, documented path is in-app: **Settings → Statusline 5h/7d
@@ -125,9 +158,9 @@ Choices persist to `~/.config/cc-usage/config.json` and apply live.
 ## The 5h / 7d limits — how capture works (and how to undo it)
 
 Claude Code passes a JSON document on **stdin** to your `statusLine` command on every
-assistant turn; for Pro/Max accounts it includes a `rate_limits` object. cc-usage reads
+assistant turn; for Pro/Max accounts it includes a `rate_limits` object. ccusage reads
 those numbers **only** from a small local cache — it never touches credentials and makes
-**no network calls**.
+**no network calls** on the panel/data path.
 
 To populate that cache, install the wrapper from **Settings → Statusline 5h/7d capture →
 Install wrapper** (all keyboard-driven). The wrapper:
@@ -187,7 +220,7 @@ are flagged with a `*`, and never crash the tool. Model ids are matched tolerant
   refreshes read only newly appended lines (no full re-scan per tick) and stay smooth across
   hundreds of files.
 
-## Files cc-usage owns
+## Files ccusage owns
 
 Everything under `~/.config/cc-usage/`:
 
@@ -215,9 +248,10 @@ byte-identical by sha256 — plus incremental parsing.
 
 ## Scope & safety
 
-- **No credentials are ever read; no network calls.** Limits come only from the local
-  statusline capture.
-- `~/.claude` transcripts are treated as read-only. The only files cc-usage modifies are the
+- **No credentials are ever read; no network calls on the panel/data path.** Limits come
+  only from the local statusline capture. The only network access is the explicit,
+  user-invoked `ccusage --update` / `--check-update`.
+- `~/.claude` transcripts are treated as read-only. The only files ccusage modifies are the
   statusline settings/script, and only reversibly, with backups.
 - Out of scope: the OAuth `/api/oauth/usage` endpoint, multi-user, remote, historical
   charts.

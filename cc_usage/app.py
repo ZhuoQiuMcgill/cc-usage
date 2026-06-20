@@ -1,6 +1,6 @@
 """The interactive Textual TUI (T3 R3) — keyboard-only.
 
-One command (`cc-usage`) launches this. The whole app is operable with **arrow keys +
+One command (`ccusage`) launches this. The whole app is operable with **arrow keys +
 Enter** (plus `q`/Ctrl-C to quit, Esc to back out of Settings):
 
   * ← / →            switch the heartbeat window (5h / 24h / 7d)
@@ -182,5 +182,5 @@ class CCUsageApp(App):
 
 
 def run_tui(config: Config) -> None:
-    """Launch the interactive TUI (default `cc-usage`)."""
+    """Launch the interactive TUI (default `ccusage`)."""
     CCUsageApp(Engine(config)).run()
