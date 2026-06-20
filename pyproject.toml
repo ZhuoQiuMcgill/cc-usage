@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cc-usage"
+version = "2.0.0"
+description = "Keyboard-first interactive TUI of Claude Code usage (tokens + API-equivalent cost) across all sessions, plus the 5h/7d subscription limits and a usage heartbeat."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "textual==0.86.0",
+    "rich==15.0.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest==9.1.0"]
+
+[project.scripts]
+cc-usage = "cc_usage.cli:main"
+
+[tool.setuptools]
+packages = ["cc_usage"]
+
+[tool.setuptools.package-data]
+cc_usage = ["data/pricing.json"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]

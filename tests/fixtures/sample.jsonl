@@ -1,0 +1,8 @@
+{"type":"assistant","requestId":"req_A","timestamp":"2026-06-01T00:00:00.000Z","message":{"id":"msg_A","model":"claude-opus-4-8","usage":{"input_tokens":1000,"output_tokens":2000,"cache_read_input_tokens":10000,"cache_creation_input_tokens":4000,"cache_creation":{"ephemeral_5m_input_tokens":1000,"ephemeral_1h_input_tokens":3000}}}}
+{"type":"assistant","requestId":"req_A","timestamp":"2026-06-01T00:00:01.000Z","message":{"id":"msg_A","model":"claude-opus-4-8","usage":{"input_tokens":999999,"output_tokens":999999,"cache_read_input_tokens":999999,"cache_creation_input_tokens":999999,"cache_creation":{"ephemeral_5m_input_tokens":999999,"ephemeral_1h_input_tokens":999999}}}}
+{"type":"assistant","requestId":"req_B","timestamp":"2026-06-01T00:00:02.000Z","message":{"id":"msg_B","model":"claude-sonnet-4-6","usage":{"input_tokens":500,"output_tokens":100,"cache_read_input_tokens":2000,"cache_creation_input_tokens":800}}}
+{"type":"assistant","requestId":"req_C","timestamp":"2026-06-01T00:00:03.000Z","message":{"id":"msg_C","model":"claude-mystery-9","usage":{"input_tokens":1000,"output_tokens":1000}}}
+{"type":"assistant","requestId":"req_D","timestamp":"2026-06-01T00:00:04.000Z","message":{"id":"msg_D","model":"claude-opus-4-8[1m]","usage":{"input_tokens":200,"output_tokens":50}}}
+{"type":"assistant","requestId":"req_BAD","message":{"usage":{"input_tokens": THIS IS NOT VALID JSON }}}
+{"type":"user","timestamp":"2026-06-01T00:00:05.000Z","message":{"role":"user","content":"the assistant usage spiked today"}}
+{"type":"assistant","requestId":"req_NoU","timestamp":"2026-06-01T00:00:06.000Z","message":{"id":"msg_NoU","model":"claude-opus-4-8"}}

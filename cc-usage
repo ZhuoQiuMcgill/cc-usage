@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# cc-usage launcher — run the tool using the project venv without activating it.
+# Resolves its own directory (following symlinks) so it works from a PATH symlink too.
+set -euo pipefail
+SOURCE="${BASH_SOURCE[0]}"
+while [ -L "$SOURCE" ]; do
+  DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+  SOURCE="$(readlink "$SOURCE")"
+  [[ $SOURCE != /* ]] && SOURCE="$DIR/$SOURCE"
+done
+DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+
+PY="$DIR/.venv/bin/python"
+[ -x "$PY" ] || PY="$(command -v python3)"
+
+# Put the package on the path so `python -m cc_usage` works even without an install.
+exec env PYTHONPATH="$DIR${PYTHONPATH:+:$PYTHONPATH}" "$PY" -m cc_usage "$@"
