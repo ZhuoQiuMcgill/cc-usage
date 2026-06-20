@@ -8,14 +8,19 @@ on:
 
 jobs:
   test:
+    name: test (py${{ matrix.python-version }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Python 3.12
+      - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: ${{ matrix.python-version }}
 
       - name: Install package (with dev extras)
         run: |
@@ -24,3 +29,28 @@ jobs:
 
       - name: Run tests
         run: pytest -q
+
+  build:
+    name: build + install smoke test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build sdist + wheel
+        run: |
+          python -m pip install --upgrade pip build
+          python -m build
+
+      - name: Install built wheel in a clean venv and smoke-test
+        run: |
+          python -m venv /tmp/smoke-venv
+          /tmp/smoke-venv/bin/python -m pip install --upgrade pip
+          # Install the freshly built wheel (no source tree on path).
+          /tmp/smoke-venv/bin/python -m pip install dist/*.whl
+          # The console entry point must exist and report the version.
+          /tmp/smoke-venv/bin/ccusage --version
