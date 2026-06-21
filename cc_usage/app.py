@@ -32,6 +32,7 @@ from .render import (
     model_block,
     spend_block,
 )
+from .range_screen import RangeScreen
 from .settings_screen import SettingsScreen
 from .themes import get_theme
 
@@ -42,14 +43,21 @@ Screen { align: center top; }
 #hb { padding: 0 0; }
 Rule { color: $panel-darken-2; }
 
-/* Settings + pickers */
-#settings-box, #choice-box, #result-box {
+/* Settings + pickers + date-range screen + date stepper */
+#settings-box, #choice-box, #result-box, #range-box, #stepper-box {
     width: auto; min-width: 48; max-width: 90%; height: auto;
     border: round $accent; padding: 1 2; background: $panel;
 }
-#settings-title, #choice-title, #result-text { text-style: bold; padding-bottom: 1; }
-#settings-hint, #choice-hint, #result-hint { color: $text-muted; padding-top: 1; }
-#settings-list, #choices { height: auto; max-height: 16; }
+#settings-title, #choice-title, #result-text, #range-title, #stepper-title {
+    text-style: bold; padding-bottom: 1;
+}
+#settings-hint, #choice-hint, #result-hint, #range-hint, #stepper-hint {
+    color: $text-muted; padding-top: 1;
+}
+#settings-list, #choices, #range-controls { height: auto; max-height: 16; }
+/* The results area scrolls so a long by-day table never overflows the screen. */
+#range-results { height: auto; max-height: 60vh; padding-top: 1; }
+#stepper-date { padding: 1 0; }
 ListView { background: $panel; }
 ListView > ListItem { padding: 0 1; }
 ListView > ListItem.--highlight { background: $accent; color: $text; }
@@ -69,6 +77,7 @@ class CCUsageApp(App):
         Binding("ctrl+c", "quit", "Quit", show=False),
         Binding("s", "settings", "Settings", show=True),
         Binding("enter", "settings", "Settings", show=True),
+        Binding("d", "date_range", "Date range", show=True),
         Binding("left", "hb_prev", "HB ◄ window", show=True, priority=True),
         Binding("right", "hb_next", "HB ► window", show=True, priority=True),
         Binding("up", "hb_metric", "HB metric", show=True, priority=True),
@@ -147,14 +156,25 @@ class CCUsageApp(App):
         self.render_panel()
 
     # ── actions (keyboard) ───────────────────────────────────────────────────
-    def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
-        """Gate the heartbeat arrow actions to the main panel.
+    # Every App-level binding that drives the MAIN PANEL (or pushes a screen). Each must be
+    # disabled whenever a sub-screen is on top, or its key leaks INTO that screen:
+    #   * the heartbeat arrows are `priority=True`, so they'd steal ↑/↓/←/→ from a list/stepper;
+    #   * `date_range` (`d`) would push a SECOND RangeScreen on top of the first;
+    #   * `settings` (`s`) would stack Settings on top of RangeScreen;
+    #   * `refresh_now` (`r`) would fire a panel refresh from inside a sub-screen.
+    # (`enter` also maps to `settings`, but a sub-screen's own `enter` binding wins, so it
+    # never reaches the App action while a screen is up.) Quit stays available everywhere.
+    _PANEL_ONLY_ACTIONS = frozenset(
+        {"hb_prev", "hb_next", "hb_metric", "date_range", "settings", "refresh_now"}
+    )
 
-        The heartbeat arrows are `priority=True`, so without this they would also fire
-        while Settings (a ModalScreen) is open — stealing ↑/↓ from the settings list.
-        Disabling them when a modal is on top lets the key fall through to the focused
-        ListView (Textual continues the priority chain when an action is disabled)."""
-        if action in ("hb_prev", "hb_next", "hb_metric") and len(self.screen_stack) > 1:
+    def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
+        """Gate every panel-only App action to the base panel.
+
+        Disabling these whenever anything is pushed on top of the base panel lets the key
+        fall through to the focused widget / top screen (Textual continues the priority
+        chain when an action is disabled), so no base-app key leaks into a sub-screen."""
+        if action in self._PANEL_ONLY_ACTIONS and len(self.screen_stack) > 1:
             return False
         return True
 
@@ -176,6 +196,12 @@ class CCUsageApp(App):
     def action_settings(self) -> None:
         # Re-render on return so any changed config/theme shows immediately.
         self.push_screen(SettingsScreen(self.config), lambda _=None: self.apply_config())
+
+    def action_date_range(self) -> None:
+        # The date-range analysis screen (T7). Re-render the main panel on return so it
+        # reflects any data refresh that ticked while the screen was open. The heartbeat
+        # arrows are already gated by check_action() while this (non-base) screen is on top.
+        self.push_screen(RangeScreen(self.engine), lambda _=None: self.render_panel())
 
     def action_quit(self) -> None:
         self.exit()

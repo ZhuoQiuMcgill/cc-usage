@@ -24,7 +24,7 @@ from rich.rule import Rule
 from rich.table import Table
 from rich.text import Text
 
-from .aggregate import Series, WindowAgg
+from .aggregate import RangeAgg, Series, WindowAgg
 from .braille import chart_rows
 from .config import Config
 from .format import human_duration, human_money, human_tokens, pretty_model_name
@@ -356,3 +356,179 @@ def build_panel(state: RenderState) -> Panel:
         padding=(1, 2),
         expand=False,
     )
+
+
+# ── Date-range analysis results (T7) ───────────────────────────────────────────
+# Pure renderers of a RangeAgg + theme, mirroring model_block's style, so RangeScreen
+# (and any later analysis view) reuses them. The range is the inclusive LOCAL-calendar
+# range the user picked; days are zero-filled (see aggregate.aggregate_range).
+
+_RANGE_CHART_ROWS = 5  # braille daily-cost chart height (compact; tables are primary)
+
+
+def range_header(rng: RangeAgg, theme: dict[str, str]) -> Text:
+    """`Usage · 2026-06-13 → 2026-06-20  (8 days)`."""
+    t = Text()
+    t.append("Usage", style=theme["label"])
+    t.append(" · ", style=theme["dim"])
+    if rng.days:
+        start_label = rng.days[0].date.isoformat()
+        end_label = rng.days[-1].date.isoformat()
+    else:  # defensive: an inverted/empty span still renders a sane header
+        start_label = time.strftime("%Y-%m-%d", time.localtime(rng.start_ts))
+        end_label = time.strftime("%Y-%m-%d", time.localtime(rng.end_ts))
+    t.append(f"{start_label}", style=theme["value"])
+    t.append(" → ", style=theme["dim"])
+    t.append(f"{end_label}", style=theme["value"])
+    n = rng.n_days
+    t.append(f"  ({n} day{'s' if n != 1 else ''})", style=theme["dim"])
+    return t
+
+
+def range_totals_block(rng: RangeAgg, theme: dict[str, str], show_cost: bool = True):
+    """Two-column totals: tokens in/out/cache/total, cost, active/total days, records."""
+    t = Table(box=None, show_header=False, pad_edge=False, expand=False)
+    t.add_column(style=theme["label"], no_wrap=True)
+    t.add_column(justify="right", style=theme["value"], no_wrap=True)
+
+    t.add_row("tokens in", human_tokens(rng.input_tokens))
+    t.add_row("tokens out", human_tokens(rng.output_tokens))
+    t.add_row("cache", human_tokens(rng.cache_tokens))
+    t.add_row("total tokens", human_tokens(rng.total_tokens))
+    if show_cost:
+        t.add_row("cost", human_money(rng.cost))
+    t.add_row("active days", f"{rng.active_days} / {rng.n_days}")
+    t.add_row("records", str(rng.record_count))
+    return t
+
+
+def range_model_block(rng: RangeAgg, theme: dict[str, str], show_cost: bool = True):
+    """By-model table for the range: Model · In · Out · Cache · Cost, cost desc.
+
+    Unknown models are flagged with `*` and contribute $0 (never a crash). An empty
+    range shows a single muted `no activity in this range` row.
+    """
+    t = Table(
+        box=None,
+        pad_edge=False,
+        expand=False,
+        title="By model",
+        title_justify="left",
+        title_style=theme["label"],
+    )
+    t.add_column("Model", style=theme["model"], no_wrap=True)
+    t.add_column("In", justify="right", header_style=theme["header"], style=theme["value"])
+    t.add_column("Out", justify="right", header_style=theme["header"], style=theme["value"])
+    t.add_column("Cache", justify="right", header_style=theme["header"], style=theme["value"])
+    if show_cost:
+        t.add_column("Cost", justify="right", header_style=theme["header"], style=theme["value"])
+
+    rows = rng.models_sorted()
+    if not rows:
+        span = 4 + (1 if show_cost else 0)
+        t.add_row("no activity in this range", *([""] * (span - 1)), style=theme["dim"])
+        return t
+
+    for m in rows:
+        name = pretty_model_name(m.model)
+        if not m.known:
+            name += " *"
+        cells = [
+            name,
+            human_tokens(m.input_tokens),
+            human_tokens(m.output_tokens),
+            human_tokens(m.cache_tokens),
+        ]
+        if show_cost:
+            cells.append(human_money(m.cost))
+        t.add_row(*cells, style=(theme["dim"] if not m.known else None))
+
+    t.add_section()
+    total_cells = [
+        "Total",
+        human_tokens(rng.input_tokens),
+        human_tokens(rng.output_tokens),
+        human_tokens(rng.cache_tokens),
+    ]
+    if show_cost:
+        total_cells.append(human_money(rng.cost))
+    t.add_row(*total_cells, style=theme["total"])
+    return t
+
+
+def range_day_block(rng: RangeAgg, theme: dict[str, str], show_cost: bool = True):
+    """By-day table: Date · Tokens · Cost, chronological, incl. zero days (`–`/`$0.00`).
+
+    Zero days are shown muted with an en-dash for tokens so gaps read at a glance. The
+    hosting widget scrolls when the range is long (this just emits all rows).
+    """
+    t = Table(
+        box=None,
+        pad_edge=False,
+        expand=False,
+        title="By day",
+        title_justify="left",
+        title_style=theme["label"],
+    )
+    t.add_column("Date", style=theme["model"], no_wrap=True)
+    t.add_column("Tokens", justify="right", header_style=theme["header"], style=theme["value"])
+    if show_cost:
+        t.add_column("Cost", justify="right", header_style=theme["header"], style=theme["value"])
+
+    if not rng.days:
+        span = 2 + (1 if show_cost else 0)
+        t.add_row("no activity in this range", *([""] * (span - 1)), style=theme["dim"])
+        return t
+
+    for day in rng.days:
+        active = day.total_tokens > 0 or day.cost > 0.0
+        tok = human_tokens(day.total_tokens) if active else "–"
+        cells = [day.date.isoformat(), tok]
+        if show_cost:
+            cells.append(human_money(day.cost))
+        t.add_row(*cells, style=(None if active else theme["dim"]))
+    return t
+
+
+def range_chart(rng: RangeAgg, theme: dict[str, str], metric: str = "cost"):
+    """A compact braille chart of per-day `metric` across the range, peak labelled.
+
+    Default metric is cost; `tokens` is the alternate. Empty range -> a flat baseline and
+    `no activity in this range`, never a crash (reuses the heartbeat's `chart_rows`).
+    """
+    metric = "cost" if metric not in ("cost", "tokens") else metric
+    values = [
+        (d.cost if metric == "cost" else float(d.total_tokens)) for d in rng.days
+    ]
+    peak = max(values) if values else 0.0
+    # "Empty" = genuinely NO activity in the range, NOT merely a $0 cost peak. A range with
+    # tokens but $0 cost (only unknown/unpriced models) is real activity: it draws a flat
+    # bar with a `$0.00` peak label, not "no activity" (F4). Base it on record_count so the
+    # cost chart and the tokens chart agree on whether the range is empty.
+    is_empty = rng.record_count == 0
+
+    header = Text()
+    header.append("Daily ", style=theme["label"])
+    header.append(metric, style=theme["header"])
+    header.append("   (m: toggle cost/tokens)", style=theme["dim"])
+
+    rows = _RANGE_CHART_ROWS
+    body = chart_rows(values, peak, rows) if values else [""] * rows
+    body_style = theme["dim"] if is_empty else theme["good"]
+
+    lines: list[Text] = [header]
+    for glyphs in body:
+        lines.append(Text(glyphs, style=body_style))
+
+    if is_empty:
+        lines.append(Text("no activity in this range", style=theme["dim"]))
+    else:
+        # `values` may be all-zero (tokens-but-$0 range): label the peak as the first day so
+        # there's still a definite peak day, and show the $0.00 / 0 peak value honestly.
+        peak_idx = max(range(len(values)), key=lambda i: values[i]) if values else 0
+        peak_day = rng.days[peak_idx].date.isoformat() if rng.days else "—"
+        peak_label = _fmt_metric(peak, metric)
+        lines.append(
+            Text(f"peak {peak_label} · {peak_day}", style=theme["value"])
+        )
+    return Group(*lines)
