@@ -80,7 +80,7 @@ fires the Release workflow, and only step 6 runs in CI.
    - **Publishes to PyPI** only when a `PYPI_API_TOKEN` secret is configured; on
      repos without the token this step is skipped (PyPI is never hard-required).
 
-## How `--update` / `--check-update` consume releases
+## How `--update` / `--check-update` consume releases (and the test channels)
 
 The self-updater reads the project's **GitHub Releases**, not PyPI:
 
@@ -91,7 +91,40 @@ The self-updater reads the project's **GitHub Releases**, not PyPI:
   `pip install --upgrade git+https://github.com/ZhuoQiuMcgill/cc-usage.git@<tag>`.
   If no release is published yet, it falls back to `@main`.
 
-These are the **only** commands that touch the network; they are explicit user
-actions and are never reached from the panel/data path. Because the updater keys
-off release **tags**, the tag/version guard in step 6 is what keeps a published
-release installable: the tag always matches the version users end up running.
+These are explicit user actions and are never reached from the panel/data path.
+Because the updater keys off release **tags**, the tag/version guard in step 6 is
+what keeps a published release installable: the tag always matches the version
+users end up running.
+
+### Test channels (`--update-pr` / `--update-prerelease` / `--update-stable`)
+
+Beyond the stable release, the updater can install **unreleased / test** builds —
+for trying work that isn't merged or published yet — and then return to the
+official release:
+
+- `ccusage --update-pr <N>` installs the head of **open PR #N** directly from the
+  git ref GitHub exposes for public repos (`refs/pull/<N>/head`):
+  `pip install --upgrade --force-reinstall git+...@refs/pull/<N>/head`. An unmerged
+  PR is **not** a release, so this is the only way to reach it. It installs
+  **unreviewed** code and prints a caution to that effect.
+- `ccusage --update-prerelease` installs the newest GitHub release whose
+  `prerelease` flag is set (a `-rc.N` / `-beta.N` tag, see *Pre-releases* above);
+  if none is published it falls back to `@main`.
+- `ccusage --check-prerelease` reports the installed version against the latest
+  prerelease tag and installs nothing.
+- `ccusage --update-stable` is the **return path**: it force-reinstalls the latest
+  stable release tag (`/releases/latest`), restoring an official build.
+
+All three install commands pass pip `--force-reinstall`. This is required because
+feature branches and test builds **do not bump `__version__`** (the bump happens
+at release time, per the flow above), so a test build can share the stable
+version string; without `--force-reinstall` pip would treat the target as
+already-satisfied and not switch builds. The plain `--update` path does **not**
+force-reinstall — it only moves between distinct release tags.
+
+These commands, like `--update` / `--check-update`, touch the network **only** as
+explicit user actions, use the public-repo release/PR APIs and `git+https` (no
+auth), and are never reached from the panel/data path. Because a machine on a
+stable build doesn't yet have these flags, the very first test-build install is a
+one-time manual pip line (the bootstrap documented in the README); afterward the
+`--update-*` commands are available.

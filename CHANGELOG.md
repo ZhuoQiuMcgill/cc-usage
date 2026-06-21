@@ -8,7 +8,25 @@ See [VERSIONING.md](VERSIONING.md) for the release policy.
 
 ## [Unreleased]
 
-_No unreleased changes yet._
+### Added
+
+- **Test-channel self-update commands.** Install unreleased / test builds from the
+  CLI and return cleanly to the official release:
+  - `ccusage --update-pr <N>` force-reinstalls the head of **open PR #N**
+    (`refs/pull/<N>/head`) for testing — the only way to reach unmerged code. It
+    cautions that the code is unreviewed and prints how to return to stable.
+  - `ccusage --update-prerelease` force-reinstalls the newest prerelease GitHub
+    release, falling back to `@main` when none is published.
+  - `ccusage --update-stable` force-reinstalls the latest stable release tag (the
+    return-to-official path).
+  - `ccusage --check-prerelease` reports the installed version against the latest
+    prerelease tag and installs nothing.
+
+  Like the existing `--update` / `--check-update`, these touch the network only as
+  explicit user actions, need no credentials, and are never reached from the
+  panel/data path. Force-reinstall is used because feature/test builds do not bump
+  `__version__`. README and VERSIONING.md document the commands and a one-time
+  manual bootstrap (a stable build doesn't yet have the `--update-*` flags).
 
 ## [2.0.0] - 2026-06-19
 
