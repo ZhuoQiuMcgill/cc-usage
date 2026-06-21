@@ -49,33 +49,69 @@ render at exact monospace width; in a real terminal the columns line up.*
 ## Install
 
 Requires **Python 3.10+** and `jq` (used by the statusline wrapper; you almost certainly
-already have it).
+already have it). Any installer below puts the `ccusage` command on your `PATH` — **uv is
+recommended.**
 
-Install straight from GitHub — this creates the `ccusage` command on your `PATH`:
+### With uv (recommended)
+
+[uv](https://docs.astral.sh/uv/) installs `ccusage` into its own isolated environment, so it
+works even on modern **externally-managed** Pythons (PEP 668) where a system-wide
+`pip install` is blocked:
 
 ```bash
-pip install git+https://github.com/ZhuoQiuMcgill/cc-usage.git
-```
-
-Then just run:
-
-```bash
+uv tool install "git+https://github.com/ZhuoQiuMcgill/cc-usage.git"
 ccusage
 ```
 
-(Once published to PyPI you'll be able to `pip install ccusage` instead.)
+Pin a specific release by appending a tag (`…cc-usage.git@v2.1.0`). Upgrade later with
+`uv tool upgrade cc-usage`.
+
+### With pipx
+
+[pipx](https://pipx.pypa.io/) is an equally good isolated install:
+
+```bash
+pipx install "git+https://github.com/ZhuoQiuMcgill/cc-usage.git"
+ccusage
+```
+
+Upgrade with `pipx upgrade cc-usage`.
+
+### With pip (in a virtual environment)
+
+A plain `pip install` works **inside a virtual environment** (a system-wide `pip install`
+is blocked on PEP 668 / externally-managed Pythons):
+
+```bash
+python3 -m venv ~/.venvs/ccusage
+~/.venvs/ccusage/bin/pip install "git+https://github.com/ZhuoQiuMcgill/cc-usage.git"
+~/.venvs/ccusage/bin/ccusage
+```
+
+(Once published to PyPI you'll be able to install `cc-usage` by name instead of the git URL.)
 
 ### Staying up to date
 
-`ccusage` can update itself from the latest GitHub release:
+The simplest upgrade is your installer's own command:
+
+```bash
+uv tool upgrade cc-usage      # if you installed with uv
+pipx upgrade cc-usage         # if you installed with pipx
+```
+
+`ccusage` also has **built-in** self-update commands that fetch the latest GitHub release:
 
 ```bash
 ccusage --check-update   # report current vs latest release; install nothing
-ccusage --update         # upgrade to the latest release (via pip)
+ccusage --update         # upgrade to the latest release
 ccusage --version        # print the installed version
 ```
 
-`--check-update` and `--update` are explicit user actions; the panel itself never makes a
+> The built-in `--update*` commands shell out to `pip`, so they work on **pipx** and **venv**
+> installs. A **uv tool** environment has no `pip` — there, upgrade with
+> `uv tool upgrade cc-usage` (or `uv tool install --force "git+…@vX.Y.Z"`).
+
+`--check-update` / `--update` are explicit user actions; the panel itself never makes a
 network call.
 
 #### Testing unreleased builds (test channel)
@@ -100,15 +136,18 @@ string — without it pip would think you're already up to date and not switch.
 > done.
 
 **One-time bootstrap.** A machine on a stable build doesn't have the `--update-*` commands
-yet (they ship *with* the test build). So the **first** install of a test build is a manual
-pip line — for an open PR #N:
+yet (they ship *with* the test build), so the **first** install of a test build uses your
+installer directly — for an open PR #N:
 
 ```bash
-pip install --force-reinstall "git+https://github.com/ZhuoQiuMcgill/cc-usage.git@refs/pull/<N>/head"
+uv tool install --force "git+https://github.com/ZhuoQiuMcgill/cc-usage.git@refs/pull/<N>/head"   # uv
+pipx install --force "git+https://github.com/ZhuoQiuMcgill/cc-usage.git@refs/pull/<N>/head"      # pipx
 ```
 
-After that, `ccusage --update-pr`, `--update-prerelease`, `--update-stable`, and
-`--check-prerelease` are available, so you never need the manual line again.
+After that the in-app `ccusage --update-pr`, `--update-prerelease`, `--update-stable`, and
+`--check-prerelease` commands are available on **pipx / venv** installs. On a **uv tool**
+install, switch builds with `uv tool install --force "git+…@<ref>"` and return to the latest
+release with `uv tool upgrade cc-usage`.
 
 All of the update commands above reach the network **only** as explicit user actions; the
 passive panel/data path stays strictly no-network.
