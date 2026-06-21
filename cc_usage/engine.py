@@ -13,7 +13,14 @@ from __future__ import annotations
 
 import time
 
-from .aggregate import HEARTBEAT_METRICS, HEARTBEAT_WINDOW_SECS, aggregate, series
+from .aggregate import (
+    HEARTBEAT_METRICS,
+    HEARTBEAT_WINDOW_SECS,
+    RangeAgg,
+    aggregate,
+    aggregate_range,
+    series,
+)
 from .config import Config
 from .parser import Parser
 from .pricing import load_pricing
@@ -53,6 +60,17 @@ class Engine:
         i = (HEARTBEAT_METRICS.index(self.hb_metric) + 1) % len(HEARTBEAT_METRICS)
         self.hb_metric = HEARTBEAT_METRICS[i]
         return self.hb_metric
+
+    # ── date-range analysis (T7) ──────────────────────────────────────────────
+    def range_metrics(self, start_ts: float, end_ts: float) -> RangeAgg:
+        """Aggregate the in-memory records over an inclusive [start_ts, end_ts] range.
+
+        Kept deliberately separate from snapshot()/heartbeat state (no `hb_window`
+        entanglement): the date-range view is its own thing, computed on demand from the
+        same already-parsed records. Reads nothing new from disk beyond the initial scan.
+        """
+        self.ensure_scanned()
+        return aggregate_range(self.parser.records, start_ts, end_ts)
 
     # ── snapshot ─────────────────────────────────────────────────────────────
     def snapshot(self, now: float | None = None) -> RenderState:

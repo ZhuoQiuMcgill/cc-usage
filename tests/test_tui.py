@@ -9,6 +9,8 @@ or the real statusline (that reversibility proof is a separate, explicit script)
 from __future__ import annotations
 
 import asyncio
+import datetime
+import time
 
 import pytest
 
@@ -16,6 +18,7 @@ import cc_usage.config as cfgmod
 from cc_usage.app import CCUsageApp
 from cc_usage.config import Config
 from cc_usage.engine import Engine
+from cc_usage.parser import UsageRecord
 
 
 @pytest.fixture
@@ -31,6 +34,41 @@ def _app() -> CCUsageApp:
     # (empty windows + flat heartbeat). Avoids depending on real ~/.claude data.
     eng = Engine(Config())
     eng._scanned = True  # skip the disk scan; records stay []
+    return CCUsageApp(eng)
+
+
+def _app_with_records() -> CCUsageApp:
+    """An app whose engine carries a few deterministic records.
+
+    The date-range screen needs a record floor (earliest record day) and something to
+    aggregate. We seed records at fixed *ages* relative to now (a 40-day-old one sets the
+    floor well before any preset window, a few recent ones populate Last-7-days), so the
+    flows are exercised without depending on real ~/.claude data or wall-clock dates.
+    """
+    eng = Engine(Config())
+    now = time.time()
+    day = 86400
+
+    def rec(age_days: float, inp: int, cost: float, model: str = "claude-opus-4-8"):
+        return UsageRecord(
+            ts=now - age_days * day,
+            model_raw=model,
+            model_norm=model,
+            known=True,
+            input_tokens=inp,
+            output_tokens=inp // 2,
+            cache_read=inp,
+            cache_creation=0,
+            cost=cost,
+        )
+
+    eng.parser.records = [
+        rec(40, 1000, 20.0),  # old -> sets the floor ~40 days back
+        rec(3, 500, 9.0),  # inside Last 7 days
+        rec(1, 200, 4.0, "claude-sonnet-4-6"),  # inside Last 7 days, 2nd model
+        rec(0, 50, 0.5),  # today
+    ]
+    eng._scanned = True  # skip the disk scan; use the seeded records
     return CCUsageApp(eng)
 
 
@@ -236,5 +274,300 @@ def test_quit_is_clean(tmp_config):
             await pilot.press("q")
         # run_test() exits the context without raising -> clean quit + restore
         assert app.return_code in (0, None)
+
+    asyncio.run(scenario())
+
+
+# ── T7: date-range analysis screen ───────────────────────────────────────────────
+def test_date_range_opens_and_highlight_visible_immediately(tmp_config):
+    """`d` opens RangeScreen; the controls list is focused AND visibly highlighted with
+    NO pre-press (the highlight bug we must not regress); ↑/↓ move the highlight."""
+
+    async def scenario():
+        app = _app_with_records()
+        async with app.run_test() as pilot:
+            from textual.widgets import ListView
+
+            from cc_usage.range_screen import RangeScreen
+
+            await pilot.press("d")
+            await pilot.pause()
+            assert isinstance(app.screen, RangeScreen)
+
+            lv = app.screen.query_one("#range-controls", ListView)
+            # Highlight visible immediately, before any arrow press:
+            assert lv.has_focus
+            assert lv.index == 0
+            assert lv.highlighted_child is not None
+            assert lv.highlighted_child.has_class("-highlight")
+
+            # ↑/↓ move the control highlight (Preset -> Start -> End -> wrap is not asserted,
+            # just that down advances and the new row is highlighted).
+            await pilot.press("down")
+            assert lv.index == 1
+            assert lv.highlighted_child.has_class("-highlight")
+            await pilot.press("down")
+            assert lv.index == 2
+            await pilot.press("up")
+            assert lv.index == 1
+
+    asyncio.run(scenario())
+
+
+def test_date_range_preset_updates_results(tmp_config):
+    """Enter on Preset opens the ChoiceScreen; choosing a different preset updates the
+    screen's range. Then Esc returns to the main panel and the heartbeat arrows work."""
+
+    async def scenario():
+        app = _app_with_records()
+        async with app.run_test() as pilot:
+            from cc_usage.range_screen import RangeScreen
+            from cc_usage.settings_screen import ChoiceScreen
+
+            await pilot.press("d")
+            await pilot.pause()
+            assert isinstance(app.screen, RangeScreen)
+            assert app.screen.preset_key == "last7"  # default range on open
+            span_before = (app.screen.end_date - app.screen.start_date).days
+            assert span_before == 6  # Last 7 days inclusive
+
+            # Preset is control row 0; Enter opens the picker.
+            await pilot.press("enter")
+            await pilot.pause()
+            assert isinstance(app.screen, ChoiceScreen)
+            # PRESETS order: last7, last30, thismonth, lastmonth, all, custom.
+            await pilot.press("down")  # last7 -> last30
+            await pilot.press("enter")
+            await pilot.pause()
+            assert isinstance(app.screen, RangeScreen)
+            assert app.screen.preset_key == "last30"
+            assert (app.screen.end_date - app.screen.start_date).days == 29
+
+            # Back to the main panel, and the heartbeat arrows work again (were gated).
+            base_window = app.engine.hb_window
+            await pilot.press("escape")
+            await pilot.pause()
+            assert not isinstance(app.screen, RangeScreen)
+            await pilot.press("right")  # heartbeat window must advance again
+            assert app.engine.hb_window != base_window
+
+    asyncio.run(scenario())
+
+
+def test_date_range_stepper_changes_date_and_keeps_invariant(tmp_config):
+    """Enter on Start opens the DateStepperScreen; ↑/↓ (±day), ←/→ (±month) change the
+    date; Enter applies and the results update; start <= end always holds."""
+
+    async def scenario():
+        app = _app_with_records()
+        async with app.run_test() as pilot:
+            from cc_usage.range_screen import DateStepperScreen, RangeScreen
+
+            await pilot.press("d")
+            await pilot.pause()
+            assert isinstance(app.screen, RangeScreen)
+            start_before = app.screen.start_date
+
+            # Move to the Start control (row 1) and open the stepper.
+            await pilot.press("down")
+            await pilot.press("enter")
+            await pilot.pause()
+            assert isinstance(app.screen, DateStepperScreen)
+
+            # ↓ = -1 day, ← = -1 month. Step the start date earlier, then confirm.
+            await pilot.press("down")  # -1 day
+            await pilot.press("left")  # -1 month
+            await pilot.press("enter")  # confirm
+            await pilot.pause()
+            assert isinstance(app.screen, RangeScreen)
+            # The start date actually moved earlier and the invariant holds.
+            assert app.screen.start_date < start_before
+            assert app.screen.start_date <= app.screen.end_date
+            assert app.screen.preset_key == "custom"  # a manual edit marks it custom
+
+            # Now push the END below start to prove auto-correction. Move to End (row 2).
+            await pilot.press("down")  # row 1 (start) -> row 2 (end)
+            await pilot.press("enter")
+            await pilot.pause()
+            assert isinstance(app.screen, DateStepperScreen)
+            # Hammer ↓ many times to drive end far below start; the stepper clamps to the
+            # floor, and on apply the screen pulls start down to keep start <= end.
+            for _ in range(400):
+                await pilot.press("down")
+            await pilot.press("enter")
+            await pilot.pause()
+            assert isinstance(app.screen, RangeScreen)
+            assert app.screen.start_date <= app.screen.end_date  # invariant preserved
+
+    asyncio.run(scenario())
+
+
+def test_date_range_esc_returns_and_panel_intact(tmp_config):
+    """Esc from RangeScreen returns to the main panel; the panel's widgets are still
+    present and the heartbeat arrows fire on the base screen again."""
+
+    async def scenario():
+        app = _app_with_records()
+        async with app.run_test() as pilot:
+            from textual.widgets import Static
+
+            from cc_usage.range_screen import RangeScreen
+
+            await pilot.press("d")
+            await pilot.pause()
+            assert isinstance(app.screen, RangeScreen)
+
+            # `m` toggles the chart metric without leaving the screen.
+            assert app.screen.chart_metric == "cost"
+            await pilot.press("m")
+            assert app.screen.chart_metric == "tokens"
+
+            await pilot.press("escape")
+            await pilot.pause()
+            assert not isinstance(app.screen, RangeScreen)
+
+            # Main panel widgets intact + heartbeat still drivable by arrows.
+            hb = app.query_one("#hb", Static)
+            assert hb.renderable is not None
+            metric_before = app.engine.hb_metric
+            await pilot.press("down")  # toggles heartbeat metric on the base panel
+            assert app.engine.hb_metric != metric_before
+
+    asyncio.run(scenario())
+
+
+def test_date_range_arrows_gated_while_open(tmp_config):
+    """While RangeScreen is on top, the panel's priority heartbeat arrows must NOT fire —
+    ↑/↓ drive the controls list, not the heartbeat metric (the modal-gating contract)."""
+
+    async def scenario():
+        app = _app_with_records()
+        async with app.run_test() as pilot:
+            from cc_usage.range_screen import RangeScreen
+
+            await pilot.press("d")
+            await pilot.pause()
+            assert isinstance(app.screen, RangeScreen)
+            metric_before = app.engine.hb_metric
+            await pilot.press("down")  # should move the list, not flip the metric
+            assert app.engine.hb_metric == metric_before  # ↓ did not leak to the panel
+
+    asyncio.run(scenario())
+
+
+def test_date_range_base_keys_do_not_leak_into_screen(tmp_config):
+    """F1/F2: while RangeScreen is open, the base-app keys that PUSH a screen (`d` ->
+    date_range, `s` -> settings) must NOT fire — they would stack a second RangeScreen /
+    a Settings screen on top. `t` (hb_metric) and `r` (refresh_now) must not fire either.
+    The screen stack must stay exactly ['Screen', 'RangeScreen'] after pressing them, and
+    Esc/q must still return to the panel."""
+
+    async def scenario():
+        app = _app_with_records()
+        async with app.run_test() as pilot:
+            from cc_usage.range_screen import RangeScreen
+
+            await pilot.press("d")
+            await pilot.pause()
+            assert isinstance(app.screen, RangeScreen)
+            base_stack = [type(s).__name__ for s in app.screen_stack]
+            assert base_stack == ["Screen", "RangeScreen"]
+
+            # `d` must NOT push a SECOND RangeScreen (F1).
+            await pilot.press("d")
+            await pilot.pause()
+            assert [type(s).__name__ for s in app.screen_stack] == base_stack
+            assert isinstance(app.screen, RangeScreen)
+
+            # `s` must NOT open Settings on top of RangeScreen (F2).
+            await pilot.press("s")
+            await pilot.pause()
+            assert [type(s).__name__ for s in app.screen_stack] == base_stack
+            assert isinstance(app.screen, RangeScreen)
+
+            # `t` (hb_metric) and `r` (refresh_now) must not change the stack either.
+            metric_before = app.engine.hb_metric
+            await pilot.press("t")
+            await pilot.press("r")
+            await pilot.pause()
+            assert [type(s).__name__ for s in app.screen_stack] == base_stack
+            assert app.engine.hb_metric == metric_before  # `t` didn't leak to the panel
+
+            # Esc still returns to the panel (one pop reaches the base, not a pile of them).
+            await pilot.press("escape")
+            await pilot.pause()
+            assert not isinstance(app.screen, RangeScreen)
+            assert [type(s).__name__ for s in app.screen_stack] == ["Screen"]
+
+            # The heartbeat arrows work again on the panel.
+            window_before = app.engine.hb_window
+            await pilot.press("right")
+            assert app.engine.hb_window != window_before
+
+    asyncio.run(scenario())
+
+
+def _app_with_recent_records_only() -> CCUsageApp:
+    """An app whose ENTIRE data history is only ~4 days old (earliest record 4 days back).
+
+    This makes the earliest-record floor MORE RECENT than the start of "Last 7/30 days",
+    so the buggy floor-clamp would visibly TRUNCATE those presets. Used to prove F3."""
+    eng = Engine(Config())
+    now = time.time()
+    day = 86400
+
+    def rec(age_days: float, inp: int, cost: float):
+        return UsageRecord(
+            ts=now - age_days * day,
+            model_raw="claude-opus-4-8",
+            model_norm="claude-opus-4-8",
+            known=True,
+            input_tokens=inp,
+            output_tokens=inp // 2,
+            cache_read=inp,
+            cache_creation=0,
+            cost=cost,
+        )
+
+    eng.parser.records = [rec(4, 1000, 20.0), rec(1, 200, 4.0), rec(0, 50, 0.5)]
+    eng._scanned = True
+    return CCUsageApp(eng)
+
+
+def test_date_range_preset_keeps_literal_calendar_span(tmp_config):
+    """F3: a preset reflects its LITERAL calendar span and is NOT floor-clamped to the
+    earliest record. Here the whole history is only 4 days old, so the floor is today-4 —
+    MORE recent than the "Last 30 days" start (today-29) and the "Last 7 days" start
+    (today-6). The presets must STILL span the full 30 / 7 calendar days (the leading
+    pre-data days are simply zero-filled), NOT get snapped up to the 4-day-old floor."""
+
+    async def scenario():
+        app = _app_with_recent_records_only()
+        async with app.run_test() as pilot:
+            from cc_usage.range_screen import RangeScreen
+            from cc_usage.settings_screen import ChoiceScreen
+
+            await pilot.press("d")
+            await pilot.pause()
+            assert isinstance(app.screen, RangeScreen)
+            screen = app.screen
+            # Default Last 7 days: literal 7-day span even though data starts 4 days ago.
+            assert (screen.end_date - screen.start_date).days == 6
+            assert screen._compute_range().n_days == 7
+
+            # Pick "Last 30 days" — its start (today-29) is well before the today-4 floor,
+            # but the span stays a literal 30 days (the floor must NOT snap it up).
+            await pilot.press("enter")  # open preset picker
+            await pilot.pause()
+            assert isinstance(app.screen, ChoiceScreen)
+            await pilot.press("down")  # last7 -> last30
+            await pilot.press("enter")
+            await pilot.pause()
+            assert isinstance(app.screen, RangeScreen)
+            assert app.screen.preset_key == "last30"
+            assert (app.screen.end_date - app.screen.start_date).days == 29
+            assert app.screen.end_date == datetime.date.today()
+            # The by-day chart/table reflect the full 30-day span (zero-filled days).
+            assert app.screen._compute_range().n_days == 30
 
     asyncio.run(scenario())
