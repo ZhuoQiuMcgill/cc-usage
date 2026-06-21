@@ -150,3 +150,357 @@ def test_latest_release_parses_tag(monkeypatch):
     assert upd.latest_release() == "v2.0.0"
     # io imported to keep the dependency obvious for readers
     assert io is not None
+
+
+# --------------------------------------------------------------------------- #
+# T8 — test-channel commands (--update-pr / --update-prerelease /
+# --update-stable / --check-prerelease). Same hermetic contract: NEVER hit the
+# network, NEVER run pip for real.
+# --------------------------------------------------------------------------- #
+
+
+class _JSONResp:
+    """Minimal urlopen() stand-in returning a fixed JSON body."""
+
+    def __init__(self, payload) -> None:
+        import json as _json
+
+        self._payload = _json.dumps(payload).encode("utf-8")
+
+    def read(self) -> bytes:
+        return self._payload
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+# ---- _pip_install: the --force-reinstall wiring --------------------------- #
+
+
+def test_pip_install_force_appends_force_reinstall(monkeypatch):
+    """force=True adds --force-reinstall; the git target is still last."""
+    captured: dict[str, list[str]] = {}
+
+    def _record(cmd, *a, **k):
+        captured["cmd"] = cmd
+        return _FakeCompleted(0)
+
+    monkeypatch.setattr(upd.subprocess, "run", _record)
+
+    rc = upd._pip_install("v1.2.3", force=True)
+    assert rc == 0
+    cmd = captured["cmd"]
+    assert cmd[1:4] == ["-m", "pip", "install"]
+    assert "--upgrade" in cmd
+    assert "--force-reinstall" in cmd
+    assert cmd[-1] == f"git+{upd.GIT_URL}@v1.2.3"
+
+
+def test_pip_install_no_force_omits_force_reinstall(monkeypatch):
+    """force=False (the default, used by plain --update) has NO --force-reinstall."""
+    captured: dict[str, list[str]] = {}
+
+    def _record(cmd, *a, **k):
+        captured["cmd"] = cmd
+        return _FakeCompleted(0)
+
+    monkeypatch.setattr(upd.subprocess, "run", _record)
+
+    rc = upd._pip_install("v1.2.3")
+    assert rc == 0
+    assert "--force-reinstall" not in captured["cmd"]
+
+
+def test_plain_update_path_has_no_force_reinstall(monkeypatch):
+    """Regression guard: perform_update() (the --update path) never force-reinstalls."""
+    monkeypatch.setattr(upd, "latest_release", lambda: "v9.9.9")
+    captured: dict[str, list[str]] = {}
+
+    def _record(cmd, *a, **k):
+        captured["cmd"] = cmd
+        return _FakeCompleted(0)
+
+    monkeypatch.setattr(upd.subprocess, "run", _record)
+
+    assert upd.perform_update() == 0
+    assert "--force-reinstall" not in captured["cmd"]
+
+
+# ---- --update-pr ---------------------------------------------------------- #
+
+
+def test_pr_ref_format():
+    assert upd.pr_ref(2) == "refs/pull/2/head"
+    assert upd.pr_ref(42) == "refs/pull/42/head"
+
+
+def test_perform_update_pr_force_reinstalls_pr_head(monkeypatch, capsys):
+    """--update-pr 2: argv has @refs/pull/2/head + --force-reinstall; prints return hint."""
+    captured: dict[str, list[str]] = {}
+
+    def _record(cmd, *a, **k):
+        captured["cmd"] = cmd
+        return _FakeCompleted(0)
+
+    monkeypatch.setattr(upd.subprocess, "run", _record)
+
+    rc = upd.perform_update_pr(2)
+    out = capsys.readouterr().out
+    assert rc == 0
+
+    cmd = captured["cmd"]
+    assert "--force-reinstall" in cmd
+    assert cmd[-1].endswith("@refs/pull/2/head")
+    # Up-front caution about unreviewed code + the return-to-stable hint.
+    assert "unreviewed" in out.lower()
+    assert "ccusage --update-stable" in out
+
+
+def test_perform_update_pr_zero_is_rejected_without_pip(monkeypatch, capsys):
+    """--update-pr 0: friendly error, NO pip call, non-zero exit."""
+    def _boom(*a, **k):  # pragma: no cover - must never run
+        raise AssertionError("pip must not be invoked for an invalid PR number")
+
+    monkeypatch.setattr(upd.subprocess, "run", _boom)
+
+    rc = upd.perform_update_pr(0)
+    out = capsys.readouterr().out
+    assert rc != 0
+    assert "invalid pr number" in out.lower()
+
+
+def test_perform_update_pr_negative_is_rejected_without_pip(monkeypatch, capsys):
+    """--update-pr -1: friendly error, NO pip call, non-zero exit."""
+    def _boom(*a, **k):  # pragma: no cover - must never run
+        raise AssertionError("pip must not be invoked for an invalid PR number")
+
+    monkeypatch.setattr(upd.subprocess, "run", _boom)
+
+    rc = upd.perform_update_pr(-1)
+    out = capsys.readouterr().out
+    assert rc != 0
+    assert "invalid pr number" in out.lower()
+
+
+# ---- --update-prerelease -------------------------------------------------- #
+
+
+def test_perform_update_prerelease_installs_tag(monkeypatch, capsys):
+    """A published prerelease -> force-reinstall that tag."""
+    monkeypatch.setattr(upd, "prerelease_release", lambda: "v2.1.0-rc.1")
+    captured: dict[str, list[str]] = {}
+
+    def _record(cmd, *a, **k):
+        captured["cmd"] = cmd
+        return _FakeCompleted(0)
+
+    monkeypatch.setattr(upd.subprocess, "run", _record)
+
+    rc = upd.perform_update_prerelease()
+    out = capsys.readouterr().out
+    assert rc == 0
+    cmd = captured["cmd"]
+    assert "--force-reinstall" in cmd
+    assert cmd[-1].endswith("@v2.1.0-rc.1")
+    assert "ccusage --update-stable" in out
+
+
+def test_perform_update_prerelease_falls_back_to_main(monkeypatch):
+    """No prerelease -> force-reinstall @main."""
+    monkeypatch.setattr(upd, "prerelease_release", lambda: None)
+    captured: dict[str, list[str]] = {}
+
+    def _record(cmd, *a, **k):
+        captured["cmd"] = cmd
+        return _FakeCompleted(0)
+
+    monkeypatch.setattr(upd.subprocess, "run", _record)
+
+    rc = upd.perform_update_prerelease()
+    assert rc == 0
+    cmd = captured["cmd"]
+    assert "--force-reinstall" in cmd
+    assert cmd[-1].endswith("@main")
+
+
+# ---- --update-stable ------------------------------------------------------ #
+
+
+def test_perform_update_stable_force_reinstalls_latest(monkeypatch, capsys):
+    """A published latest stable -> force-reinstall that tag (the return path)."""
+    monkeypatch.setattr(upd, "latest_release", lambda: "v2.0.0")
+    captured: dict[str, list[str]] = {}
+
+    def _record(cmd, *a, **k):
+        captured["cmd"] = cmd
+        return _FakeCompleted(0)
+
+    monkeypatch.setattr(upd.subprocess, "run", _record)
+
+    rc = upd.perform_update_stable()
+    out = capsys.readouterr().out
+    assert rc == 0
+    cmd = captured["cmd"]
+    assert "--force-reinstall" in cmd
+    assert cmd[-1].endswith("@v2.0.0")
+    assert "official release" in out.lower()
+
+
+def test_perform_update_stable_no_release_is_friendly(monkeypatch, capsys):
+    """No stable release -> friendly message, non-zero, NO pip call."""
+    monkeypatch.setattr(upd, "latest_release", lambda: None)
+
+    def _boom(*a, **k):  # pragma: no cover - must never run
+        raise AssertionError("pip must not be invoked when there is no stable release")
+
+    monkeypatch.setattr(upd.subprocess, "run", _boom)
+
+    rc = upd.perform_update_stable()
+    out = capsys.readouterr().out
+    assert rc != 0
+    assert "no published release" in out.lower()
+
+
+# ---- prerelease_release() parsing ----------------------------------------- #
+
+
+def test_prerelease_release_picks_newest_prerelease(monkeypatch):
+    """Newest-first list: skip the leading stable, return the first prerelease."""
+    payload = [
+        {"tag_name": "v2.0.0", "prerelease": False},
+        {"tag_name": "v2.1.0-rc.2", "prerelease": True},
+        {"tag_name": "v2.1.0-rc.1", "prerelease": True},
+    ]
+    monkeypatch.setattr(
+        upd.urllib.request, "urlopen", lambda *a, **k: _JSONResp(payload)
+    )
+    assert upd.prerelease_release() == "v2.1.0-rc.2"
+
+
+def test_prerelease_release_none_when_all_stable(monkeypatch):
+    """A list with no prerelease entries -> None."""
+    payload = [
+        {"tag_name": "v2.0.0", "prerelease": False},
+        {"tag_name": "v1.9.0", "prerelease": False},
+    ]
+    monkeypatch.setattr(
+        upd.urllib.request, "urlopen", lambda *a, **k: _JSONResp(payload)
+    )
+    assert upd.prerelease_release() is None
+
+
+def test_prerelease_release_none_on_empty(monkeypatch):
+    monkeypatch.setattr(
+        upd.urllib.request, "urlopen", lambda *a, **k: _JSONResp([])
+    )
+    assert upd.prerelease_release() is None
+
+
+def test_prerelease_release_none_on_malformed(monkeypatch):
+    """A non-list body (e.g. an error dict) -> None, never a crash."""
+    monkeypatch.setattr(
+        upd.urllib.request,
+        "urlopen",
+        lambda *a, **k: _JSONResp({"message": "Not Found"}),
+    )
+    assert upd.prerelease_release() is None
+
+
+def test_prerelease_release_none_on_network_error(monkeypatch):
+    import urllib.error
+
+    def _raise(*a, **k):
+        raise urllib.error.URLError("no network")
+
+    monkeypatch.setattr(upd.urllib.request, "urlopen", _raise)
+    assert upd.prerelease_release() is None
+
+
+# ---- --check-prerelease (installs nothing) -------------------------------- #
+
+
+def test_check_prerelease_installs_nothing(monkeypatch, capsys):
+    """--check-prerelease reports installed vs latest prerelease, never calls pip."""
+    monkeypatch.setattr(upd, "prerelease_release", lambda: "v2.1.0-rc.1")
+
+    def _boom(*a, **k):  # pragma: no cover - must never run
+        raise AssertionError("pip must not be invoked on --check-prerelease")
+
+    monkeypatch.setattr(upd.subprocess, "run", _boom)
+
+    rc = upd.check_prerelease()
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "v2.1.0-rc.1" in out
+
+
+def test_check_prerelease_none_is_friendly(monkeypatch, capsys):
+    """No prerelease (or GitHub unreachable): friendly message, still installs nothing."""
+    monkeypatch.setattr(upd, "prerelease_release", lambda: None)
+
+    def _boom(*a, **k):  # pragma: no cover - must never run
+        raise AssertionError("pip must not be invoked on --check-prerelease")
+
+    monkeypatch.setattr(upd.subprocess, "run", _boom)
+
+    rc = upd.check_prerelease()
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "no prerelease" in out.lower()
+
+
+# ---- pip-missing path (friendly + non-zero) ------------------------------- #
+
+
+def test_update_pr_pip_missing_is_friendly(monkeypatch, capsys):
+    """If pip itself cannot run, --update-pr degrades to a friendly message + non-zero."""
+    def _raise(*a, **k):
+        raise OSError("no pip")
+
+    monkeypatch.setattr(upd.subprocess, "run", _raise)
+
+    rc = upd.perform_update_pr(2)
+    out = capsys.readouterr().out
+    assert rc != 0
+    assert "could not run pip" in out.lower()
+    # The manual fallback line keeps the force flag for the test build.
+    assert "--force-reinstall" in out
+
+
+# --------------------------------------------------------------------------- #
+# Argparse: the four flags parse to the right attributes with no ambiguity.
+# --------------------------------------------------------------------------- #
+
+
+def test_argparse_parses_test_channel_flags():
+    from cc_usage.cli import build_parser
+
+    p = build_parser()
+
+    a = p.parse_args(["--update-pr", "2"])
+    assert a.update_pr == 2
+    assert a.update_prerelease is False
+    assert a.update_stable is False
+    assert a.check_prerelease is False
+    # --update-pr must not also flip the plain --update flag (no abbreviation bleed).
+    assert a.update is False
+
+    a = p.parse_args(["--update-prerelease"])
+    assert a.update_prerelease is True
+    assert a.update_pr is None
+
+    a = p.parse_args(["--update-stable"])
+    assert a.update_stable is True
+
+    a = p.parse_args(["--check-prerelease"])
+    assert a.check_prerelease is True
+
+    # Plain --update stays distinct from all the --update-* variants.
+    a = p.parse_args(["--update"])
+    assert a.update is True
+    assert a.update_pr is None
+    assert a.update_prerelease is False
+    assert a.update_stable is False

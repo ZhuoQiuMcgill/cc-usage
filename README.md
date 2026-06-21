@@ -75,8 +75,43 @@ ccusage --update         # upgrade to the latest release (via pip)
 ccusage --version        # print the installed version
 ```
 
-`--check-update` and `--update` are the *only* commands that reach the network; they are
-explicit user actions. The panel itself never makes a network call.
+`--check-update` and `--update` are explicit user actions; the panel itself never makes a
+network call.
+
+#### Testing unreleased builds (test channel)
+
+Sometimes you want to try work that isn't merged or released yet — most often the code on
+an **open pull request**, before deciding to merge it. These commands install a **test
+build** and give you a clean way back to the official release:
+
+```bash
+ccusage --update-pr <N>      # install the head of open PR #N for testing
+ccusage --update-prerelease  # install the latest prerelease build (or @main if none)
+ccusage --check-prerelease   # report current vs latest prerelease tag (installs nothing)
+ccusage --update-stable      # return to the latest official release
+```
+
+`--update-pr`, `--update-prerelease`, and `--update-stable` always pass pip
+`--force-reinstall`, because a test build and the stable build can share the same version
+string — without it pip would think you're already up to date and not switch.
+
+> **`--update-pr <N>` installs unreviewed code from a pull request.** Only do it for a PR
+> you trust, and return to the official release with `ccusage --update-stable` when you're
+> done.
+
+**One-time bootstrap.** A machine on a stable build doesn't have the `--update-*` commands
+yet (they ship *with* the test build). So the **first** install of a test build is a manual
+pip line — for an open PR #N:
+
+```bash
+pip install --force-reinstall "git+https://github.com/ZhuoQiuMcgill/cc-usage.git@refs/pull/<N>/head"
+```
+
+After that, `ccusage --update-pr`, `--update-prerelease`, `--update-stable`, and
+`--check-prerelease` are available, so you never need the manual line again.
+
+All of the update commands above reach the network **only** as explicit user actions; the
+passive panel/data path stays strictly no-network.
 
 ### Run from source (development)
 
@@ -126,6 +161,10 @@ timers and the heartbeat update live.
 | `ccusage --once` | Print a single static frame and exit (handy for scripts / a statusline). |
 | `ccusage --check-update` | Report your version vs the latest GitHub release (installs nothing). |
 | `ccusage --update` | Upgrade to the latest release via pip. |
+| `ccusage --update-pr <N>` | Install the head of open PR #N for testing (force-reinstall; **unreviewed code**). |
+| `ccusage --update-prerelease` | Install the latest prerelease build (or `@main`) for testing (force-reinstall). |
+| `ccusage --update-stable` | Return to the latest official release (force-reinstall). |
+| `ccusage --check-prerelease` | Report your version vs the latest prerelease tag (installs nothing). |
 | `ccusage --version` / `--help` | Version / usage. |
 
 (`--install-statusline` / `--restore-statusline` still exist as **hidden** scriptable
@@ -258,7 +297,9 @@ byte-identical by sha256 — plus incremental parsing.
 
 - **No credentials are ever read; no network calls on the panel/data path.** Limits come
   only from the local statusline capture. The only network access is the explicit,
-  user-invoked `ccusage --update` / `--check-update`.
+  user-invoked update commands (`--update` / `--check-update` and the test-channel
+  `--update-pr` / `--update-prerelease` / `--update-stable` / `--check-prerelease`); they
+  use the public-repo release/PR APIs and `git+https`, which need no auth.
 - `~/.claude` transcripts are treated as read-only. The only files ccusage modifies are the
   statusline settings/script, and only reversibly, with backups.
 - Out of scope: the OAuth `/api/oauth/usage` endpoint, multi-user, remote, historical
