@@ -10,6 +10,15 @@ See [VERSIONING.md](VERSIONING.md) for the release policy.
 
 _No unreleased changes yet._
 
+## [2.1.1] - 2026-06-21
+
+### Changed
+
+- **Docs:** the README now recommends installing with **uv** (`uv tool install`),
+  keeping pipx and pip-in-a-venv as alternatives, and clarifies that the built-in
+  `ccusage --update*` commands need a pip-bearing environment — so `uv tool` installs
+  upgrade with `uv tool upgrade cc-usage` instead.
+
 ## [2.1.0] - 2026-06-21
 
 ### Added
@@ -63,6 +72,7 @@ formal, pip-installable tool.
   a GitHub Release on each `v*` tag, with PyPI publishing gated on a
   `PYPI_API_TOKEN` secret.
 
-[Unreleased]: https://github.com/ZhuoQiuMcgill/cc-usage/compare/v2.1.0...HEAD
+[Unreleased]: https://github.com/ZhuoQiuMcgill/cc-usage/compare/v2.1.1...HEAD
+[2.1.1]: https://github.com/ZhuoQiuMcgill/cc-usage/compare/v2.1.0...v2.1.1
 [2.1.0]: https://github.com/ZhuoQiuMcgill/cc-usage/compare/v2.0.0...v2.1.0
 [2.0.0]: https://github.com/ZhuoQiuMcgill/cc-usage/releases/tag/v2.0.0
