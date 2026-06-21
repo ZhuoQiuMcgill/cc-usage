@@ -8,8 +8,19 @@ See [VERSIONING.md](VERSIONING.md) for the release policy.
 
 ## [Unreleased]
 
+_No unreleased changes yet._
+
+## [2.1.0] - 2026-06-21
+
 ### Added
 
+- **Date-range usage analysis.** A keyboard-only analysis screen (open with `d`)
+  showing usage metrics for an arbitrary inclusive start → end calendar range:
+  totals (tokens in/out/cache, API-equivalent cost, active days, record count), a
+  by-model table, a by-day breakdown, and a daily braille chart. Pick the range
+  with arrow keys — a preset picker (last 7/30 days, this/last month, all time,
+  custom) and a date stepper (↑/↓ ±1 day, ←/→ ±1 month, PgUp/PgDn ±1 year); day
+  boundaries use the local calendar.
 - **Test-channel self-update commands.** Install unreleased / test builds from the
   CLI and return cleanly to the official release:
   - `ccusage --update-pr <N>` force-reinstalls the head of **open PR #N**
@@ -52,5 +63,6 @@ formal, pip-installable tool.
   a GitHub Release on each `v*` tag, with PyPI publishing gated on a
   `PYPI_API_TOKEN` secret.
 
-[Unreleased]: https://github.com/ZhuoQiuMcgill/cc-usage/compare/v2.0.0...HEAD
+[Unreleased]: https://github.com/ZhuoQiuMcgill/cc-usage/compare/v2.1.0...HEAD
+[2.1.0]: https://github.com/ZhuoQiuMcgill/cc-usage/compare/v2.0.0...v2.1.0
 [2.0.0]: https://github.com/ZhuoQiuMcgill/cc-usage/releases/tag/v2.0.0
