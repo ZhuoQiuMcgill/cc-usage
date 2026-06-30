@@ -27,6 +27,18 @@ def test_get_rates_known_and_unknown():
     assert get_rates(None, PRICING) is None
 
 
+def test_bundled_pricing_prices_sonnet_5():
+    """Claude Sonnet 5 (claude-sonnet-5) ships in the pricing table at $3/$15 and
+    resolves through the tolerant matcher, including a [1m] variant."""
+    import json
+    from importlib.resources import files
+
+    models = json.loads((files("cc_usage") / "data" / "pricing.json").read_text())["models"]
+    assert models["claude-sonnet-5"] == {"input": 3.0, "output": 15.0}
+    assert get_rates("claude-sonnet-5", models) == (3.0, 15.0)
+    assert get_rates("claude-sonnet-5[1m]", models) == (3.0, 15.0)
+
+
 def test_cost_with_ephemeral_subbuckets():
     # Record A: in 1000, out 2000, cache_read 10000, eph_5m 1000, eph_1h 3000 (opus 5/25).
     # 0.005 + 0.05 + 0.005 + 0.00625 + 0.03 = 0.09625
