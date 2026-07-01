@@ -17,8 +17,9 @@ from cc_usage import __version__
 
 
 class _FakeCompleted:
-    def __init__(self, returncode: int = 0) -> None:
+    def __init__(self, returncode: int = 0, stdout: str = "") -> None:
         self.returncode = returncode
+        self.stdout = stdout
 
 
 def test_check_update_up_to_date_makes_no_pip_call(monkeypatch, capsys):
@@ -636,6 +637,118 @@ def test_perform_update_stable_routes_through_uv_on_a_uv_tool_install(monkeypatc
     assert rc == 0
     assert captured["cmd"] == ["uv", "tool", "install", "--force", f"git+{upd.GIT_URL}@v2.0.0"]
     assert "official release" in out.lower()
+
+
+# --------------------------------------------------------------------------- #
+# Windows self-replace: upgrading ccusage while ccusage itself drives the
+# upgrade means its own launcher .exe is open, so Windows (unlike Unix)
+# refuses to overwrite it — pip/uv can still install the new package, but the
+# final entry-point step fails with a Win32 sharing violation. Detect that
+# specific failure and print a clear hint instead of leaving a bare error on
+# screen. Hermetic — `sys.platform` and `subprocess.run` are both
+# monkeypatched; never touches a real Windows machine or process.
+# --------------------------------------------------------------------------- #
+
+_WIN_LOCK_MSG = (
+    "error: Failed to install entrypoint\n"
+    "  Caused by: failed to copy file ... ccusage.exe: The process cannot "
+    "access the file because it is being used by another process. (os error 32)\n"
+)
+
+
+def test_is_windows_self_replace_error_true_on_windows_with_signature(monkeypatch):
+    monkeypatch.setattr(upd.sys, "platform", "win32")
+    assert upd._is_windows_self_replace_error(_WIN_LOCK_MSG) is True
+
+
+def test_is_windows_self_replace_error_false_without_signature(monkeypatch):
+    monkeypatch.setattr(upd.sys, "platform", "win32")
+    assert upd._is_windows_self_replace_error("some unrelated pip error") is False
+
+
+def test_is_windows_self_replace_error_false_off_windows(monkeypatch):
+    """Even with the exact phrase, only Windows can actually hit this failure."""
+    monkeypatch.setattr(upd.sys, "platform", "linux")
+    assert upd._is_windows_self_replace_error(_WIN_LOCK_MSG) is False
+
+
+def test_run_install_prints_hint_on_windows_self_replace_failure(monkeypatch, capsys):
+    monkeypatch.setattr(upd.sys, "platform", "win32")
+
+    def _record(cmd, *a, **k):
+        return _FakeCompleted(2, stdout=_WIN_LOCK_MSG)
+
+    monkeypatch.setattr(upd.subprocess, "run", _record)
+
+    rc = upd._run_install(["uv", "tool", "upgrade", upd.TOOL_NAME], "uv", "uv tool upgrade cc-usage")
+    out = capsys.readouterr().out
+    assert rc == 2
+    assert _WIN_LOCK_MSG in out  # the real tool output is still shown in full
+    assert "refusing to replace" in out.lower()
+    assert "python -m cc_usage" in out
+
+
+def test_run_install_no_hint_off_windows_even_with_signature(monkeypatch, capsys):
+    """The same failure text on Linux/macOS isn't this bug -- no hint printed."""
+    monkeypatch.setattr(upd.sys, "platform", "linux")
+
+    def _record(cmd, *a, **k):
+        return _FakeCompleted(1, stdout=_WIN_LOCK_MSG)
+
+    monkeypatch.setattr(upd.subprocess, "run", _record)
+
+    rc = upd._run_install(["pip", "install", "x"], "pip", "pip install x")
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "refusing to replace" not in out.lower()
+
+
+def test_run_install_no_hint_on_windows_without_signature(monkeypatch, capsys):
+    """A generic Windows failure with no matching signature gets no hint."""
+    monkeypatch.setattr(upd.sys, "platform", "win32")
+
+    def _record(cmd, *a, **k):
+        return _FakeCompleted(1, stdout="some unrelated pip error\n")
+
+    monkeypatch.setattr(upd.subprocess, "run", _record)
+
+    rc = upd._run_install(["pip", "install", "x"], "pip", "pip install x")
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "refusing to replace" not in out.lower()
+
+
+def test_run_install_no_hint_on_success_even_with_signature(monkeypatch, capsys):
+    """returncode == 0: never print the hint, no matter what text is present."""
+    monkeypatch.setattr(upd.sys, "platform", "win32")
+
+    def _record(cmd, *a, **k):
+        return _FakeCompleted(0, stdout=_WIN_LOCK_MSG)
+
+    monkeypatch.setattr(upd.subprocess, "run", _record)
+
+    rc = upd._run_install(["uv", "tool", "upgrade", upd.TOOL_NAME], "uv", "uv tool upgrade cc-usage")
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "refusing to replace" not in out.lower()
+
+
+def test_pip_install_and_uv_install_both_surface_the_hint(monkeypatch, capsys):
+    """Both backends route through _run_install(), so both surface the hint."""
+    monkeypatch.setattr(upd.sys, "platform", "win32")
+
+    def _record(cmd, *a, **k):
+        return _FakeCompleted(2, stdout=_WIN_LOCK_MSG)
+
+    monkeypatch.setattr(upd.subprocess, "run", _record)
+
+    rc_pip = upd._pip_install("v1.2.3", force=True)
+    assert rc_pip == 2
+    assert "refusing to replace" in capsys.readouterr().out.lower()
+
+    rc_uv = upd._uv_install("v1.2.3", force=True)
+    assert rc_uv == 2
+    assert "refusing to replace" in capsys.readouterr().out.lower()
 
 
 # --------------------------------------------------------------------------- #

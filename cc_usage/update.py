@@ -13,9 +13,16 @@ Design notes:
     (no pip, but `uv` on PATH) and `_install()` routes to `_uv_install()`
     instead, so the built-in commands upgrade in place there too instead of
     failing with a "could not run pip" dead end.
+  - On Windows, upgrading ccusage while ccusage itself is doing the upgrading
+    means its own launcher `.exe` is open, so pip/uv can install the new
+    package but can't refresh the entry point — Windows refuses to overwrite a
+    running executable's image (Unix has no such restriction).
+    `_is_windows_self_replace_error()` recognizes that specific failure and
+    `_run_install()` prints `_SELF_REPLACE_HINT` instead of leaving a bare
+    Win32 error on screen.
   - Every failure mode (no network, missing pip/uv, GitHub down, no release
-    yet) is caught and turned into a friendly message + a non-zero return —
-    never a traceback.
+    yet, the Windows self-replace case above) is caught and turned into a
+    friendly message + a non-zero return — never a traceback.
 """
 
 from __future__ import annotations
@@ -140,6 +147,60 @@ def _should_use_uv() -> bool:
     return _uv_executable() is not None and not _pip_available()
 
 
+def _is_windows_self_replace_error(output: str) -> bool:
+    """True if ``output`` looks like Windows refusing to overwrite ccusage's own
+    running executable (a Win32 sharing violation, error 32).
+
+    Upgrading ccusage while ccusage itself is the process driving the upgrade
+    means its own launcher ``.exe`` is open — Windows (unlike Unix, which allows
+    replacing a running binary on disk) refuses to overwrite the image of a
+    running executable, so the final entry-point step fails even though the
+    underlying package install has usually already succeeded by that point. Pip
+    and uv both surface this via the OS's own canned message rather than
+    wording of their own, so matching that phrase (gated on ``sys.platform``)
+    catches it from either backend without depending on either tool's exact
+    output format.
+    """
+    return sys.platform == "win32" and "being used by another process" in output
+
+
+_SELF_REPLACE_HINT = (
+    "ccusage: this looks like Windows refusing to replace its own running "
+    "executable — a running .exe can't be overwritten on Windows (Unix has no "
+    "such restriction). The underlying package is usually updated anyway; "
+    "check with 'ccusage --version'. To refresh the command too, close any "
+    "other running ccusage windows and re-run, or run it once via "
+    "'python -m cc_usage' in place of 'ccusage'."
+)
+
+
+def _run_install(cmd: list[str], tool: str, manual: str) -> int:
+    """Run an install/upgrade ``cmd`` for ``tool`` (``"pip"`` or ``"uv"``), print
+    its output, and return its exit code.
+
+    Shared by ``_pip_install()`` and ``_uv_install()``. Captures combined
+    stdout/stderr (rather than letting them stream live) so a failed run can be
+    checked for the Windows self-replace error above and given
+    ``_SELF_REPLACE_HINT`` instead of leaving a bare Win32 error on screen; the
+    captured text is still printed in full either way. If ``tool`` itself
+    cannot be run at all, prints a friendly message + the manual fallback
+    command and returns 1.
+    """
+    try:
+        completed = subprocess.run(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        print(f"ccusage: could not run {tool} ({exc}).")
+        print("Install/upgrade manually:")
+        print(f"  {manual}")
+        return 1
+    print(completed.stdout, end="")
+    if completed.returncode != 0 and _is_windows_self_replace_error(completed.stdout):
+        print(_SELF_REPLACE_HINT)
+    return completed.returncode
+
+
 def _pip_install(tag: str | None, force: bool = False) -> int:
     """Invoke pip to upgrade to ``tag`` (or ``@main`` when ``tag`` is None).
 
@@ -160,15 +221,8 @@ def _pip_install(tag: str | None, force: bool = False) -> int:
     if force:
         cmd.append("--force-reinstall")
     cmd.append(target)
-    try:
-        completed = subprocess.run(cmd)
-    except (OSError, subprocess.SubprocessError) as exc:
-        print(f"ccusage: could not run pip ({exc}).")
-        print("Install/upgrade manually:")
-        manual = f"pip install --upgrade {'--force-reinstall ' if force else ''}{target}"
-        print(f"  {manual}")
-        return 1
-    return completed.returncode
+    manual = f"pip install --upgrade {'--force-reinstall ' if force else ''}{target}"
+    return _run_install(cmd, "pip", manual)
 
 
 def _uv_install(tag: str | None, force: bool = False) -> int:
@@ -190,14 +244,7 @@ def _uv_install(tag: str | None, force: bool = False) -> int:
         cmd = ["uv", "tool", "install", "--force", f"git+{GIT_URL}@{ref}"]
     else:
         cmd = ["uv", "tool", "upgrade", TOOL_NAME]
-    try:
-        completed = subprocess.run(cmd)
-    except (OSError, subprocess.SubprocessError) as exc:
-        print(f"ccusage: could not run uv ({exc}).")
-        print("Install/upgrade manually:")
-        print(f"  {' '.join(cmd)}")
-        return 1
-    return completed.returncode
+    return _run_install(cmd, "uv", " ".join(cmd))
 
 
 def _install(tag: str | None, force: bool = False) -> int:

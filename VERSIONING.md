@@ -152,3 +152,22 @@ force-reinstall command (`--update-pr`, `--update-prerelease`,
 `_install()`; `_pip_install()` and `_uv_install()` are the two backends, kept
 small and independently mockable so the test suite never runs pip, uv, or the
 network for real.
+
+### Windows: replacing ccusage's own running executable
+
+Both backends above route their subprocess call through a shared `_run_install()`,
+which exists to handle one more Windows-only wrinkle: running `ccusage --update*`
+invokes ccusage's own launcher `.exe`, and while that process is alive Windows won't
+let pip/uv overwrite its image (a Win32 sharing violation — `os error 32` / `WinError
+32`, "the process cannot access the file because it is being used by another
+process"). Unix has no such restriction, so this never happens there. The underlying
+package install itself typically still succeeds; only the final entry-point refresh
+fails.
+
+`_run_install()` captures the install command's combined output (rather than
+streaming it live) so `_is_windows_self_replace_error()` can check a failed run for
+that exact OS-level phrase, gated on `sys.platform`. When it matches, `_run_install()`
+prints the captured output as usual plus `_SELF_REPLACE_HINT`, telling the user the
+package is likely already updated (verify with `ccusage --version`) and that closing
+other running `ccusage` windows and re-running — or running the same command once via
+`python -m cc_usage` instead of `ccusage` — refreshes the launcher too.
