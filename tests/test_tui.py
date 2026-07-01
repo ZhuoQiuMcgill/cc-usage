@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime
+import json
 import time
 
 import pytest
@@ -32,7 +33,8 @@ def tmp_config(tmp_path, monkeypatch):
 def _app() -> CCUsageApp:
     # Empty engine: no transcripts needed to exercise navigation; snapshot still renders
     # (empty windows + flat heartbeat). Avoids depending on real ~/.claude data.
-    eng = Engine(Config())
+    # cache_path=None keeps it fully in-memory — never reads/writes the real parse cache.
+    eng = Engine(Config(), cache_path=None)
     eng._scanned = True  # skip the disk scan; records stay []
     return CCUsageApp(eng)
 
@@ -45,7 +47,7 @@ def _app_with_records() -> CCUsageApp:
     floor well before any preset window, a few recent ones populate Last-7-days), so the
     flows are exercised without depending on real ~/.claude data or wall-clock dates.
     """
-    eng = Engine(Config())
+    eng = Engine(Config(), cache_path=None)
     now = time.time()
     day = 86400
 
@@ -263,6 +265,49 @@ def test_settings_highlight_restored_after_pick_without_arrow(tmp_config, monkey
             assert lv.index is not None
             assert lv.highlighted_child is not None
             assert lv.highlighted_child.has_class("-highlight")
+
+    asyncio.run(scenario())
+
+
+def test_startup_scan_runs_in_background_and_fills_panel(tmp_config, tmp_path, monkeypatch):
+    """A not-yet-scanned engine must NOT block on_mount: the app paints immediately and
+    runs the first scan in a worker thread, then the panel fills in and is_scanned flips.
+
+    (The other TUI tests seed `_scanned=True` to skip this path; this one exercises it.)
+    """
+    import cc_usage.parser as P
+
+    monkeypatch.setattr(P, "PROJECTS_DIR", tmp_path)
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    (proj / "s.jsonl").write_text(
+        json.dumps(
+            {
+                "type": "assistant",
+                "requestId": "r1",
+                "timestamp": "2026-06-01T00:00:00.000Z",
+                "message": {
+                    "id": "m1",
+                    "model": "claude-opus-4-8",
+                    "usage": {"input_tokens": 100, "output_tokens": 10},
+                },
+            }
+        )
+        + "\n"
+    )
+
+    eng = Engine(Config(), cache_path=tmp_path / "cache.pkl")
+    app = CCUsageApp(eng)
+
+    async def scenario():
+        async with app.run_test() as pilot:
+            assert eng.is_scanned is False  # on_mount did NOT scan synchronously
+            await app.workers.wait_for_complete()  # let the background scan finish
+            await pilot.pause()
+            assert eng.is_scanned is True
+            assert len(eng.parser.records) == 1
+            # The scan persisted a warm-start cache for next launch.
+            assert (tmp_path / "cache.pkl").exists()
 
     asyncio.run(scenario())
 
@@ -512,7 +557,7 @@ def _app_with_recent_records_only() -> CCUsageApp:
 
     This makes the earliest-record floor MORE RECENT than the start of "Last 7/30 days",
     so the buggy floor-clamp would visibly TRUNCATE those presets. Used to prove F3."""
-    eng = Engine(Config())
+    eng = Engine(Config(), cache_path=None)
     now = time.time()
     day = 86400
 
