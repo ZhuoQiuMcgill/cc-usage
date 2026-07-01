@@ -13,6 +13,10 @@ Design notes:
     (no pip, but `uv` on PATH) and `_install()` routes to `_uv_install()`
     instead, so the built-in commands upgrade in place there too instead of
     failing with a "could not run pip" dead end.
+  - `_uv_install()` always force-installs an explicit `git+...@<ref>` target,
+    never a bare `uv tool upgrade` — the latter silently no-ops (exit 0)
+    against a tool pinned to a specific rev, which would make `--update`
+    falsely report success instead of actually moving to the new release.
   - On Windows, upgrading ccusage while ccusage itself is doing the upgrading
     means its own launcher `.exe` is open, so pip/uv can install the new
     package but can't refresh the entry point — Windows refuses to overwrite a
@@ -41,7 +45,6 @@ REPO = "ZhuoQiuMcgill/cc-usage"
 RELEASES_LATEST_URL = f"https://api.github.com/repos/{REPO}/releases/latest"
 RELEASES_URL = f"https://api.github.com/repos/{REPO}/releases"
 GIT_URL = "https://github.com/ZhuoQiuMcgill/cc-usage.git"
-TOOL_NAME = "cc-usage"  # the uv tool / pipx install name (pyproject `[project].name`)
 
 _TIMEOUT = 10  # seconds
 
@@ -226,24 +229,28 @@ def _pip_install(tag: str | None, force: bool = False) -> int:
 
 
 def _uv_install(tag: str | None, force: bool = False) -> int:
-    """Upgrade/install ``tag`` (or ``@main``) via ``uv`` in a uv-tool environment.
+    """Install ``tag`` (or ``@main``) via ``uv`` in a uv-tool environment.
 
     Mirrors ``_pip_install()`` for the pip-less environment ``uv tool install``
-    creates. A plain upgrade (``force=False``) runs ``uv tool upgrade``, the same
-    command the README already tells uv users to run by hand — it ignores
-    ``tag`` since uv re-resolves the tool's existing source itself. A pinned
-    install (``force=True``, used by the test-channel and ``--update-stable``
-    commands) instead runs ``uv tool install --force git+...@<ref>`` so a build
-    sharing the installed ``__version__`` still actually switches.
+    creates. Always force-installs an *explicit* ``git+...@<ref>`` target —
+    never a bare ``uv tool upgrade`` — regardless of ``force`` (accepted only
+    so callers can pass it symmetrically with ``_pip_install()``).
+
+    A bare ``uv tool upgrade`` re-resolves against whatever source the tool is
+    *currently* recorded as using, which can be pinned to a specific rev —
+    either by a prior ``--update-pr`` / ``--update-prerelease`` /
+    ``--update-stable`` call, or by a user following the README's own "pin a
+    specific release" instructions. Against a pinned rev, ``uv tool upgrade``
+    silently no-ops (exit 0, "Nothing to upgrade") even when a newer release
+    exists, which would make ``ccusage --update`` falsely report success.
+    Pinning to the freshly resolved ``tag`` and forcing every time sidesteps
+    that regardless of whatever the tool was previously pinned to.
 
     Returns uv's exit code; returns a non-zero code (and prints a friendly
     message) if ``uv`` itself cannot be run.
     """
-    if force:
-        ref = tag if tag else "main"
-        cmd = ["uv", "tool", "install", "--force", f"git+{GIT_URL}@{ref}"]
-    else:
-        cmd = ["uv", "tool", "upgrade", TOOL_NAME]
+    ref = tag if tag else "main"
+    cmd = ["uv", "tool", "install", "--force", f"git+{GIT_URL}@{ref}"]
     return _run_install(cmd, "uv", " ".join(cmd))
 
 

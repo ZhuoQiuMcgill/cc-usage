@@ -143,15 +143,27 @@ that at call time — pip unimportable in the running interpreter, `uv` present 
 
 | pip (pipx / venv)                                        | uv tool install                           |
 |-----------------------------------------------------------|---------------------------------------------|
-| `pip install --upgrade git+...@<tag>`                      | `uv tool upgrade cc-usage`                   |
+| `pip install --upgrade git+...@<tag>`                      | `uv tool install --force git+...@<tag>`      |
 | `pip install --upgrade --force-reinstall git+...@<ref>`    | `uv tool install --force git+...@<ref>`      |
 
-The left column backs the plain `--update` path; the right backs every
-force-reinstall command (`--update-pr`, `--update-prerelease`,
-`--update-stable`). The detection and dispatch live in `_should_use_uv()` and
-`_install()`; `_pip_install()` and `_uv_install()` are the two backends, kept
-small and independently mockable so the test suite never runs pip, uv, or the
-network for real.
+The left column backs the plain `--update` path; the right backs every command,
+plain or force-reinstall (`--update-pr`, `--update-prerelease`,
+`--update-stable`) alike — for uv there is only one command shape. `_uv_install()`
+always force-installs the freshly resolved tag explicitly and ignores its own
+`force` parameter (kept only so callers can pass it symmetrically with
+`_pip_install()`); it never runs a bare `uv tool upgrade`, because that
+re-resolves against whatever source the tool is *currently* recorded as using.
+If the install was ever pinned to a specific rev — by a prior force-reinstall
+command, or by a user pinning a release by hand per the README — a bare
+`uv tool upgrade` silently exits 0 with "Nothing to upgrade" even when a newer
+release exists, which would make `ccusage --update` falsely report success while
+changing nothing. Pinning to the freshly resolved tag and forcing every time
+sidesteps that regardless of any existing pin.
+
+The detection and dispatch live in `_should_use_uv()` and `_install()`;
+`_pip_install()` and `_uv_install()` are the two backends, kept small and
+independently mockable so the test suite never runs pip, uv, or the network for
+real.
 
 ### Windows: replacing ccusage's own running executable
 

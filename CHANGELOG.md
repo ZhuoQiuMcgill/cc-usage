@@ -8,7 +8,19 @@ See [VERSIONING.md](VERSIONING.md) for the release policy.
 
 ## [Unreleased]
 
-_No unreleased changes yet._
+### Fixed
+
+- **`--update` could silently no-op on a pinned `uv tool` install.** The v2.1.3 uv-tool
+  fix routed the plain `--update` path through a bare `uv tool upgrade`, which re-resolves
+  against whatever source the tool is *currently* recorded as using. If that install was
+  ever pinned to a specific rev — by a prior `--update-pr` / `--update-prerelease` /
+  `--update-stable` call, or by a user following the README's own "pin a specific release"
+  instructions — `uv tool upgrade` silently exits 0 with "Nothing to upgrade" even when a
+  newer release exists, so `ccusage --update` would falsely report success while actually
+  changing nothing. The uv backend now always force-installs the freshly resolved release
+  tag explicitly (`uv tool install --force git+...@<tag>`), the same way the force-reinstall
+  commands already did, regardless of any existing pin. The README's own "pin a release,
+  then `uv tool upgrade` later" advice had the same bug and is corrected too.
 
 ## [2.1.3] - 2026-07-01
 
