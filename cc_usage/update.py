@@ -6,16 +6,23 @@ from the panel/data path, which remains strictly no-network (AGENT_RULEBOOK hard
 rule 3): nothing here is ever called from the TUI, the engine, or the scan loop.
 
 Design notes:
-  - `latest_release()` and `_pip_install()` are kept as small, separately
-    *mockable* functions so the tests can stub the network and pip out entirely.
-  - Every failure mode (no network, missing pip, GitHub down, no release yet) is
-    caught and turned into a friendly message + a non-zero return — never a
-    traceback.
+  - `latest_release()`, `_pip_install()`, and `_uv_install()` are kept as small,
+    separately *mockable* functions so the tests can stub the network, pip, and
+    uv out entirely.
+  - A `uv tool install` environment has no pip. `_should_use_uv()` detects that
+    (no pip, but `uv` on PATH) and `_install()` routes to `_uv_install()`
+    instead, so the built-in commands upgrade in place there too instead of
+    failing with a "could not run pip" dead end.
+  - Every failure mode (no network, missing pip/uv, GitHub down, no release
+    yet) is caught and turned into a friendly message + a non-zero return —
+    never a traceback.
 """
 
 from __future__ import annotations
 
+import importlib.util
 import json
+import shutil
 import subprocess
 import sys
 import urllib.error
@@ -27,6 +34,7 @@ REPO = "ZhuoQiuMcgill/cc-usage"
 RELEASES_LATEST_URL = f"https://api.github.com/repos/{REPO}/releases/latest"
 RELEASES_URL = f"https://api.github.com/repos/{REPO}/releases"
 GIT_URL = "https://github.com/ZhuoQiuMcgill/cc-usage.git"
+TOOL_NAME = "cc-usage"  # the uv tool / pipx install name (pyproject `[project].name`)
 
 _TIMEOUT = 10  # seconds
 
@@ -107,6 +115,31 @@ def is_up_to_date(latest: str | None) -> bool:
     return _normalize(latest) == _normalize(__version__)
 
 
+def _pip_available() -> bool:
+    """True if the ``pip`` module can be imported in this interpreter.
+
+    A ``uv tool install`` environment is isolated and deliberately ships without
+    pip, so this is ``False`` there even though the interpreter itself works fine.
+    """
+    return importlib.util.find_spec("pip") is not None
+
+
+def _uv_executable() -> str | None:
+    """Return the path to a ``uv`` executable on ``PATH``, or ``None``."""
+    return shutil.which("uv")
+
+
+def _should_use_uv() -> bool:
+    """True when this looks like a ``uv tool`` install: no pip, but ``uv`` itself
+    is reachable on ``PATH``.
+
+    Kept separate and mockable (like ``latest_release()`` / ``_pip_install()``)
+    so tests can force either branch without touching the real interpreter or
+    ``PATH``.
+    """
+    return _uv_executable() is not None and not _pip_available()
+
+
 def _pip_install(tag: str | None, force: bool = False) -> int:
     """Invoke pip to upgrade to ``tag`` (or ``@main`` when ``tag`` is None).
 
@@ -138,6 +171,48 @@ def _pip_install(tag: str | None, force: bool = False) -> int:
     return completed.returncode
 
 
+def _uv_install(tag: str | None, force: bool = False) -> int:
+    """Upgrade/install ``tag`` (or ``@main``) via ``uv`` in a uv-tool environment.
+
+    Mirrors ``_pip_install()`` for the pip-less environment ``uv tool install``
+    creates. A plain upgrade (``force=False``) runs ``uv tool upgrade``, the same
+    command the README already tells uv users to run by hand — it ignores
+    ``tag`` since uv re-resolves the tool's existing source itself. A pinned
+    install (``force=True``, used by the test-channel and ``--update-stable``
+    commands) instead runs ``uv tool install --force git+...@<ref>`` so a build
+    sharing the installed ``__version__`` still actually switches.
+
+    Returns uv's exit code; returns a non-zero code (and prints a friendly
+    message) if ``uv`` itself cannot be run.
+    """
+    if force:
+        ref = tag if tag else "main"
+        cmd = ["uv", "tool", "install", "--force", f"git+{GIT_URL}@{ref}"]
+    else:
+        cmd = ["uv", "tool", "upgrade", TOOL_NAME]
+    try:
+        completed = subprocess.run(cmd)
+    except (OSError, subprocess.SubprocessError) as exc:
+        print(f"ccusage: could not run uv ({exc}).")
+        print("Install/upgrade manually:")
+        print(f"  {' '.join(cmd)}")
+        return 1
+    return completed.returncode
+
+
+def _install(tag: str | None, force: bool = False) -> int:
+    """Upgrade to ``tag`` (or ``@main``), routing around a missing pip.
+
+    pipx and pip-in-a-venv installs have pip and use ``_pip_install()``
+    unchanged. A ``uv tool install`` environment has none — ``_should_use_uv()``
+    detects that and this delegates to ``_uv_install()`` instead, so every
+    ``--update*`` command works under all three supported installers.
+    """
+    if _should_use_uv():
+        return _uv_install(tag, force=force)
+    return _pip_install(tag, force=force)
+
+
 def check_update() -> int:
     """Backs ``ccusage --check-update``: report current vs latest, install nothing."""
     print(f"ccusage {__version__}")
@@ -154,11 +229,13 @@ def check_update() -> int:
 
 
 def perform_update() -> int:
-    """Backs ``ccusage --update``: upgrade to the latest release via pip.
+    """Backs ``ccusage --update``: upgrade to the latest release.
 
-    If already on the latest release, says so and makes NO pip call. Otherwise
-    runs pip against ``git+...@<tag>`` (falling back to ``@main`` when no release
-    is published). All failures degrade to a friendly message + non-zero exit.
+    If already on the latest release, says so and makes NO install call.
+    Otherwise upgrades to ``git+...@<tag>`` (falling back to ``@main`` when no
+    release is published) via pip, or via ``uv tool upgrade`` when this is a
+    pip-less uv-tool install (see ``_install()``). All failures degrade to a
+    friendly message + non-zero exit.
     """
     latest = latest_release()
     if is_up_to_date(latest):
@@ -170,12 +247,12 @@ def perform_update() -> int:
     else:
         print(f"Updating ccusage {__version__} -> {latest} ...")
 
-    code = _pip_install(latest)
+    code = _install(latest)
     if code == 0:
         target = latest if latest else "main"
         print(f"ccusage updated successfully ({target}).")
     else:
-        print("ccusage update failed. See the pip output above.")
+        print("ccusage update failed. See the output above.")
     return code
 
 
@@ -184,7 +261,7 @@ def perform_update_pr(n: int) -> int:
 
     This is a **test build** of UNREVIEWED code from a pull request — the caution
     is printed up front. ``N`` must be a positive integer; ``<= 0`` is rejected
-    with a friendly message and a non-zero exit, making NO pip call. On success it
+    with a friendly message and a non-zero exit, making NO install call. On success it
     prints how to return to the official release. Force-reinstall is required so a
     PR build that shares the stable ``__version__`` still actually installs.
     """
@@ -195,12 +272,12 @@ def perform_update_pr(n: int) -> int:
     ref = pr_ref(n)
     print(f"Installing PR #{n} ({ref}) for testing ...")
     print("Caution: this installs UNREVIEWED code from a pull request.")
-    code = _pip_install(ref, force=True)
+    code = _install(ref, force=True)
     if code == 0:
         print(f"Installed PR #{n} for testing.")
         print("Return to the official release with: ccusage --update-stable")
     else:
-        print("ccusage PR install failed. See the pip output above.")
+        print("ccusage PR install failed. See the output above.")
     return code
 
 
@@ -217,13 +294,13 @@ def perform_update_prerelease() -> int:
     else:
         print(f"Installing prerelease {tag} for testing ...")
 
-    code = _pip_install(tag, force=True)
+    code = _install(tag, force=True)
     if code == 0:
         target = tag if tag else "main"
         print(f"Installed prerelease build ({target}).")
         print("Return to the official release with: ccusage --update-stable")
     else:
-        print("ccusage prerelease install failed. See the pip output above.")
+        print("ccusage prerelease install failed. See the output above.")
     return code
 
 
@@ -233,7 +310,7 @@ def perform_update_stable() -> int:
     Force-reinstalls the latest stable release tag (``latest_release()``) so a
     machine currently on a PR/prerelease test build is restored to the official
     release even when the version strings match. If no stable release is
-    published, reports it and exits non-zero (NO pip call).
+    published, reports it and exits non-zero (NO install call).
     """
     latest = latest_release()
     if latest is None:
@@ -241,11 +318,11 @@ def perform_update_stable() -> int:
         return 1
 
     print(f"Returning to the official release {latest} ...")
-    code = _pip_install(latest, force=True)
+    code = _install(latest, force=True)
     if code == 0:
         print(f"ccusage restored to the official release ({latest}).")
     else:
-        print("ccusage update failed. See the pip output above.")
+        print("ccusage update failed. See the output above.")
     return code
 
 

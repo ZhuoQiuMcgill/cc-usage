@@ -8,7 +8,15 @@ See [VERSIONING.md](VERSIONING.md) for the release policy.
 
 ## [Unreleased]
 
-_No unreleased changes yet._
+### Fixed
+
+- **`--update*` now works on a `uv tool` install.** The built-in self-update commands
+  (`--update`, `--update-pr`, `--update-prerelease`, `--update-stable`) always shelled out
+  to `pip`, which a `uv tool install` environment doesn't have — so there they failed with
+  a generic "could not run pip" instead of upgrading anything. The updater now detects a
+  pip-less environment with `uv` on `PATH` and routes through `uv tool upgrade` (plain
+  `--update`) or `uv tool install --force git+...@<ref>` (the force-reinstall commands)
+  instead, matching the commands the README already told uv users to run by hand.
 
 ## [2.1.2] - 2026-07-01
 

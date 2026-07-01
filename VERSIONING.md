@@ -89,7 +89,9 @@ The self-updater reads the project's **GitHub Releases**, not PyPI:
   comparison). It reports whether you are current and installs nothing.
 - `ccusage --update` upgrades to the latest release tag via
   `pip install --upgrade git+https://github.com/ZhuoQiuMcgill/cc-usage.git@<tag>`.
-  If no release is published yet, it falls back to `@main`.
+  If no release is published yet, it falls back to `@main`. On a `uv tool`
+  install (no pip in that environment), it detects that and runs
+  `uv tool upgrade cc-usage` instead — see *Installer routing* below.
 
 These are explicit user actions and are never reached from the panel/data path.
 Because the updater keys off release **tags**, the tag/version guard in step 6 is
@@ -115,16 +117,38 @@ official release:
 - `ccusage --update-stable` is the **return path**: it force-reinstalls the latest
   stable release tag (`/releases/latest`), restoring an official build.
 
-All three install commands pass pip `--force-reinstall`. This is required because
-feature branches and test builds **do not bump `__version__`** (the bump happens
-at release time, per the flow above), so a test build can share the stable
-version string; without `--force-reinstall` pip would treat the target as
-already-satisfied and not switch builds. The plain `--update` path does **not**
-force-reinstall — it only moves between distinct release tags.
+All three install commands force a reinstall (pip's `--force-reinstall`, or
+`uv tool install --force` on a uv tool install — see *Installer routing* below).
+This is required because feature branches and test builds **do not bump
+`__version__`** (the bump happens at release time, per the flow above), so a
+test build can share the stable version string; without forcing, the installer
+would treat the target as already-satisfied and not switch builds. The plain
+`--update` path does **not** force-reinstall — it only moves between distinct
+release tags.
 
 These commands, like `--update` / `--check-update`, touch the network **only** as
 explicit user actions, use the public-repo release/PR APIs and `git+https` (no
 auth), and are never reached from the panel/data path. Because a machine on a
 stable build doesn't yet have these flags, the very first test-build install is a
-one-time manual pip line (the bootstrap documented in the README); afterward the
-`--update-*` commands are available.
+one-time manual pip or uv line (the bootstrap documented in the README);
+afterward the `--update-*` commands are available.
+
+### Installer routing (pip vs uv)
+
+Every command above is written assuming a pip-bearing environment (pipx, or pip
+in a venv), which is what most of the codebase and docs default to. A
+`uv tool install` environment has no pip at all, so `cc_usage/update.py` detects
+that at call time — pip unimportable in the running interpreter, `uv` present on
+`PATH` — and swaps in the `uv` equivalent instead of failing:
+
+| pip (pipx / venv)                                        | uv tool install                           |
+|-----------------------------------------------------------|---------------------------------------------|
+| `pip install --upgrade git+...@<tag>`                      | `uv tool upgrade cc-usage`                   |
+| `pip install --upgrade --force-reinstall git+...@<ref>`    | `uv tool install --force git+...@<ref>`      |
+
+The left column backs the plain `--update` path; the right backs every
+force-reinstall command (`--update-pr`, `--update-prerelease`,
+`--update-stable`). The detection and dispatch live in `_should_use_uv()` and
+`_install()`; `_pip_install()` and `_uv_install()` are the two backends, kept
+small and independently mockable so the test suite never runs pip, uv, or the
+network for real.

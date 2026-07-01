@@ -471,6 +471,174 @@ def test_update_pr_pip_missing_is_friendly(monkeypatch, capsys):
 
 
 # --------------------------------------------------------------------------- #
+# uv-tool routing: a `uv tool install` has no pip, so the updater must detect
+# that and shell out to `uv` instead of failing. Hermetic — `_pip_available()` /
+# `_uv_executable()` / `subprocess.run` are all monkeypatched; never touches the
+# real interpreter, PATH, network, or pip/uv.
+# --------------------------------------------------------------------------- #
+
+
+def test_should_use_uv_true_when_pip_missing_and_uv_on_path(monkeypatch):
+    monkeypatch.setattr(upd, "_pip_available", lambda: False)
+    monkeypatch.setattr(upd, "_uv_executable", lambda: "/usr/bin/uv")
+    assert upd._should_use_uv() is True
+
+
+def test_should_use_uv_false_when_pip_present(monkeypatch):
+    """Even with uv on PATH, a pip-bearing env (pipx/venv) keeps using pip."""
+    monkeypatch.setattr(upd, "_pip_available", lambda: True)
+    monkeypatch.setattr(upd, "_uv_executable", lambda: "/usr/bin/uv")
+    assert upd._should_use_uv() is False
+
+
+def test_should_use_uv_false_when_no_uv_executable(monkeypatch):
+    """No pip AND no uv on PATH: nothing to route to, so stay on the pip path
+    (which will itself degrade to a friendly 'could not run pip' message)."""
+    monkeypatch.setattr(upd, "_pip_available", lambda: False)
+    monkeypatch.setattr(upd, "_uv_executable", lambda: None)
+    assert upd._should_use_uv() is False
+
+
+def test_uv_install_plain_upgrade_runs_uv_tool_upgrade(monkeypatch):
+    """force=False (plain --update path) runs `uv tool upgrade <name>`, ignoring tag."""
+    captured: dict[str, list[str]] = {}
+
+    def _record(cmd, *a, **k):
+        captured["cmd"] = cmd
+        return _FakeCompleted(0)
+
+    monkeypatch.setattr(upd.subprocess, "run", _record)
+
+    rc = upd._uv_install("v9.9.9", force=False)
+    assert rc == 0
+    assert captured["cmd"] == ["uv", "tool", "upgrade", upd.TOOL_NAME]
+
+
+def test_uv_install_force_runs_uv_tool_install_force_with_ref(monkeypatch):
+    """force=True (test-channel / --update-stable) runs `uv tool install --force git+...@<tag>`."""
+    captured: dict[str, list[str]] = {}
+
+    def _record(cmd, *a, **k):
+        captured["cmd"] = cmd
+        return _FakeCompleted(0)
+
+    monkeypatch.setattr(upd.subprocess, "run", _record)
+
+    rc = upd._uv_install("v1.2.3", force=True)
+    assert rc == 0
+    assert captured["cmd"] == ["uv", "tool", "install", "--force", f"git+{upd.GIT_URL}@v1.2.3"]
+
+
+def test_uv_install_force_falls_back_to_main(monkeypatch):
+    """force=True with tag=None (no release / no prerelease published) targets @main."""
+    captured: dict[str, list[str]] = {}
+
+    def _record(cmd, *a, **k):
+        captured["cmd"] = cmd
+        return _FakeCompleted(0)
+
+    monkeypatch.setattr(upd.subprocess, "run", _record)
+
+    rc = upd._uv_install(None, force=True)
+    assert rc == 0
+    assert captured["cmd"][-1] == f"git+{upd.GIT_URL}@main"
+
+
+def test_uv_install_missing_uv_is_friendly(monkeypatch, capsys):
+    """If uv itself cannot run, _uv_install degrades to a friendly message + non-zero."""
+    def _raise(*a, **k):
+        raise OSError("no uv")
+
+    monkeypatch.setattr(upd.subprocess, "run", _raise)
+
+    rc = upd._uv_install("v1.2.3", force=True)
+    out = capsys.readouterr().out
+    assert rc != 0
+    assert "could not run uv" in out.lower()
+    assert "uv tool install --force" in out
+
+
+def test_install_dispatches_to_pip_when_should_use_uv_is_false(monkeypatch):
+    monkeypatch.setattr(upd, "_should_use_uv", lambda: False)
+
+    def _boom(*a, **k):  # pragma: no cover - must never run
+        raise AssertionError("_uv_install must not be called on a pip-bearing env")
+
+    monkeypatch.setattr(upd, "_uv_install", _boom)
+
+    captured: dict[str, tuple] = {}
+
+    def _record(tag, force=False):
+        captured["args"] = (tag, force)
+        return 0
+
+    monkeypatch.setattr(upd, "_pip_install", _record)
+
+    assert upd._install("v1.2.3", force=True) == 0
+    assert captured["args"] == ("v1.2.3", True)
+
+
+def test_install_dispatches_to_uv_when_should_use_uv_is_true(monkeypatch):
+    monkeypatch.setattr(upd, "_should_use_uv", lambda: True)
+
+    def _boom(*a, **k):  # pragma: no cover - must never run
+        raise AssertionError("_pip_install must not be called on a uv-tool env")
+
+    monkeypatch.setattr(upd, "_pip_install", _boom)
+
+    captured: dict[str, tuple] = {}
+
+    def _record(tag, force=False):
+        captured["args"] = (tag, force)
+        return 0
+
+    monkeypatch.setattr(upd, "_uv_install", _record)
+
+    assert upd._install("v1.2.3", force=True) == 0
+    assert captured["args"] == ("v1.2.3", True)
+
+
+def test_perform_update_routes_through_uv_on_a_uv_tool_install(monkeypatch, capsys):
+    """End-to-end: on a pip-less uv-tool env, --update calls `uv tool upgrade`."""
+    monkeypatch.setattr(upd, "latest_release", lambda: "v9.9.9")
+    monkeypatch.setattr(upd, "_should_use_uv", lambda: True)
+
+    captured: dict[str, list[str]] = {}
+
+    def _record(cmd, *a, **k):
+        captured["cmd"] = cmd
+        return _FakeCompleted(0)
+
+    monkeypatch.setattr(upd.subprocess, "run", _record)
+
+    rc = upd.perform_update()
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert captured["cmd"] == ["uv", "tool", "upgrade", upd.TOOL_NAME]
+    assert "updated successfully" in out.lower()
+
+
+def test_perform_update_stable_routes_through_uv_on_a_uv_tool_install(monkeypatch, capsys):
+    """End-to-end: on a pip-less uv-tool env, --update-stable force-installs via uv."""
+    monkeypatch.setattr(upd, "latest_release", lambda: "v2.0.0")
+    monkeypatch.setattr(upd, "_should_use_uv", lambda: True)
+
+    captured: dict[str, list[str]] = {}
+
+    def _record(cmd, *a, **k):
+        captured["cmd"] = cmd
+        return _FakeCompleted(0)
+
+    monkeypatch.setattr(upd.subprocess, "run", _record)
+
+    rc = upd.perform_update_stable()
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert captured["cmd"] == ["uv", "tool", "install", "--force", f"git+{upd.GIT_URL}@v2.0.0"]
+    assert "official release" in out.lower()
+
+
+# --------------------------------------------------------------------------- #
 # Argparse: the four flags parse to the right attributes with no ambiguity.
 # --------------------------------------------------------------------------- #
 
