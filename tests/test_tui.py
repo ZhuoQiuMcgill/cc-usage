@@ -270,11 +270,17 @@ def test_settings_highlight_restored_after_pick_without_arrow(tmp_config, monkey
 
 
 def test_startup_scan_runs_in_background_and_fills_panel(tmp_config, tmp_path, monkeypatch):
-    """A not-yet-scanned engine must NOT block on_mount: the app paints immediately and
-    runs the first scan in a worker thread, then the panel fills in and is_scanned flips.
+    """A not-yet-scanned engine must NOT block on_mount: the first scan runs in a worker
+    thread (proven by capturing the thread it executes on), then the panel fills in,
+    is_scanned flips, and a warm-start cache is written.
 
     (The other TUI tests seed `_scanned=True` to skip this path; this one exercises it.)
+    We assert the scan ran OFF the main thread rather than trying to observe the in-flight
+    'not yet scanned' state — for a one-line transcript the worker can finish before the
+    first assertion, so that observation is racy; the thread identity is deterministic.
     """
+    import threading
+
     import cc_usage.parser as P
 
     monkeypatch.setattr(P, "PROJECTS_DIR", tmp_path)
@@ -297,13 +303,24 @@ def test_startup_scan_runs_in_background_and_fills_panel(tmp_config, tmp_path, m
     )
 
     eng = Engine(Config(), cache_path=tmp_path / "cache.pkl")
+
+    # Wrap scan() to record which thread it actually runs on. If on_mount blocked
+    # (scanned synchronously) this would be the main thread; the worker path must not.
+    scan_ran = {}
+    orig_scan = eng.scan
+
+    def _recording_scan():
+        scan_ran["on_main_thread"] = threading.current_thread() is threading.main_thread()
+        orig_scan()
+
+    monkeypatch.setattr(eng, "scan", _recording_scan)
     app = CCUsageApp(eng)
 
     async def scenario():
         async with app.run_test() as pilot:
-            assert eng.is_scanned is False  # on_mount did NOT scan synchronously
             await app.workers.wait_for_complete()  # let the background scan finish
             await pilot.pause()
+            assert scan_ran.get("on_main_thread") is False  # scan ran OFF the UI thread
             assert eng.is_scanned is True
             assert len(eng.parser.records) == 1
             # The scan persisted a warm-start cache for next launch.
