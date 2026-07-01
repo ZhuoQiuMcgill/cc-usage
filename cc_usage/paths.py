@@ -27,6 +27,12 @@ CONFIG_JSON = CONFIG_DIR / "config.json"
 RATELIMITS_JSON = CONFIG_DIR / "ratelimits.json"
 WRAPPER_SCRIPT = CONFIG_DIR / "statusline-wrapper.sh"
 
+# Persistent parse cache (M6 extended across process runs). Lets a relaunch read only
+# transcript bytes appended since the last run instead of re-parsing every file from
+# scratch. Pure derived data — safe to delete at any time; a missing/stale/corrupt cache
+# just falls back to a full scan. Never holds anything from ~/.claude beyond parsed usage.
+PARSE_CACHE = CONFIG_DIR / "parse-cache.pkl"
+
 # Backups (the .orig pair is created on first capture/install; preinstall snapshots
 # are written immediately before the wrapper repoints settings.json).
 SETTINGS_ORIG = BACKUPS_DIR / "settings.json.orig"
