@@ -107,9 +107,18 @@ ccusage --update         # upgrade to the latest release
 ccusage --version        # print the installed version
 ```
 
-> The built-in `--update*` commands shell out to `pip`, so they work on **pipx** and **venv**
-> installs. A **uv tool** environment has no `pip` — there, upgrade with
-> `uv tool upgrade cc-usage` (or `uv tool install --force "git+…@vX.Y.Z"`).
+> The built-in `--update*` commands work on **every** install method. On pipx / venv
+> installs they shell out to `pip`. A **uv tool** environment has no `pip` — there they
+> detect that automatically and shell out to `uv` instead (`uv tool upgrade cc-usage`, or
+> `uv tool install --force "git+…@vX.Y.Z"` for the force-reinstall commands below), so no
+> manual step is needed.
+
+> **Windows:** running any `--update*` command from the same `ccusage` you're updating
+> can't replace that running `.exe` — Windows refuses to overwrite the image of a running
+> executable (Unix has no such restriction). ccusage detects this and tells you the
+> package is usually updated anyway (confirm with `ccusage --version`); to refresh the
+> command too, close other running `ccusage` windows and re-run, or run it once via
+> `python -m cc_usage` in place of `ccusage`.
 
 `--check-update` / `--update` are explicit user actions; the panel itself never makes a
 network call.
@@ -127,9 +136,10 @@ ccusage --check-prerelease   # report current vs latest prerelease tag (installs
 ccusage --update-stable      # return to the latest official release
 ```
 
-`--update-pr`, `--update-prerelease`, and `--update-stable` always pass pip
-`--force-reinstall`, because a test build and the stable build can share the same version
-string — without it pip would think you're already up to date and not switch.
+`--update-pr`, `--update-prerelease`, and `--update-stable` always force a reinstall
+(pip's `--force-reinstall`, or `uv tool install --force` on a uv tool install), because a
+test build and the stable build can share the same version string — without it, the
+installer would think you're already up to date and not switch.
 
 > **`--update-pr <N>` installs unreviewed code from a pull request.** Only do it for a PR
 > you trust, and return to the official release with `ccusage --update-stable` when you're
@@ -145,9 +155,9 @@ pipx install --force "git+https://github.com/ZhuoQiuMcgill/cc-usage.git@refs/pul
 ```
 
 After that the in-app `ccusage --update-pr`, `--update-prerelease`, `--update-stable`, and
-`--check-prerelease` commands are available on **pipx / venv** installs. On a **uv tool**
-install, switch builds with `uv tool install --force "git+…@<ref>"` and return to the latest
-release with `uv tool upgrade cc-usage`.
+`--check-prerelease` commands are available on **every** install method, including uv tool —
+they detect the missing `pip` there and shell out to the equivalent `uv tool install --force`
+/ `uv tool upgrade` command automatically.
 
 All of the update commands above reach the network **only** as explicit user actions; the
 passive panel/data path stays strictly no-network.

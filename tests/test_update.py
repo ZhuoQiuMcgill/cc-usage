@@ -17,8 +17,9 @@ from cc_usage import __version__
 
 
 class _FakeCompleted:
-    def __init__(self, returncode: int = 0) -> None:
+    def __init__(self, returncode: int = 0, stdout: str = "") -> None:
         self.returncode = returncode
+        self.stdout = stdout
 
 
 def test_check_update_up_to_date_makes_no_pip_call(monkeypatch, capsys):
@@ -468,6 +469,286 @@ def test_update_pr_pip_missing_is_friendly(monkeypatch, capsys):
     assert "could not run pip" in out.lower()
     # The manual fallback line keeps the force flag for the test build.
     assert "--force-reinstall" in out
+
+
+# --------------------------------------------------------------------------- #
+# uv-tool routing: a `uv tool install` has no pip, so the updater must detect
+# that and shell out to `uv` instead of failing. Hermetic — `_pip_available()` /
+# `_uv_executable()` / `subprocess.run` are all monkeypatched; never touches the
+# real interpreter, PATH, network, or pip/uv.
+# --------------------------------------------------------------------------- #
+
+
+def test_should_use_uv_true_when_pip_missing_and_uv_on_path(monkeypatch):
+    monkeypatch.setattr(upd, "_pip_available", lambda: False)
+    monkeypatch.setattr(upd, "_uv_executable", lambda: "/usr/bin/uv")
+    assert upd._should_use_uv() is True
+
+
+def test_should_use_uv_false_when_pip_present(monkeypatch):
+    """Even with uv on PATH, a pip-bearing env (pipx/venv) keeps using pip."""
+    monkeypatch.setattr(upd, "_pip_available", lambda: True)
+    monkeypatch.setattr(upd, "_uv_executable", lambda: "/usr/bin/uv")
+    assert upd._should_use_uv() is False
+
+
+def test_should_use_uv_false_when_no_uv_executable(monkeypatch):
+    """No pip AND no uv on PATH: nothing to route to, so stay on the pip path
+    (which will itself degrade to a friendly 'could not run pip' message)."""
+    monkeypatch.setattr(upd, "_pip_available", lambda: False)
+    monkeypatch.setattr(upd, "_uv_executable", lambda: None)
+    assert upd._should_use_uv() is False
+
+
+def test_uv_install_plain_upgrade_runs_uv_tool_upgrade(monkeypatch):
+    """force=False (plain --update path) runs `uv tool upgrade <name>`, ignoring tag."""
+    captured: dict[str, list[str]] = {}
+
+    def _record(cmd, *a, **k):
+        captured["cmd"] = cmd
+        return _FakeCompleted(0)
+
+    monkeypatch.setattr(upd.subprocess, "run", _record)
+
+    rc = upd._uv_install("v9.9.9", force=False)
+    assert rc == 0
+    assert captured["cmd"] == ["uv", "tool", "upgrade", upd.TOOL_NAME]
+
+
+def test_uv_install_force_runs_uv_tool_install_force_with_ref(monkeypatch):
+    """force=True (test-channel / --update-stable) runs `uv tool install --force git+...@<tag>`."""
+    captured: dict[str, list[str]] = {}
+
+    def _record(cmd, *a, **k):
+        captured["cmd"] = cmd
+        return _FakeCompleted(0)
+
+    monkeypatch.setattr(upd.subprocess, "run", _record)
+
+    rc = upd._uv_install("v1.2.3", force=True)
+    assert rc == 0
+    assert captured["cmd"] == ["uv", "tool", "install", "--force", f"git+{upd.GIT_URL}@v1.2.3"]
+
+
+def test_uv_install_force_falls_back_to_main(monkeypatch):
+    """force=True with tag=None (no release / no prerelease published) targets @main."""
+    captured: dict[str, list[str]] = {}
+
+    def _record(cmd, *a, **k):
+        captured["cmd"] = cmd
+        return _FakeCompleted(0)
+
+    monkeypatch.setattr(upd.subprocess, "run", _record)
+
+    rc = upd._uv_install(None, force=True)
+    assert rc == 0
+    assert captured["cmd"][-1] == f"git+{upd.GIT_URL}@main"
+
+
+def test_uv_install_missing_uv_is_friendly(monkeypatch, capsys):
+    """If uv itself cannot run, _uv_install degrades to a friendly message + non-zero."""
+    def _raise(*a, **k):
+        raise OSError("no uv")
+
+    monkeypatch.setattr(upd.subprocess, "run", _raise)
+
+    rc = upd._uv_install("v1.2.3", force=True)
+    out = capsys.readouterr().out
+    assert rc != 0
+    assert "could not run uv" in out.lower()
+    assert "uv tool install --force" in out
+
+
+def test_install_dispatches_to_pip_when_should_use_uv_is_false(monkeypatch):
+    monkeypatch.setattr(upd, "_should_use_uv", lambda: False)
+
+    def _boom(*a, **k):  # pragma: no cover - must never run
+        raise AssertionError("_uv_install must not be called on a pip-bearing env")
+
+    monkeypatch.setattr(upd, "_uv_install", _boom)
+
+    captured: dict[str, tuple] = {}
+
+    def _record(tag, force=False):
+        captured["args"] = (tag, force)
+        return 0
+
+    monkeypatch.setattr(upd, "_pip_install", _record)
+
+    assert upd._install("v1.2.3", force=True) == 0
+    assert captured["args"] == ("v1.2.3", True)
+
+
+def test_install_dispatches_to_uv_when_should_use_uv_is_true(monkeypatch):
+    monkeypatch.setattr(upd, "_should_use_uv", lambda: True)
+
+    def _boom(*a, **k):  # pragma: no cover - must never run
+        raise AssertionError("_pip_install must not be called on a uv-tool env")
+
+    monkeypatch.setattr(upd, "_pip_install", _boom)
+
+    captured: dict[str, tuple] = {}
+
+    def _record(tag, force=False):
+        captured["args"] = (tag, force)
+        return 0
+
+    monkeypatch.setattr(upd, "_uv_install", _record)
+
+    assert upd._install("v1.2.3", force=True) == 0
+    assert captured["args"] == ("v1.2.3", True)
+
+
+def test_perform_update_routes_through_uv_on_a_uv_tool_install(monkeypatch, capsys):
+    """End-to-end: on a pip-less uv-tool env, --update calls `uv tool upgrade`."""
+    monkeypatch.setattr(upd, "latest_release", lambda: "v9.9.9")
+    monkeypatch.setattr(upd, "_should_use_uv", lambda: True)
+
+    captured: dict[str, list[str]] = {}
+
+    def _record(cmd, *a, **k):
+        captured["cmd"] = cmd
+        return _FakeCompleted(0)
+
+    monkeypatch.setattr(upd.subprocess, "run", _record)
+
+    rc = upd.perform_update()
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert captured["cmd"] == ["uv", "tool", "upgrade", upd.TOOL_NAME]
+    assert "updated successfully" in out.lower()
+
+
+def test_perform_update_stable_routes_through_uv_on_a_uv_tool_install(monkeypatch, capsys):
+    """End-to-end: on a pip-less uv-tool env, --update-stable force-installs via uv."""
+    monkeypatch.setattr(upd, "latest_release", lambda: "v2.0.0")
+    monkeypatch.setattr(upd, "_should_use_uv", lambda: True)
+
+    captured: dict[str, list[str]] = {}
+
+    def _record(cmd, *a, **k):
+        captured["cmd"] = cmd
+        return _FakeCompleted(0)
+
+    monkeypatch.setattr(upd.subprocess, "run", _record)
+
+    rc = upd.perform_update_stable()
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert captured["cmd"] == ["uv", "tool", "install", "--force", f"git+{upd.GIT_URL}@v2.0.0"]
+    assert "official release" in out.lower()
+
+
+# --------------------------------------------------------------------------- #
+# Windows self-replace: upgrading ccusage while ccusage itself drives the
+# upgrade means its own launcher .exe is open, so Windows (unlike Unix)
+# refuses to overwrite it — pip/uv can still install the new package, but the
+# final entry-point step fails with a Win32 sharing violation. Detect that
+# specific failure and print a clear hint instead of leaving a bare error on
+# screen. Hermetic — `sys.platform` and `subprocess.run` are both
+# monkeypatched; never touches a real Windows machine or process.
+# --------------------------------------------------------------------------- #
+
+_WIN_LOCK_MSG = (
+    "error: Failed to install entrypoint\n"
+    "  Caused by: failed to copy file ... ccusage.exe: The process cannot "
+    "access the file because it is being used by another process. (os error 32)\n"
+)
+
+
+def test_is_windows_self_replace_error_true_on_windows_with_signature(monkeypatch):
+    monkeypatch.setattr(upd.sys, "platform", "win32")
+    assert upd._is_windows_self_replace_error(_WIN_LOCK_MSG) is True
+
+
+def test_is_windows_self_replace_error_false_without_signature(monkeypatch):
+    monkeypatch.setattr(upd.sys, "platform", "win32")
+    assert upd._is_windows_self_replace_error("some unrelated pip error") is False
+
+
+def test_is_windows_self_replace_error_false_off_windows(monkeypatch):
+    """Even with the exact phrase, only Windows can actually hit this failure."""
+    monkeypatch.setattr(upd.sys, "platform", "linux")
+    assert upd._is_windows_self_replace_error(_WIN_LOCK_MSG) is False
+
+
+def test_run_install_prints_hint_on_windows_self_replace_failure(monkeypatch, capsys):
+    monkeypatch.setattr(upd.sys, "platform", "win32")
+
+    def _record(cmd, *a, **k):
+        return _FakeCompleted(2, stdout=_WIN_LOCK_MSG)
+
+    monkeypatch.setattr(upd.subprocess, "run", _record)
+
+    rc = upd._run_install(["uv", "tool", "upgrade", upd.TOOL_NAME], "uv", "uv tool upgrade cc-usage")
+    out = capsys.readouterr().out
+    assert rc == 2
+    assert _WIN_LOCK_MSG in out  # the real tool output is still shown in full
+    assert "refusing to replace" in out.lower()
+    assert "python -m cc_usage" in out
+
+
+def test_run_install_no_hint_off_windows_even_with_signature(monkeypatch, capsys):
+    """The same failure text on Linux/macOS isn't this bug -- no hint printed."""
+    monkeypatch.setattr(upd.sys, "platform", "linux")
+
+    def _record(cmd, *a, **k):
+        return _FakeCompleted(1, stdout=_WIN_LOCK_MSG)
+
+    monkeypatch.setattr(upd.subprocess, "run", _record)
+
+    rc = upd._run_install(["pip", "install", "x"], "pip", "pip install x")
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "refusing to replace" not in out.lower()
+
+
+def test_run_install_no_hint_on_windows_without_signature(monkeypatch, capsys):
+    """A generic Windows failure with no matching signature gets no hint."""
+    monkeypatch.setattr(upd.sys, "platform", "win32")
+
+    def _record(cmd, *a, **k):
+        return _FakeCompleted(1, stdout="some unrelated pip error\n")
+
+    monkeypatch.setattr(upd.subprocess, "run", _record)
+
+    rc = upd._run_install(["pip", "install", "x"], "pip", "pip install x")
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "refusing to replace" not in out.lower()
+
+
+def test_run_install_no_hint_on_success_even_with_signature(monkeypatch, capsys):
+    """returncode == 0: never print the hint, no matter what text is present."""
+    monkeypatch.setattr(upd.sys, "platform", "win32")
+
+    def _record(cmd, *a, **k):
+        return _FakeCompleted(0, stdout=_WIN_LOCK_MSG)
+
+    monkeypatch.setattr(upd.subprocess, "run", _record)
+
+    rc = upd._run_install(["uv", "tool", "upgrade", upd.TOOL_NAME], "uv", "uv tool upgrade cc-usage")
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "refusing to replace" not in out.lower()
+
+
+def test_pip_install_and_uv_install_both_surface_the_hint(monkeypatch, capsys):
+    """Both backends route through _run_install(), so both surface the hint."""
+    monkeypatch.setattr(upd.sys, "platform", "win32")
+
+    def _record(cmd, *a, **k):
+        return _FakeCompleted(2, stdout=_WIN_LOCK_MSG)
+
+    monkeypatch.setattr(upd.subprocess, "run", _record)
+
+    rc_pip = upd._pip_install("v1.2.3", force=True)
+    assert rc_pip == 2
+    assert "refusing to replace" in capsys.readouterr().out.lower()
+
+    rc_uv = upd._uv_install("v1.2.3", force=True)
+    assert rc_uv == 2
+    assert "refusing to replace" in capsys.readouterr().out.lower()
 
 
 # --------------------------------------------------------------------------- #

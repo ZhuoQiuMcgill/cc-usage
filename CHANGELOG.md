@@ -8,7 +8,23 @@ See [VERSIONING.md](VERSIONING.md) for the release policy.
 
 ## [Unreleased]
 
-_No unreleased changes yet._
+### Fixed
+
+- **`--update*` now works on a `uv tool` install.** The built-in self-update commands
+  (`--update`, `--update-pr`, `--update-prerelease`, `--update-stable`) always shelled out
+  to `pip`, which a `uv tool install` environment doesn't have — so there they failed with
+  a generic "could not run pip" instead of upgrading anything. The updater now detects a
+  pip-less environment with `uv` on `PATH` and routes through `uv tool upgrade` (plain
+  `--update`) or `uv tool install --force git+...@<ref>` (the force-reinstall commands)
+  instead, matching the commands the README already told uv users to run by hand.
+- **A clear message when Windows blocks replacing ccusage's own running executable.**
+  Upgrading ccusage while ccusage itself drives the upgrade means its own launcher `.exe`
+  is open; Windows (unlike Unix) refuses to overwrite a running executable's image, so
+  pip/uv can install the new package but the final entry-point step fails with a bare
+  Win32 "being used by another process" error. The updater now recognizes that specific
+  failure and prints a clear hint instead: the package is usually updated already, and
+  closing other running `ccusage` windows (or running the update once via
+  `python -m cc_usage` instead of `ccusage`) refreshes the command too.
 
 ## [2.1.2] - 2026-07-01
 
