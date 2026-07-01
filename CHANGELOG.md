@@ -8,7 +8,12 @@ See [VERSIONING.md](VERSIONING.md) for the release policy.
 
 ## [Unreleased]
 
-_No unreleased changes yet._
+### Changed
+
+- **Release notes now mirror the changelog.** The Release workflow builds each GitHub
+  Release body from that version's `## [X.Y.Z]` section in `CHANGELOG.md` (with GitHub's
+  auto "What's Changed" appended), instead of a bare auto-generated PR-title list — so
+  published release notes follow the same Keep a Changelog convention as this file.
 
 ## [2.2.0] - 2026-07-01
 
