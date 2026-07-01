@@ -113,6 +113,13 @@ ccusage --version        # print the installed version
 > `uv tool install --force "git+…@vX.Y.Z"` for the force-reinstall commands below), so no
 > manual step is needed.
 
+> **Windows:** running any `--update*` command from the same `ccusage` you're updating
+> can't replace that running `.exe` — Windows refuses to overwrite the image of a running
+> executable (Unix has no such restriction). ccusage detects this and tells you the
+> package is usually updated anyway (confirm with `ccusage --version`); to refresh the
+> command too, close other running `ccusage` windows and re-run, or run it once via
+> `python -m cc_usage` in place of `ccusage`.
+
 `--check-update` / `--update` are explicit user actions; the panel itself never makes a
 network call.
 
