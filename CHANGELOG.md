@@ -10,6 +10,17 @@ See [VERSIONING.md](VERSIONING.md) for the release policy.
 
 _No unreleased changes yet._
 
+## [2.1.2] - 2026-07-01
+
+### Added
+
+- **Claude Sonnet 5 pricing.** `claude-sonnet-5` is now in the bundled pricing
+  table ($3 input / $15 output per 1M tokens), so its usage is costed instead of
+  flagged unknown ($0). Cache read/write costs derive from the input rate as
+  usual, and the id is matched tolerantly (`[1m]` / date suffixes stripped).
+  Sonnet 5's introductory $2/$10 rate (through 2026-08-31) can be set in the
+  user-editable `pricing.json` if you prefer the promo rate.
+
 ## [2.1.1] - 2026-06-21
 
 ### Changed
@@ -72,7 +83,8 @@ formal, pip-installable tool.
   a GitHub Release on each `v*` tag, with PyPI publishing gated on a
   `PYPI_API_TOKEN` secret.
 
-[Unreleased]: https://github.com/ZhuoQiuMcgill/cc-usage/compare/v2.1.1...HEAD
+[Unreleased]: https://github.com/ZhuoQiuMcgill/cc-usage/compare/v2.1.2...HEAD
+[2.1.2]: https://github.com/ZhuoQiuMcgill/cc-usage/compare/v2.1.1...v2.1.2
 [2.1.1]: https://github.com/ZhuoQiuMcgill/cc-usage/compare/v2.1.0...v2.1.1
 [2.1.0]: https://github.com/ZhuoQiuMcgill/cc-usage/compare/v2.0.0...v2.1.0
 [2.0.0]: https://github.com/ZhuoQiuMcgill/cc-usage/releases/tag/v2.0.0
