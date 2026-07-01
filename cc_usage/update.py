@@ -166,7 +166,7 @@ def _is_windows_self_replace_error(output: str) -> bool:
 
 _SELF_REPLACE_HINT = (
     "ccusage: this looks like Windows refusing to replace its own running "
-    "executable — a running .exe can't be overwritten on Windows (Unix has no "
+    "executable (a running .exe can't be overwritten on Windows; Unix has no "
     "such restriction). The underlying package is usually updated anyway; "
     "check with 'ccusage --version'. To refresh the command too, close any "
     "other running ccusage windows and re-run, or run it once via "
