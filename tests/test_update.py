@@ -500,8 +500,16 @@ def test_should_use_uv_false_when_no_uv_executable(monkeypatch):
     assert upd._should_use_uv() is False
 
 
-def test_uv_install_plain_upgrade_runs_uv_tool_upgrade(monkeypatch):
-    """force=False (plain --update path) runs `uv tool upgrade <name>`, ignoring tag."""
+def test_uv_install_force_false_still_force_installs_explicit_ref(monkeypatch):
+    """Regression test: force=False must NOT run a bare `uv tool upgrade`.
+
+    A bare `uv tool upgrade` silently no-ops (exit 0, "Nothing to upgrade")
+    against a tool pinned to a specific rev -- from a prior --update-pr /
+    --update-prerelease / --update-stable call, or from a user following the
+    README's own "pin a specific release" instructions -- which would make
+    `ccusage --update` falsely report success. force=False must therefore
+    build the exact same explicit-ref force-install command as force=True.
+    """
     captured: dict[str, list[str]] = {}
 
     def _record(cmd, *a, **k):
@@ -512,7 +520,7 @@ def test_uv_install_plain_upgrade_runs_uv_tool_upgrade(monkeypatch):
 
     rc = upd._uv_install("v9.9.9", force=False)
     assert rc == 0
-    assert captured["cmd"] == ["uv", "tool", "upgrade", upd.TOOL_NAME]
+    assert captured["cmd"] == ["uv", "tool", "install", "--force", f"git+{upd.GIT_URL}@v9.9.9"]
 
 
 def test_uv_install_force_runs_uv_tool_install_force_with_ref(monkeypatch):
@@ -530,8 +538,9 @@ def test_uv_install_force_runs_uv_tool_install_force_with_ref(monkeypatch):
     assert captured["cmd"] == ["uv", "tool", "install", "--force", f"git+{upd.GIT_URL}@v1.2.3"]
 
 
-def test_uv_install_force_falls_back_to_main(monkeypatch):
-    """force=True with tag=None (no release / no prerelease published) targets @main."""
+def test_uv_install_falls_back_to_main_regardless_of_force(monkeypatch):
+    """tag=None (no release / no prerelease published) targets @main, whether
+    force is True or False -- they now build an identical command."""
     captured: dict[str, list[str]] = {}
 
     def _record(cmd, *a, **k):
@@ -541,6 +550,10 @@ def test_uv_install_force_falls_back_to_main(monkeypatch):
     monkeypatch.setattr(upd.subprocess, "run", _record)
 
     rc = upd._uv_install(None, force=True)
+    assert rc == 0
+    assert captured["cmd"][-1] == f"git+{upd.GIT_URL}@main"
+
+    rc = upd._uv_install(None, force=False)
     assert rc == 0
     assert captured["cmd"][-1] == f"git+{upd.GIT_URL}@main"
 
@@ -600,7 +613,9 @@ def test_install_dispatches_to_uv_when_should_use_uv_is_true(monkeypatch):
 
 
 def test_perform_update_routes_through_uv_on_a_uv_tool_install(monkeypatch, capsys):
-    """End-to-end: on a pip-less uv-tool env, --update calls `uv tool upgrade`."""
+    """End-to-end: on a pip-less uv-tool env, --update force-installs the
+    explicit resolved tag via uv (not a bare `uv tool upgrade`, which would
+    no-op against a tool pinned to an older rev)."""
     monkeypatch.setattr(upd, "latest_release", lambda: "v9.9.9")
     monkeypatch.setattr(upd, "_should_use_uv", lambda: True)
 
@@ -615,7 +630,7 @@ def test_perform_update_routes_through_uv_on_a_uv_tool_install(monkeypatch, caps
     rc = upd.perform_update()
     out = capsys.readouterr().out
     assert rc == 0
-    assert captured["cmd"] == ["uv", "tool", "upgrade", upd.TOOL_NAME]
+    assert captured["cmd"] == ["uv", "tool", "install", "--force", f"git+{upd.GIT_URL}@v9.9.9"]
     assert "updated successfully" in out.lower()
 
 
@@ -680,7 +695,7 @@ def test_run_install_prints_hint_on_windows_self_replace_failure(monkeypatch, ca
 
     monkeypatch.setattr(upd.subprocess, "run", _record)
 
-    rc = upd._run_install(["uv", "tool", "upgrade", upd.TOOL_NAME], "uv", "uv tool upgrade cc-usage")
+    rc = upd._run_install(["uv", "tool", "upgrade", "cc-usage"], "uv", "uv tool upgrade cc-usage")
     out = capsys.readouterr().out
     assert rc == 2
     assert _WIN_LOCK_MSG in out  # the real tool output is still shown in full
@@ -727,7 +742,7 @@ def test_run_install_no_hint_on_success_even_with_signature(monkeypatch, capsys)
 
     monkeypatch.setattr(upd.subprocess, "run", _record)
 
-    rc = upd._run_install(["uv", "tool", "upgrade", upd.TOOL_NAME], "uv", "uv tool upgrade cc-usage")
+    rc = upd._run_install(["uv", "tool", "upgrade", "cc-usage"], "uv", "uv tool upgrade cc-usage")
     out = capsys.readouterr().out
     assert rc == 0
     assert "refusing to replace" not in out.lower()

@@ -63,8 +63,11 @@ uv tool install "git+https://github.com/ZhuoQiuMcgill/cc-usage.git"
 ccusage
 ```
 
-Pin a specific release by appending a tag (`…cc-usage.git@v2.1.0`). Upgrade later with
-`uv tool upgrade cc-usage`.
+Pin a specific release by appending a tag (`…cc-usage.git@v2.1.0`). A pin locks the exact
+git rev, so plain `uv tool upgrade cc-usage` won't move it forward later (it re-resolves
+the same pinned rev and reports nothing to do) — upgrade with `ccusage --update` instead
+(it force-installs the new release explicitly, regardless of any existing pin), or
+re-pin by hand with `uv tool install --force "git+…@vX.Y.Z"`.
 
 ### With pipx
 
@@ -95,7 +98,7 @@ python3 -m venv ~/.venvs/ccusage
 The simplest upgrade is your installer's own command:
 
 ```bash
-uv tool upgrade cc-usage      # if you installed with uv
+uv tool upgrade cc-usage      # if you installed with uv (unless you ever pinned a tag — see below)
 pipx upgrade cc-usage         # if you installed with pipx
 ```
 
@@ -109,9 +112,12 @@ ccusage --version        # print the installed version
 
 > The built-in `--update*` commands work on **every** install method. On pipx / venv
 > installs they shell out to `pip`. A **uv tool** environment has no `pip` — there they
-> detect that automatically and shell out to `uv` instead (`uv tool upgrade cc-usage`, or
-> `uv tool install --force "git+…@vX.Y.Z"` for the force-reinstall commands below), so no
-> manual step is needed.
+> detect that automatically and shell out to `uv tool install --force "git+…@<resolved
+> tag>"` instead, so no manual step is needed. This always targets the freshly resolved
+> release explicitly (never a bare `uv tool upgrade`), so it works even if the install was
+> previously pinned to an older tag by `--update-pr` / `--update-prerelease` /
+> `--update-stable`, or by hand — cases where plain `uv tool upgrade cc-usage` silently
+> has nothing to do.
 
 > **Windows:** running any `--update*` command from the same `ccusage` you're updating
 > can't replace that running `.exe` — Windows refuses to overwrite the image of a running
@@ -157,7 +163,7 @@ pipx install --force "git+https://github.com/ZhuoQiuMcgill/cc-usage.git@refs/pul
 After that the in-app `ccusage --update-pr`, `--update-prerelease`, `--update-stable`, and
 `--check-prerelease` commands are available on **every** install method, including uv tool —
 they detect the missing `pip` there and shell out to the equivalent `uv tool install --force`
-/ `uv tool upgrade` command automatically.
+command automatically.
 
 All of the update commands above reach the network **only** as explicit user actions; the
 passive panel/data path stays strictly no-network.
