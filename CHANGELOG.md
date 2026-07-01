@@ -8,6 +8,10 @@ See [VERSIONING.md](VERSIONING.md) for the release policy.
 
 ## [Unreleased]
 
+_No unreleased changes yet._
+
+## [2.1.3] - 2026-07-01
+
 ### Fixed
 
 - **`--update*` now works on a `uv tool` install.** The built-in self-update commands
@@ -99,7 +103,8 @@ formal, pip-installable tool.
   a GitHub Release on each `v*` tag, with PyPI publishing gated on a
   `PYPI_API_TOKEN` secret.
 
-[Unreleased]: https://github.com/ZhuoQiuMcgill/cc-usage/compare/v2.1.2...HEAD
+[Unreleased]: https://github.com/ZhuoQiuMcgill/cc-usage/compare/v2.1.3...HEAD
+[2.1.3]: https://github.com/ZhuoQiuMcgill/cc-usage/compare/v2.1.2...v2.1.3
 [2.1.2]: https://github.com/ZhuoQiuMcgill/cc-usage/compare/v2.1.1...v2.1.2
 [2.1.1]: https://github.com/ZhuoQiuMcgill/cc-usage/compare/v2.1.0...v2.1.1
 [2.1.0]: https://github.com/ZhuoQiuMcgill/cc-usage/compare/v2.0.0...v2.1.0
