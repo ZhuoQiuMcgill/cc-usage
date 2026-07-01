@@ -8,7 +8,28 @@ See [VERSIONING.md](VERSIONING.md) for the release policy.
 
 ## [Unreleased]
 
-_No unreleased changes yet._
+### Added
+
+- **Persistent parse cache for near-instant warm startup.** The incremental parse state
+  (per-file offsets + extracted records + the dedup set) is now saved to
+  `~/.config/cc-usage/parse-cache.pkl` and reloaded on the next launch, so a relaunch
+  re-parses only transcript bytes appended since last time instead of the entire corpus.
+  On a real ~3 GB / 6k-file history this took cold startup from ~7 s to under 1 s (~10×),
+  with warm-start totals byte-identical to a cold scan. The cache is pure derived data:
+  it's invalidated automatically on a pricing-table change, a deleted transcript, or a
+  format-version bump, and a missing/corrupt/incompatible cache degrades silently to a
+  full scan (never a crash). Safe to delete at any time.
+
+### Changed
+
+- **Startup no longer blocks the UI.** The first (potentially multi-second) transcript
+  scan now runs in a background worker thread: the panel paints immediately with a brief
+  `scanning transcripts…` placeholder and fills in when the scan completes, instead of
+  freezing until it's done.
+- **Optional `orjson` acceleration.** If the [`orjson`](https://github.com/ijl/orjson)
+  package is present it's used to parse transcript JSON (~2× faster on this workload);
+  it is not a dependency and the stdlib `json` path (with tolerant UTF-8 decode) is used
+  otherwise. This only affects the rare cold scan — warm starts read almost nothing.
 
 ## [2.1.4] - 2026-07-01
 

@@ -21,29 +21,43 @@ from .aggregate import (
     aggregate_range,
     series,
 )
+from pathlib import Path
+
 from .config import Config
 from .parser import Parser
+from .paths import PARSE_CACHE
 from .pricing import load_pricing
 from .ratelimits import get_buckets, load_ratelimits
 from .render import RenderState
 
 
 class Engine:
-    def __init__(self, config: Config):
+    def __init__(self, config: Config, cache_path: Path | None = PARSE_CACHE):
         self.config = config
         pricing, warns = load_pricing()
         self.warnings: list[str] = list(warns)
-        self.parser = Parser(pricing)
+        # cache_path defaults to the real persistent cache for the app/CLI; tests pass
+        # cache_path=None to stay fully in-memory and hermetic.
+        self.parser = Parser(pricing, cache_path=cache_path)
         self._scanned = False
         # Heartbeat view state (T3 R2). Default window 24h, default metric cost.
         self.hb_window = "24h"
         self.hb_metric = "cost"
 
     # ── data ───────────────────────────────────────────────────────────────
+    @property
+    def is_scanned(self) -> bool:
+        return self._scanned
+
     def scan(self) -> None:
         """Read new transcript lines (full on first call, incremental after)."""
         self.parser.scan()
         self._scanned = True
+
+    def save_cache(self) -> None:
+        """Persist the parser's state so the next launch starts warm (no-op if the
+        engine was built with cache_path=None, e.g. in tests)."""
+        self.parser.save_cache()
 
     def ensure_scanned(self) -> None:
         if not self._scanned:

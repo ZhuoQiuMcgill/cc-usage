@@ -7,13 +7,18 @@ subagent usage is included (it is real spend). Anything malformed or non-usage i
 skipped, never fatal (Rulebook rule 4).
 
 Reads are incremental (M6 / T0 §9): each file's byte offset + size + mtime are
-remembered, and on a later scan only newly appended *complete* lines are read.
+remembered, and on a later scan only newly appended *complete* lines are read. That
+state can also be *persisted* across process runs (a stale/corrupt cache is ignored),
+so a relaunch re-parses only bytes appended since the last run — see `load_cache` /
+`save_cache`.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import pickle
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -21,11 +26,36 @@ from pathlib import Path
 from .cost import compute_cost, get_rates, normalize_model
 from .paths import PROJECTS_DIR
 
+# Optional fast JSON. orjson (a C extension) parses bytes directly and is ~2x the
+# stdlib on this workload; it's NOT a hard dependency, so we use it only if the user
+# happens to have it and fall back to stdlib json (with tolerant UTF-8 decode) otherwise.
+try:
+    import orjson as _orjson
+except ImportError:  # pragma: no cover - depends on the environment
+    _orjson = None
+
+
+def _json_loads(raw: bytes):
+    """Parse a JSON line from raw bytes, via orjson when present else stdlib json.
+
+    The stdlib path keeps the original tolerant decode (`errors="replace"`) so a line
+    with a stray bad byte but valid JSON still parses; orjson raises on invalid UTF-8,
+    which `_ingest_line` already treats as malformed-and-skipped (never fatal, r4).
+    """
+    if _orjson is not None:
+        return _orjson.loads(raw)
+    return json.loads(raw.decode("utf-8", "replace"))
+
+
 # Cheap byte prefilter: an assistant usage line must contain both markers. No false
 # negatives (an assistant record with usage always has them), so this only skips
 # lines we'd discard anyway — it just avoids a full json.loads on most lines.
 _MARK_USAGE = b'"usage"'
 _MARK_ASSISTANT = b"assistant"
+
+# Persistent-cache format version. Bump whenever the on-disk shape below or the
+# extraction/cost logic changes, so an older cache is ignored rather than mis-read.
+_CACHE_VERSION = 1
 
 
 @dataclass(slots=True)
@@ -122,8 +152,17 @@ class Parser:
     everything; subsequent scans read only appended lines (M6).
     """
 
-    def __init__(self, pricing: dict[str, dict[str, float]]):
+    def __init__(
+        self,
+        pricing: dict[str, dict[str, float]],
+        cache_path: Path | None = None,
+    ):
         self.pricing = pricing
+        # When set, scan() loads persisted state before its first read and save_cache()
+        # can write it back. Left None (the default) the parser is fully self-contained
+        # and touches no cache — which is what the unit tests rely on.
+        self.cache_path = cache_path
+        self._cache_loaded = False
         self.records: list[UsageRecord] = []
         self.stats = ParseStats()
         self._seen: set[tuple[object, object]] = set()
@@ -208,7 +247,7 @@ class Parser:
             return
         self.stats.lines_read += 1
         try:
-            obj = json.loads(raw.decode("utf-8", "replace"))
+            obj = _json_loads(raw)
         except (json.JSONDecodeError, ValueError):
             self.stats.malformed += 1
             return
@@ -259,12 +298,122 @@ class Parser:
         state.mtime = st.st_mtime
 
     def scan(self) -> ParseStats:
-        """Read any new transcript lines and fold them into running aggregates."""
+        """Read any new transcript lines and fold them into running aggregates.
+
+        On the *first* scan, if a cache path is configured, previously persisted
+        state (records + dedup set + per-file offsets) is loaded first, so only
+        transcript bytes appended since that snapshot are read now (M6 across runs).
+        """
         files = iter_transcript_files()
+        if self.cache_path is not None and not self._cache_loaded:
+            self._cache_loaded = True
+            self._load_cache({str(p) for p in files})
         self.stats.files_seen = len(files)
         for path in files:
             self._read_new(path)
         return self.stats
+
+    # ── persistent cache (M6 across process runs) ─────────────────────────────
+    def _pricing_fingerprint(self) -> str:
+        """Stable hash of the active pricing table.
+
+        Cached records carry a *computed* cost, so a cache built under different rates
+        must be discarded — this fingerprint, stored in the cache, detects that.
+        """
+        blob = json.dumps(self.pricing, sort_keys=True, default=str).encode("utf-8")
+        return hashlib.sha256(blob).hexdigest()
+
+    def _load_cache(self, current_paths: set[str]) -> None:
+        """Populate state from the on-disk cache, or leave it empty on any mismatch.
+
+        The cache is honoured only when it is fully consistent with *this* run:
+        matching format version, matching pricing fingerprint, and every cached file
+        still present on disk. That last check matters — records don't carry their
+        source file, so a *deleted* transcript couldn't be subtracted from the flat
+        record list; discarding the cache and rescanning keeps a warm start's totals
+        byte-identical to a cold one. ANY error (missing/corrupt/incompatible pickle)
+        degrades silently to an empty state → a normal full scan (Rulebook r4).
+        """
+        try:
+            with open(self.cache_path, "rb") as fh:
+                data = pickle.load(fh)
+        except Exception:
+            # Deliberately broad: unpickling malformed input can raise almost anything
+            # (the pickle docs say as much). A bad cache must never be fatal — it just
+            # means a cold scan this time (Rulebook r4). The data is re-validated below.
+            return
+        if not isinstance(data, dict):
+            return
+        if data.get("version") != _CACHE_VERSION:
+            return
+        if data.get("pricing_fp") != self._pricing_fingerprint():
+            return
+        files = data.get("files")
+        records = data.get("records")
+        seen = data.get("seen")
+        if not isinstance(files, dict) or records is None or seen is None:
+            return
+        # A cached file that no longer exists would leave orphaned records we can't
+        # remove → discard the whole cache and let scan() rebuild from disk.
+        if any(p not in current_paths for p in files):
+            return
+        try:
+            self.records = [UsageRecord(*t) for t in records]
+            self._seen = {tuple(k) for k in seen}
+            self._files = {
+                p: _FileState(offset=o, size=s, mtime=m)
+                for p, (o, s, m) in files.items()
+            }
+        except (TypeError, ValueError):
+            # A shape we don't recognise — treat exactly like a cold start.
+            self.records = []
+            self._seen = set()
+            self._files = {}
+            return
+        self.stats.records = len(self.records)
+        self.stats.unknown_models = {
+            r.model_norm for r in self.records if not r.known and r.model_norm
+        }
+
+    def save_cache(self) -> None:
+        """Persist current state to the cache path (atomic; no-op if unconfigured).
+
+        Serialises records as plain tuples (not the dataclass) so the on-disk format
+        is decoupled from the class layout, and writes via a temp file + os.replace so
+        a crash mid-write can never leave a half-written cache. Any write error is
+        swallowed — the cache is an optimisation, never load-bearing."""
+        if self.cache_path is None:
+            return
+        data = {
+            "version": _CACHE_VERSION,
+            "pricing_fp": self._pricing_fingerprint(),
+            "files": {
+                p: (s.offset, s.size, s.mtime) for p, s in self._files.items()
+            },
+            "records": [
+                (
+                    r.ts,
+                    r.model_raw,
+                    r.model_norm,
+                    r.known,
+                    r.input_tokens,
+                    r.output_tokens,
+                    r.cache_read,
+                    r.cache_creation,
+                    r.cost,
+                )
+                for r in self.records
+            ],
+            "seen": list(self._seen),
+        }
+        try:
+            self.cache_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.cache_path.with_name(self.cache_path.name + ".tmp")
+            with open(tmp, "wb") as fh:
+                pickle.dump(data, fh, protocol=pickle.HIGHEST_PROTOCOL)
+            os.replace(tmp, self.cache_path)
+        except OSError:
+            return
 
     def ingest_file(self, path: str | Path) -> None:
         """Read one file in full (non-incremental). Used by tests and one-shots."""

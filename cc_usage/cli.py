@@ -88,6 +88,9 @@ def run_once(config) -> None:
 
     engine = Engine(config)
     engine.scan()
+    # Persist parse state right after the (expensive) scan — before rendering — so the
+    # next launch starts warm even if the terminal render hiccups.
+    engine.save_cache()
     Console().print(build_panel(engine.snapshot()))
 
 

@@ -110,8 +110,41 @@ class CCUsageApp(App):
         yield Footer()
 
     def on_mount(self) -> None:
-        # Background full scan, then render + start the timers.
+        # If the engine already has data (a pre-warmed/seeded engine, e.g. tests), just
+        # render and start the timers. Otherwise paint an immediate placeholder and run
+        # the first scan OFF the UI thread so a large ~/.claude never freezes startup —
+        # the panel appears at once and fills in when the worker finishes.
+        if self.engine.is_scanned:
+            self.render_panel()
+            self._start_timers()
+        else:
+            self._render_scanning()
+            self.run_worker(self._background_scan, thread=True, exclusive=True)
+
+    def _render_scanning(self) -> None:
+        """Paint a lightweight 'scanning…' frame without touching the engine.
+
+        Deliberately does NOT call snapshot() — that would trigger the (still-pending)
+        full scan synchronously on the UI thread, defeating the whole point.
+        """
+        base = self.screen_stack[0] if self.screen_stack else None
+        if base is None:
+            return
+        try:
+            base.query_one("#spend", Static).update(
+                Text("scanning transcripts…", style="dim")
+            )
+        except Exception:
+            return
+
+    def _background_scan(self) -> None:
+        """Worker body (runs in a thread): the heavy first scan, then persist the cache
+        so the next launch is warm. Hands the result back to the UI thread to render."""
         self.engine.scan()
+        self.engine.save_cache()
+        self.call_from_thread(self._on_initial_scan_done)
+
+    def _on_initial_scan_done(self) -> None:
         self.render_panel()
         self._start_timers()
 

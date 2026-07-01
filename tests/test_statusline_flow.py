@@ -86,7 +86,7 @@ def test_install_then_restore_via_settings_keyboard(fake_env):
     orig_script_sha = _sha(script)
 
     async def scenario():
-        eng = Engine(Config())
+        eng = Engine(Config(), cache_path=None)  # hermetic: never touch the real parse cache
         eng._scanned = True
         app = CCUsageApp(eng)
         async with app.run_test() as pilot:

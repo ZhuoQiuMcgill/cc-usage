@@ -321,6 +321,16 @@ are flagged with a `*`, and never crash the tool. Model ids are matched tolerant
 - **Incremental parsing:** each file's byte offset + size + mtime are remembered; later
   refreshes read only newly appended lines (no full re-scan per tick) and stay smooth across
   hundreds of files.
+- **Warm startup (persistent cache):** that incremental state is also saved to disk
+  (`parse-cache.pkl`), so a **relaunch re-parses only the bytes appended since last time**
+  instead of the whole corpus — a multi-GB history that took seconds to scan cold opens in
+  a fraction of that warm. The cache is pure derived data: it's invalidated automatically
+  when the pricing table changes, a transcript is deleted, or the format version bumps, and
+  a missing/corrupt cache silently falls back to a full scan (results are always identical
+  to a cold parse). The **first** scan also runs off the UI thread, so even a cold start
+  paints immediately (a brief `scanning transcripts…`) instead of freezing. If the optional
+  [`orjson`](https://github.com/ijl/orjson) package happens to be installed, it's used to
+  speed up that cold parse; it is not required.
 
 ## Files ccusage owns
 
@@ -331,6 +341,7 @@ config.json                 your settings
 pricing.json                editable price table
 ratelimits.json             last captured 5h/7d limits (only while the wrapper is installed)
 statusline-wrapper.sh       the capture wrapper (only while installed)
+parse-cache.pkl             warm-start parse cache (derived; safe to delete anytime)
 backups/                    settings.json.orig, statusline-command.sh.orig, snapshots
 ```
 
