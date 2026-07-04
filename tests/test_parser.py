@@ -168,6 +168,36 @@ def test_merge_takes_field_max_not_sum(tmp_path):
     assert r.cache_creation == 300  # not summed to 900
 
 
+def test_merge_max_applies_to_every_counter_out_of_order(tmp_path):
+    # Vary EVERY counter out of order, with each field's max at a different line
+    # position, so a regression from field-wise max to first-wins, last-wins or sum
+    # on ANY single counter fails at least one assertion. (The other merge tests
+    # keep input/cache identical across lines, which such a regression would pass.)
+    lines = [
+        _asst_line("r", "m", inp=300, out=7, cache_read=800, cache_creation=100),
+        _asst_line("r", "m", inp=900, out=2000, cache_read=200, cache_creation=400),
+        _asst_line("r", "m", inp=600, out=500, cache_read=500, cache_creation=250),
+    ]
+    p = _parse_lines(tmp_path, lines)
+    assert len(p.records) == 1
+    r = p.records[0]
+    assert r.input_tokens == 900  # middle line: catches first(300)/last(600)/sum(1800)
+    assert r.output_tokens == 2000  # middle: catches first(7)/last(500)/sum(2507)
+    assert r.cache_read == 800  # first line: catches last(500)/sum(1500)
+    assert r.cache_creation == 400  # middle: catches first(100)/last(250)/sum(750)
+    # and cost is recomputed from the merged maxima, not any single line's counters
+    expected = compute_cost(
+        input_tokens=900,
+        output_tokens=2000,
+        cache_read=800,
+        cache_creation_total=400,
+        ephemeral_5m=None,
+        ephemeral_1h=None,
+        rates=RATES_OPUS,
+    )
+    assert math.isclose(r.cost, expected, abs_tol=1e-12)
+
+
 def test_distinct_message_ids_stay_separate(tmp_path):
     lines = [
         _asst_line("r1", "m1", inp=100, out=10),

@@ -11,9 +11,11 @@ Hermetic: PROJECTS_DIR is monkeypatched to a tmp dir; the cache is a tmp file.
 from __future__ import annotations
 
 import json
+import math
 import pickle
 
 import cc_usage.parser as P
+from cc_usage.cost import compute_cost
 from cc_usage.parser import Parser, _json_loads
 
 PRICING = {"claude-opus-4-8": {"input": 5.0, "output": 25.0}}
@@ -123,6 +125,91 @@ def test_streaming_merge_survives_warm_start(tmp_path, monkeypatch):
     assert len(p2.records) == 1  # merged in place, not a second record
     assert p2.records[0].output_tokens == 2000  # final counts win across the warm start
     assert p2.stats.lines_read == 1  # only the appended final line was read
+
+
+def _cc_line(req: str, mid: str, inp: int, out: int) -> str:
+    """Like _line but with a SPLIT cache_creation (1000 in 5m + 3000 in 1h), so a
+    merged cost must take the sub-bucket path (1.25x/2x), not the aggregate fallback."""
+    return (
+        json.dumps(
+            {
+                "type": "assistant",
+                "requestId": req,
+                "timestamp": "2026-06-01T00:00:00.000Z",
+                "message": {
+                    "id": mid,
+                    "model": "claude-opus-4-8",
+                    "usage": {
+                        "input_tokens": inp,
+                        "output_tokens": out,
+                        "cache_creation_input_tokens": 4000,
+                        "cache_creation": {
+                            "ephemeral_5m_input_tokens": 1000,
+                            "ephemeral_1h_input_tokens": 3000,
+                        },
+                    },
+                },
+            }
+        )
+        + "\n"
+    )
+
+
+def test_subbucket_merge_survives_warm_start(tmp_path, monkeypatch):
+    """The private _eph_5m/_eph_1h sub-buckets must round-trip the cache with their
+    positions intact: a merge after a warm start recomputes cost FROM the loaded
+    fields, so a save/load field reorder (or loss) would silently degrade every
+    cached record to the 1.25x aggregate fallback — this is the only test that
+    would catch it (T9)."""
+    f = _seed(tmp_path, monkeypatch, _cc_line("r", "m", 1000, 7))  # partial, WITH buckets
+    cache = tmp_path / "cache.pkl"
+
+    p1 = Parser(PRICING, cache_path=cache)
+    p1.scan()
+    p1.save_cache()
+
+    # Direct round-trip pin, BEFORE any merge can re-supply the buckets from a new
+    # line: the loaded record must carry them in the right slots (asymmetric values,
+    # so a 5m/1h swap or a loss-to-None is caught here even in isolation).
+    probe = Parser(PRICING, cache_path=cache)
+    probe.scan()
+    assert (probe.records[0]._eph_5m, probe.records[0]._eph_1h) == (1000, 3000)
+
+    # A new process appends the FINAL line, then warm-starts and merges.
+    with open(f, "a") as fh:
+        fh.write(_cc_line("r", "m", 1000, 2000))
+    p2 = Parser(PRICING, cache_path=cache)
+    p2.scan()
+    assert len(p2.records) == 1
+    rec = p2.records[0]
+    assert rec.output_tokens == 2000
+
+    # Exact sub-bucket cost vs the fallback it must NOT collapse to — both pinned
+    # numerically so the ~14% gap between the paths is unmissable:
+    #   sub-bucket: 1000*5 + 2000*25 + 1000*5*1.25 + 3000*5*2.00 (/1M) = 0.09125
+    #   fallback:   1000*5 + 2000*25 + 4000*5*1.25              (/1M) = 0.08
+    subbucket = compute_cost(
+        input_tokens=1000,
+        output_tokens=2000,
+        cache_read=0,
+        cache_creation_total=4000,
+        ephemeral_5m=1000,
+        ephemeral_1h=3000,
+        rates=(5.0, 25.0),
+    )
+    fallback = compute_cost(
+        input_tokens=1000,
+        output_tokens=2000,
+        cache_read=0,
+        cache_creation_total=4000,
+        ephemeral_5m=None,
+        ephemeral_1h=None,
+        rates=(5.0, 25.0),
+    )
+    assert math.isclose(subbucket, 0.09125, abs_tol=1e-9)
+    assert math.isclose(fallback, 0.08, abs_tol=1e-9)
+    assert math.isclose(rec.cost, subbucket, abs_tol=1e-12)  # loaded buckets used
+    assert not math.isclose(rec.cost, fallback, abs_tol=1e-9)  # did NOT fall back
 
 
 def test_pricing_change_invalidates_cache(tmp_path, monkeypatch):

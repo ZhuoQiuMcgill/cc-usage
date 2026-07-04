@@ -105,6 +105,28 @@ def test_streaming_merge_across_scans(tmp_path, monkeypatch):
     assert p.stats.lines_read == 3  # 2 in scan 1 + only the 1 appended line in scan 2
 
 
+def test_streaming_merge_across_files(tmp_path, monkeypatch):
+    """The same (requestId, message.id) split across TWO files — the parent session
+    holding the partial snapshot and a subagent transcript holding the final counts
+    (the layout iter_transcript_files descends for) — merges to the final counts
+    exactly once. The scan order of the two files is a sort detail; field-wise max
+    makes the merged result the same either way (T9)."""
+    monkeypatch.setattr(P, "PROJECTS_DIR", tmp_path)
+    proj = tmp_path / "proj"
+    sub = proj / "session" / "subagents" / "wf_1"
+    sub.mkdir(parents=True)
+    (proj / "session.jsonl").write_text(_line("r", "m", 1000, 7))  # partial snapshot
+    (sub / "agent.jsonl").write_text(_line("r", "m", 1000, 2000))  # final counts
+
+    p = Parser(PRICING)
+    p.scan()
+    assert p.stats.records == 1  # one record, not one per file
+    assert p.stats.duplicates == 1  # the other file's line merged in
+    assert len(p.records) == 1
+    assert p.records[0].output_tokens == 2000  # final counts, whichever file read first
+    assert p.records[0].input_tokens == 1000  # identical fields not summed to 2000
+
+
 def test_truncation_is_handled(tmp_path, monkeypatch):
     monkeypatch.setattr(P, "PROJECTS_DIR", tmp_path)
     proj = tmp_path / "proj"
