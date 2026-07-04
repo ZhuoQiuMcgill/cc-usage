@@ -103,6 +103,28 @@ def test_warm_start_records_identical_to_cold_scan(tmp_path, monkeypatch):
     assert any(not r.known for r in warm.records)
 
 
+def test_streaming_merge_survives_warm_start(tmp_path, monkeypatch):
+    """A partial streaming line cached by one run must merge with the final line the
+    next run reads — the per-message index is rebuilt from the cache with object
+    identity, so the append folds into the cached record (T9), not a new one."""
+    f = _seed(tmp_path, monkeypatch, _line("r", "m", 1000, 7))  # partial snapshot only
+    cache = tmp_path / "cache.pkl"
+
+    p1 = Parser(PRICING, cache_path=cache)
+    p1.scan()
+    assert p1.records[0].output_tokens == 7
+    p1.save_cache()
+
+    # A new process appends the FINAL line, then warm-starts.
+    with open(f, "a") as fh:
+        fh.write(_line("r", "m", 1000, 2000))
+    p2 = Parser(PRICING, cache_path=cache)
+    p2.scan()
+    assert len(p2.records) == 1  # merged in place, not a second record
+    assert p2.records[0].output_tokens == 2000  # final counts win across the warm start
+    assert p2.stats.lines_read == 1  # only the appended final line was read
+
+
 def test_pricing_change_invalidates_cache(tmp_path, monkeypatch):
     """Cached costs are computed under a rate table; a different table must rescan."""
     _seed(tmp_path, monkeypatch, _line("r1", "m1", 100, 10))

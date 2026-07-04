@@ -15,6 +15,25 @@ See [VERSIONING.md](VERSIONING.md) for the release policy.
   auto "What's Changed" appended), instead of a bare auto-generated PR-title list — so
   published release notes follow the same Keep a Changelog convention as this file.
 
+### Fixed
+
+- **Streaming-usage undercount in the transcript parser.** Claude Code writes
+  several transcript lines for a single streaming assistant reply — all sharing one
+  `(requestId, message.id)` — where only `output_tokens` grows across them (the
+  first line is a partial `message_start` snapshot of ~1–7 output tokens; the last
+  carries the final counts). The parser deduped by that key and kept the **first**
+  line, throwing away the final output count — the most expensive tokens — so cost
+  and output tokens were systematically **undercounted**, severely so for
+  agent-heavy sessions (on one real 103-agent workflow session, output tokens were
+  undercounted by more than an order of magnitude and reported cost was roughly half
+  of actual). Repeat lines are now **merged** into the kept record: field-wise max
+  of every token counter, cost recomputed from the merged counts, and the first
+  line's timestamp preserved so the record never shifts time bucket. The merge holds
+  across incremental scans and warm starts from the persistent parse cache (whose
+  format version was bumped, so any older cache is rebuilt once). **Historical totals
+  will increase** after this fix — they were undercounted before, and the higher
+  numbers are the correct ones.
+
 ## [2.2.0] - 2026-07-01
 
 ### Added
