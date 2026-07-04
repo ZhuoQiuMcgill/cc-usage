@@ -1,10 +1,15 @@
 """Transcript parser (T0 §4A) — dedup, tolerant extraction, incremental reads.
 
 Scans ~/.claude/projects/<encoded-cwd>/<session-id>.jsonl. For each *assistant*
-record that carries a usage object it emits one deduplicated UsageRecord, keyed by
-(requestId, message.id) so retries/sidechain echoes are counted once. Sidechain /
-subagent usage is included (it is real spend). Anything malformed or non-usage is
-skipped, never fatal (Rulebook rule 4).
+record that carries a usage object it keeps one UsageRecord per unique
+(requestId, message.id). Claude Code streams a single assistant reply across
+several transcript lines that share that key while only output_tokens grows (the
+first line is a partial message_start snapshot; the last carries the final
+counts), so repeat lines are *merged* into the kept record — field-wise max of the
+counters, cost recomputed — rather than dropped as duplicates, which would throw
+away the final (priciest) output tokens (T9). Retries/sidechain echoes still
+collapse to one record. Sidechain / subagent usage is included (it is real spend).
+Anything malformed or non-usage is skipped, never fatal (Rulebook rule 4).
 
 Reads are incremental (M6 / T0 §9): each file's byte offset + size + mtime are
 remembered, and on a later scan only newly appended *complete* lines are read. That
@@ -55,7 +60,9 @@ _MARK_ASSISTANT = b"assistant"
 
 # Persistent-cache format version. Bump whenever the on-disk shape below or the
 # extraction/cost logic changes, so an older cache is ignored rather than mis-read.
-_CACHE_VERSION = 1
+# v2: records gained the private cache_creation sub-buckets and the cache now stores
+# a per-record dedup key so streaming merges (T9) survive a warm start.
+_CACHE_VERSION = 2
 
 
 @dataclass(slots=True)
@@ -69,6 +76,12 @@ class UsageRecord:
     cache_read: int
     cache_creation: int  # aggregate creation tokens (5m + 1h)
     cost: float
+    # Raw cache_creation sub-buckets, kept privately so a later streaming line for
+    # the same message (T9) can be merged and its cost recomputed while preserving
+    # the None-vs-0 distinction compute_cost relies on (None -> 1.25x aggregate
+    # fallback). Not part of the public token/cost surface.
+    _eph_5m: int | None = None
+    _eph_1h: int | None = None
 
     @property
     def cache_tokens(self) -> int:
@@ -84,7 +97,7 @@ class ParseStats:
     files_seen: int = 0
     lines_read: int = 0
     records: int = 0  # unique usage records kept
-    duplicates: int = 0
+    duplicates: int = 0  # repeat-key lines merged into an existing record (T9)
     malformed: int = 0
     unknown_models: set[str] = field(default_factory=set)
 
@@ -145,11 +158,26 @@ def _dedup_key(obj: dict, msg: dict) -> tuple[object, object] | None:
     return (obj.get("requestId"), mid)
 
 
+def _max_opt(a: int | None, b: int | None) -> int | None:
+    """Field-wise max that preserves the None ('sub-bucket absent') signal.
+
+    compute_cost distinguishes None (no cache_creation object -> 1.25x fallback on
+    the aggregate) from 0 (object present, bucket empty). When merging streaming
+    lines keep None only if BOTH lacked the bucket; if either reported it, that
+    value wins (real streaming lines all carry identical cache fields anyway)."""
+    if a is None:
+        return b
+    if b is None:
+        return a
+    return max(a, b)
+
+
 class Parser:
     """Stateful, incremental transcript reader.
 
-    Hold a dedup set + per-file offsets across scans. The first scan reads
-    everything; subsequent scans read only appended lines (M6).
+    Hold a per-message record index + per-file offsets across scans. The first scan
+    reads everything; subsequent scans read only appended lines (M6), folding each
+    into the record its (requestId, message.id) already points at (T9).
     """
 
     def __init__(
@@ -165,7 +193,11 @@ class Parser:
         self._cache_loaded = False
         self.records: list[UsageRecord] = []
         self.stats = ParseStats()
-        self._seen: set[tuple[object, object]] = set()
+        # One kept UsageRecord per unique (requestId, message.id). A repeat key
+        # doesn't drop the line — it merges into the record stored here (T9). The
+        # values ARE the objects in self.records, so mutating in place is picked up
+        # by aggregate()/series(). Persists across scans (and, via the cache, runs).
+        self._by_key: dict[tuple[object, object], UsageRecord] = {}
         self._files: dict[str, _FileState] = {}
 
     # ── extraction ────────────────────────────────────────────────────────
@@ -183,18 +215,6 @@ class Parser:
         if model_raw == "<synthetic>":
             # Harness-generated, non-billable turn (0 tokens). Not real spend; skip
             # so it neither adds a noise row nor trips the unknown-model flag.
-            return None
-
-        key = _dedup_key(obj, msg)
-        if key is not None:
-            if key in self._seen:
-                self.stats.duplicates += 1
-                return None
-            self._seen.add(key)
-
-        ts = parse_timestamp(obj.get("timestamp"))
-        if ts is None:
-            # No usable timestamp -> can't window it; skip rather than guess.
             return None
 
         def _int(v: object) -> int:
@@ -215,6 +235,41 @@ class Parser:
         else:
             eph_5m = eph_1h = None
 
+        # Streaming merge (T9): Claude Code writes one transcript line per content
+        # block of a streaming assistant reply, all sharing one (requestId,
+        # message.id), and only output_tokens grows across them. Fold a repeat line
+        # into the record we already kept — field-wise max of every counter
+        # (monotonic within a message, so max is order-independent and robust to a
+        # final line landing in a later scan than the first) — then recompute cost.
+        # No timestamp is needed here: we keep the first line's ts so the record
+        # never shifts time bucket as later lines arrive.
+        key = _dedup_key(obj, msg)
+        if key is not None:
+            existing = self._by_key.get(key)
+            if existing is not None:
+                existing.input_tokens = max(existing.input_tokens, input_tokens)
+                existing.output_tokens = max(existing.output_tokens, output_tokens)
+                existing.cache_read = max(existing.cache_read, cache_read)
+                existing.cache_creation = max(existing.cache_creation, cache_creation_total)
+                existing._eph_5m = _max_opt(existing._eph_5m, eph_5m)
+                existing._eph_1h = _max_opt(existing._eph_1h, eph_1h)
+                existing.cost = compute_cost(
+                    input_tokens=existing.input_tokens,
+                    output_tokens=existing.output_tokens,
+                    cache_read=existing.cache_read,
+                    cache_creation_total=existing.cache_creation,
+                    ephemeral_5m=existing._eph_5m,
+                    ephemeral_1h=existing._eph_1h,
+                    rates=get_rates(existing.model_raw, self.pricing),
+                )
+                self.stats.duplicates += 1
+                return None  # merged in place; no new record to append
+
+        ts = parse_timestamp(obj.get("timestamp"))
+        if ts is None:
+            # No usable timestamp -> can't window it; skip rather than guess.
+            return None
+
         model_norm = normalize_model(model_raw)
         rates = get_rates(model_raw, self.pricing)
         known = rates is not None
@@ -230,7 +285,7 @@ class Parser:
             ephemeral_1h=eph_1h,
             rates=rates,
         )
-        return UsageRecord(
+        rec = UsageRecord(
             ts=ts,
             model_raw=model_raw,
             model_norm=model_norm or "(unknown)",
@@ -240,7 +295,14 @@ class Parser:
             cache_read=cache_read,
             cache_creation=cache_creation_total,
             cost=cost,
+            _eph_5m=eph_5m,
+            _eph_1h=eph_1h,
         )
+        # Register only once a real record exists, so a first line that lacks a
+        # timestamp doesn't claim the key and strand the message's later lines.
+        if key is not None:
+            self._by_key[key] = rec
+        return rec
 
     def _ingest_line(self, raw: bytes) -> None:
         if _MARK_USAGE not in raw or _MARK_ASSISTANT not in raw:
@@ -350,16 +412,24 @@ class Parser:
             return
         files = data.get("files")
         records = data.get("records")
-        seen = data.get("seen")
-        if not isinstance(files, dict) or records is None or seen is None:
+        keys = data.get("keys")
+        if not isinstance(files, dict) or records is None or keys is None:
             return
         # A cached file that no longer exists would leave orphaned records we can't
         # remove → discard the whole cache and let scan() rebuild from disk.
         if any(p not in current_paths for p in files):
             return
         try:
-            self.records = [UsageRecord(*t) for t in records]
-            self._seen = {tuple(k) for k in seen}
+            recs = [UsageRecord(*t) for t in records]
+            # Rebuild the per-message index from the parallel key list, pointing at
+            # the SAME record objects so a streaming line appended after this warm
+            # start merges into the cached record in place (T9).
+            by_key: dict[tuple[object, object], UsageRecord] = {}
+            for rec, k in zip(recs, keys, strict=True):
+                if k is not None:
+                    by_key[tuple(k)] = rec
+            self.records = recs
+            self._by_key = by_key
             self._files = {
                 p: _FileState(offset=o, size=s, mtime=m)
                 for p, (o, s, m) in files.items()
@@ -367,7 +437,7 @@ class Parser:
         except (TypeError, ValueError):
             # A shape we don't recognise — treat exactly like a cold start.
             self.records = []
-            self._seen = set()
+            self._by_key = {}
             self._files = {}
             return
         self.stats.records = len(self.records)
@@ -384,6 +454,9 @@ class Parser:
         swallowed — the cache is an optimisation, never load-bearing."""
         if self.cache_path is None:
             return
+        # Reverse index: the dedup key (if any) that points at each record, so a
+        # warm start can rebuild self._by_key with the same object identity (T9).
+        rec_key = {id(r): k for k, r in self._by_key.items()}
         data = {
             "version": _CACHE_VERSION,
             "pricing_fp": self._pricing_fingerprint(),
@@ -401,10 +474,12 @@ class Parser:
                     r.cache_read,
                     r.cache_creation,
                     r.cost,
+                    r._eph_5m,
+                    r._eph_1h,
                 )
                 for r in self.records
             ],
-            "seen": list(self._seen),
+            "keys": [rec_key.get(id(r)) for r in self.records],
         }
         try:
             self.cache_path.parent.mkdir(parents=True, exist_ok=True)
