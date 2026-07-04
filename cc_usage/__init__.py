@@ -6,4 +6,4 @@ heartbeat, rolling spend windows (1h/5h/24h/7d/all-time), plus the official 5-ho
 viewing, switching views, and all configuration — is driven by arrow keys + Enter.
 """
 
-__version__ = "2.2.0"
+__version__ = "2.2.1"
