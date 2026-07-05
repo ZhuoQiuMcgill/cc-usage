@@ -8,7 +8,19 @@ See [VERSIONING.md](VERSIONING.md) for the release policy.
 
 ## [Unreleased]
 
-_No unreleased changes yet._
+### Fixed
+
+- **Stale 5h/7d limit bars after a window resets.** The limit panel renders from the
+  last statusline capture, which only refreshes when a Claude Code turn fires. If a
+  window reset while nothing was running (e.g. you hit 85%, closed everything overnight,
+  and the 5-hour window rolled over), the panel kept showing the old **85%** until the
+  next Claude Code turn wrote a fresh capture. The bars are now evaluated against the
+  current time on every refresh tick: once a bucket's `resets_at` moment has passed, it
+  renders **0%** with an empty bar and a dim `reset <duration> ago · awaiting next turn`
+  note instead of the stale percentage — no fabricated next-window countdown, since the
+  next window only begins on your next turn. Each bucket is judged independently (the 5h
+  row can read expired while the weekly row is still counting down), and the row flips
+  live the first tick after the reset time.
 
 ## [2.2.1] - 2026-07-03
 
