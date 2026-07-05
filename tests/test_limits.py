@@ -6,8 +6,9 @@ assert on it. No I/O, no real capture file — everything here is fabricated.
 
 The fix under test: the 5h/7d capture only refreshes on a Claude Code turn, so once a
 bucket's reset moment has passed the last-captured percentage is stale. At render time a
-bucket with now >= resets_at must show 0% + an empty bar + a "reset … ago" note, never a
-fabricated next countdown, and the row must flip live the first tick after the boundary.
+bucket with now >= resets_at must show 0% + an empty bar + a "reset … ago" note ("reset
+just now" within the first sub-second frame at the boundary), never a fabricated next
+countdown, and the row must flip live the first tick after the boundary.
 """
 
 from __future__ import annotations
@@ -19,7 +20,7 @@ from rich.console import Console
 
 from cc_usage.config import Config
 from cc_usage.format import human_duration
-from cc_usage.ratelimits import Bucket
+from cc_usage.ratelimits import Bucket, label_for
 from cc_usage.render import RenderState, limits_block
 from cc_usage.themes import get_theme
 
@@ -53,15 +54,21 @@ def test_expired_bucket_zeroes_and_says_ago_not_resets_in():
     assert "ago" in out
     assert "resets in" not in out  # must not fabricate a next-window countdown
     assert "awaiting next turn" in out  # signals fresh data needs a Claude Code turn
+    # Pin the whole row byte-exactly so the wording itself is guarded, not just fragments.
+    assert out == "5-HOUR  ░░░░░░░░░░░░░░  0%  reset 3h00m ago · awaiting next turn\n"
 
 
 # ── 2. boundary counts as expired ─────────────────────────────────────────────
-def test_boundary_now_equals_resets_at_is_expired():
-    """now == resets_at is expired (>=): still 0% + 'ago', never 'resets in'."""
+def test_boundary_now_equals_resets_at_is_expired_and_says_just_now():
+    """now == resets_at is expired (>=). human_duration clamps the 0s age to 'now', which
+    would read as the contradictory 'reset now ago' — the boundary frame must instead say
+    'reset just now' (no 'ago'), and never 'resets in'."""
     out = _plain(limits_block(_state([_bucket(NOW)]), THEME))
     assert "0%" in out
-    assert "ago" in out
     assert "resets in" not in out
+    assert "reset now ago" not in out  # the contradictory wording this guards against
+    # Pin the whole row byte-exactly so the boundary wording is guarded.
+    assert out == "5-HOUR  ░░░░░░░░░░░░░░  0%  reset just now · awaiting next turn\n"
 
 
 # ── 3. buckets judged independently ───────────────────────────────────────────
@@ -79,6 +86,16 @@ def test_mixed_expired_five_hour_and_active_weekly():
     assert five.startswith("5-HOUR") and "0%" in five and "ago" in five and "resets in" not in five
     # active weekly row untouched
     assert weekly.startswith("WEEKLY") and "40%" in weekly and "resets in" in weekly and "ago" not in weekly
+
+
+def test_unknown_bucket_key_gets_same_expired_treatment():
+    """Guardrail 3: an unrecognized bucket key (label derived like get_buckets does, via
+    label_for) goes through the identical expired path — 0%, empty bar, 'reset … ago',
+    no fabricated countdown. The expiry rule uses only the bucket's own resets_at."""
+    b = _bucket(NOW - 7_200, key="monthly", label=label_for("monthly"), pct=60.0)
+    out = _plain(limits_block(_state([b]), THEME))
+    assert out == "MONTHLY  ░░░░░░░░░░░░░░  0%  reset 2h00m ago · awaiting next turn\n"
+    assert "60%" not in out and "▓" not in out and "resets in" not in out
 
 
 # ── 4. active rendering is byte-identical to before the fix (regression guard) ──

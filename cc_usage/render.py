@@ -87,11 +87,16 @@ def limits_block(state: RenderState, theme: dict[str, str]):
         # first refresh after the boundary. Buckets are judged independently.
         if state.now >= b.resets_at:
             ago = state.now - b.resets_at  # >= 0 by the guard above (never a negative duration)
+            ago_text = human_duration(ago)
+            # human_duration clamps sub-second/zero to "now", which would read as the
+            # contradictory "reset now ago" for the one frame right at the boundary
+            # (and in --once within that second) — say "just now" instead.
+            when = "just now" if ago_text == "now" else f"{ago_text} ago"
             t.add_row(
                 b.label,
                 _make_bar(0.0, theme),
                 "0%",
-                f"reset {human_duration(ago)} ago · awaiting next turn",
+                f"reset {when} · awaiting next turn",
             )
         else:
             remaining = b.resets_at - state.now  # > 0 here
