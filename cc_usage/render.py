@@ -78,13 +78,29 @@ def limits_block(state: RenderState, theme: dict[str, str]):
     t.add_column(justify="right", style=theme["value"], no_wrap=True)  # pct
     t.add_column(style=theme["dim"], no_wrap=True)  # reset
     for b in state.buckets:
-        remaining = b.resets_at - state.now
-        t.add_row(
-            b.label,
-            _make_bar(b.used_percentage, theme),
-            f"{b.used_percentage:.0f}%",
-            f"resets in {human_duration(remaining)}",
-        )
+        # The capture only refreshes on a Claude Code turn, so a bucket whose reset moment
+        # has passed is stale: the provider itself told us it resets at resets_at, so once
+        # now >= resets_at the truthful current utilization is 0%. Zero it here rather than
+        # echo the last-captured percentage (e.g. an overnight-stale 85%), and don't invent
+        # a next "resets in" countdown — the next window only starts on the user's next turn
+        # (unknowable now). Evaluated against state.now every tick, so the row flips live the
+        # first refresh after the boundary. Buckets are judged independently.
+        if state.now >= b.resets_at:
+            ago = state.now - b.resets_at  # >= 0 by the guard above (never a negative duration)
+            t.add_row(
+                b.label,
+                _make_bar(0.0, theme),
+                "0%",
+                f"reset {human_duration(ago)} ago · awaiting next turn",
+            )
+        else:
+            remaining = b.resets_at - state.now  # > 0 here
+            t.add_row(
+                b.label,
+                _make_bar(b.used_percentage, theme),
+                f"{b.used_percentage:.0f}%",
+                f"resets in {human_duration(remaining)}",
+            )
     return t
 
 
