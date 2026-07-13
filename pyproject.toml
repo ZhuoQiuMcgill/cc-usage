@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "cc-usage"
 dynamic = ["version"]
-description = "Keyboard-first interactive TUI of Claude Code usage (tokens + API-equivalent cost) across all sessions, plus the 5h/7d subscription limits and a usage heartbeat."
+description = "Interactive TUI for local Claude Code and Codex token usage, API-equivalent cost, subscription limits, and activity history."
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "MIT"}

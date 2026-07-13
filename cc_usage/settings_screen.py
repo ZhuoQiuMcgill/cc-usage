@@ -4,10 +4,8 @@ A Textual screen reached from the main TUI by pressing `s` (or Enter on the Sett
 hint). Arrow keys move the selection, Enter activates, Esc backs out. Every setting is
 chosen from a fixed list of choices — never raw text entry — mirroring the v1 rule.
 
-Covers (T3 R3): refresh interval, default table window (incl. 7d / all-time), show-cost,
-theme, and **Statusline 5h/7d capture: Install / Restore** (the reversible wrapper, now
-keyboard-driven — it calls the *unchanged* T2 install()/restore() in statusline.py).
-Changes persist to config.json immediately and apply live on return to the main screen.
+Covers refresh interval, default table window, show-cost, and theme. Provider limits are
+fetched automatically and need no setting. Changes persist and apply live.
 """
 
 from __future__ import annotations
@@ -26,7 +24,6 @@ from .config import (
     Config,
     save_config,
 )
-from .statusline import format_result, install, restore, status
 
 _WINDOW_LABEL = {
     "all": "all-time",
@@ -37,14 +34,13 @@ _WINDOW_LABEL = {
 }
 
 
-def _summary(cfg: Config, sl_installed: bool) -> list[tuple[str, str, str]]:
+def _summary(cfg: Config) -> list[tuple[str, str, str]]:
     """(row id, left label, current-value) for the top-level settings list."""
     return [
         ("refresh", "Refresh interval", f"{cfg.refresh_interval}s"),
         ("window", "Default table window", _WINDOW_LABEL.get(cfg.default_window, cfg.default_window)),
         ("cost", "Show cost column", "on" if cfg.show_cost else "off"),
         ("theme", "Theme", cfg.theme),
-        ("statusline", "Statusline 5h/7d capture", "installed" if sl_installed else "not installed"),
     ]
 
 
@@ -71,7 +67,10 @@ class ChoiceScreen(ModalScreen):
         self._current = current
 
     def compose(self) -> ComposeResult:
-        items = [_ChoiceRow(val, text) for val, text in self._choices]
+        items = [
+            _ChoiceRow(val, f"{'●' if val == self._current else ' '} {text}")
+            for val, text in self._choices
+        ]
         # Start the highlight on the current value so Enter without moving keeps it;
         # default to the first row otherwise (never an empty/None highlight).
         start = 0
@@ -84,7 +83,7 @@ class ChoiceScreen(ModalScreen):
             with Vertical(id="choice-box"):
                 yield Static(self._title, id="choice-title")
                 yield lv
-                yield Static("↑/↓ move · ↵ select · Esc back", id="choice-hint")
+                yield Static("● current · ↑/↓ move · ↵ select · Esc back", id="choice-hint")
 
     def on_mount(self) -> None:
         self.query_one("#choices", ListView).focus()
@@ -96,31 +95,6 @@ class ChoiceScreen(ModalScreen):
     def action_dismiss_none(self) -> None:
         self.dismiss(None)
 
-
-class ResultScreen(ModalScreen):
-    """Show the statusline install/restore result; Enter/Esc dismisses."""
-
-    BINDINGS = [
-        Binding("escape", "ok", "OK", show=True),
-        Binding("enter", "ok", "OK", show=True),
-        Binding("q", "ok", "OK", show=False),
-    ]
-
-    def __init__(self, text: str) -> None:
-        super().__init__()
-        self._text = text
-
-    def compose(self) -> ComposeResult:
-        with Center():
-            with Vertical(id="result-box"):
-                yield Static(self._text, id="result-text")
-                yield Static("↵ / Esc to continue", id="result-hint")
-
-    def on_mount(self) -> None:
-        self.focus()
-
-    def action_ok(self) -> None:
-        self.dismiss(None)
 
 
 class SettingsScreen(ModalScreen):
@@ -152,9 +126,8 @@ class SettingsScreen(ModalScreen):
         await self._refresh_list()
 
     def on_screen_resume(self) -> None:
-        # Fired whenever a screen pushed on top of us (any value picker or the
-        # statusline ResultScreen) pops. The pop callback already rebuilt the list
-        # (see _pick/_statusline_menu), but a ListView only paints its highlight
+        # Fired whenever a value picker pops. The callback already rebuilt the list,
+        # but a ListView only paints its highlight
         # cursor while focused — and the screen-pop does not return focus to our list.
         # So re-focus it here, and re-assert the highlight, so the cursor is visible
         # immediately with no arrow press. call_after_refresh defends against the
@@ -189,10 +162,9 @@ class SettingsScreen(ModalScreen):
         # still mounting and the class is lost — the highlight cursor then stays
         # invisible until an arrow key re-runs the highlight (the reported bug).
         await lv.clear()
-        sl_installed = status()["installed"]
         rows = [
             _ChoiceRow(row_id, f"{left:<26}· {value}")
-            for row_id, left, value in _summary(self.config, sl_installed)
+            for row_id, left, value in _summary(self.config)
         ]
         await lv.extend(rows)
         lv.index = max(0, min(idx, len(lv) - 1))
@@ -203,7 +175,7 @@ class SettingsScreen(ModalScreen):
     def _refresh_list_soon(self, keep_index: int | None = None) -> None:
         """Schedule the async rebuild from a sync (pop-callback) context.
 
-        Used by the value-picker / statusline pop callbacks, which are synchronous.
+        Used by value-picker callbacks, which are synchronous.
         The rebuild ends by focusing the list and re-asserting its highlight, so the
         Settings menu comes back visibly highlighted with no arrow press needed.
         """
@@ -246,8 +218,6 @@ class SettingsScreen(ModalScreen):
                 self._set_theme,
                 keep,
             )
-        elif row_id == "statusline":
-            self._statusline_menu(keep)
 
     def _pick(self, title, choices, current, setter, keep) -> None:
         def done(value) -> None:
@@ -259,27 +229,6 @@ class SettingsScreen(ModalScreen):
 
         self.app.push_screen(ChoiceScreen(title, choices, current), done)
 
-    def _statusline_menu(self, keep) -> None:
-        def chosen(action) -> None:
-            if action == "install":
-                self.app.push_screen(ResultScreen(format_result(install())), lambda _=None: self._refresh_list_soon(keep))
-            elif action == "restore":
-                self.app.push_screen(ResultScreen(format_result(restore())), lambda _=None: self._refresh_list_soon(keep))
-            else:
-                self._refresh_list_soon(keep)
-
-        sl = "installed" if status()["installed"] else "not installed"
-        self.app.push_screen(
-            ChoiceScreen(
-                f"Statusline 5h/7d capture  (currently {sl})",
-                [
-                    ("install", "Install wrapper (reversible)"),
-                    ("restore", "Restore original"),
-                    ("back", "Back"),
-                ],
-            ),
-            chosen,
-        )
 
     # ── setters ──────────────────────────────────────────────────────────────
     def _set_refresh(self, v) -> None:

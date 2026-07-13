@@ -16,6 +16,7 @@ from cc_usage.aggregate import (
     HEARTBEAT_METRICS,
     HEARTBEAT_WINDOWS,
     Series,
+    aggregate,
     series,
 )
 from cc_usage.braille import _DOTS_PER_ROW, chart_rows, sparkline
@@ -34,12 +35,19 @@ _BLANK = chr(0x2800)  # empty braille cell
 NOW = 1_000_000_000.0
 
 
-def rec(age_s: float, cost: float = 0.0, inp: int = 0, out: int = 0, cache: int = 0):
+def rec(
+    age_s: float,
+    cost: float = 0.0,
+    inp: int = 0,
+    out: int = 0,
+    cache: int = 0,
+    known: bool = True,
+):
     return UsageRecord(
         ts=NOW - age_s,
         model_raw="claude-opus-4-8",
         model_norm="claude-opus-4-8",
-        known=True,
+        known=known,
         input_tokens=inp,
         output_tokens=out,
         cache_read=cache,
@@ -141,6 +149,33 @@ def test_empty_window_is_flat_zeros():
 def test_all_records_out_of_window_is_empty():
     s = series([rec(10 * 24 * 3600, cost=5.0)], NOW, window="7d")  # 10d old, window 7d
     assert s.is_empty and s.peak == 0.0
+
+
+def test_unpriced_cost_series_is_activity_not_empty():
+    s = series(
+        [rec(60, inp=900, out=100, known=False)],
+        NOW,
+        window="24h",
+        metric="cost",
+    )
+    assert s.peak == 0.0
+    assert s.is_empty is False
+    assert s.record_count == 1
+    assert s.unpriced_tokens == 1000
+
+
+def test_window_aggregation_tracks_pricing_coverage():
+    windows = aggregate(
+        [
+            rec(60, cost=1.0, inp=750, known=True),
+            rec(30, inp=250, known=False),
+        ],
+        NOW,
+    )
+    all_time = windows["all"]
+    assert all_time.total_tokens == 1000
+    assert all_time.unpriced_tokens == 250
+    assert all_time.pricing_coverage == 0.75
 
 
 # ── the three heartbeat windows ──────────────────────────────────────────────

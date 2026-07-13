@@ -67,17 +67,27 @@ class WindowAgg:
     output_tokens: int = 0
     cache_tokens: int = 0
     cost: float = 0.0
+    unpriced_tokens: int = 0
     models: dict[str, ModelAgg] = field(default_factory=dict)
 
     @property
     def total_tokens(self) -> int:
         return self.input_tokens + self.output_tokens + self.cache_tokens
 
+    @property
+    def pricing_coverage(self) -> float:
+        """Fraction of tokens whose model has a price (1.0 for an empty window)."""
+        if self.total_tokens == 0:
+            return 1.0
+        return max(0.0, 1.0 - self.unpriced_tokens / self.total_tokens)
+
     def _add(self, r: UsageRecord) -> None:
         self.input_tokens += r.input_tokens
         self.output_tokens += r.output_tokens
         self.cache_tokens += r.cache_tokens
         self.cost += r.cost
+        if not r.known:
+            self.unpriced_tokens += r.total_tokens
         m = self.models.get(r.model_norm)
         if m is None:
             m = ModelAgg(model=r.model_norm, known=r.known)
@@ -124,10 +134,12 @@ class Series:
     bucket_seconds: float
     window_seconds: int
     now: float
+    record_count: int = 0
+    unpriced_tokens: int = 0
 
     @property
     def is_empty(self) -> bool:
-        return self.peak <= 0.0
+        return self.record_count == 0
 
 
 def series(
@@ -153,6 +165,8 @@ def series(
     bucket_seconds = secs / buckets
 
     vals = [0.0] * buckets
+    record_count = 0
+    unpriced_tokens = 0
     start = now - secs  # left edge of the oldest bucket
     for r in records:
         if r.ts <= start or r.ts > now:
@@ -163,6 +177,9 @@ def series(
         if idx >= buckets:  # guards the r.ts == now boundary
             idx = buckets - 1
         vals[idx] += r.cost if metric == "cost" else float(r.total_tokens)
+        record_count += 1
+        if not r.known:
+            unpriced_tokens += r.total_tokens
 
     peak = max(vals) if vals else 0.0
     return Series(
@@ -173,6 +190,8 @@ def series(
         bucket_seconds=bucket_seconds,
         window_seconds=secs,
         now=now,
+        record_count=record_count,
+        unpriced_tokens=unpriced_tokens,
     )
 
 
@@ -214,6 +233,7 @@ class DayAgg:
     output_tokens: int = 0
     cache_tokens: int = 0
     cost: float = 0.0
+    unpriced_tokens: int = 0
 
     @property
     def total_tokens(self) -> int:
@@ -224,6 +244,8 @@ class DayAgg:
         self.output_tokens += r.output_tokens
         self.cache_tokens += r.cache_tokens
         self.cost += r.cost
+        if not r.known:
+            self.unpriced_tokens += r.total_tokens
 
 
 @dataclass
@@ -241,6 +263,7 @@ class RangeAgg:
     output_tokens: int = 0
     cache_tokens: int = 0
     cost: float = 0.0
+    unpriced_tokens: int = 0
     record_count: int = 0
     models: dict[str, ModelAgg] = field(default_factory=dict)
     days: list[DayAgg] = field(default_factory=list)
@@ -248,6 +271,12 @@ class RangeAgg:
     @property
     def total_tokens(self) -> int:
         return self.input_tokens + self.output_tokens + self.cache_tokens
+
+    @property
+    def pricing_coverage(self) -> float:
+        if self.total_tokens == 0:
+            return 1.0
+        return max(0.0, 1.0 - self.unpriced_tokens / self.total_tokens)
 
     @property
     def n_days(self) -> int:
@@ -288,8 +317,8 @@ def aggregate_range(
     is explicit calendar bounds, so the user expects records exactly on either edge to
     count. Per-day bucketing uses the LOCAL calendar day of each record. `days` spans
     every calendar day from start to end inclusive, zero-filled, so a per-day table or
-    chart shows the gaps. Unknown-model records still count (cost 0, flagged) just as
-    the rolling aggregation does — never crash (Rulebook r4).
+    chart shows the gaps. Unknown-model records still count and track unpriced-token
+    coverage just as the rolling aggregation does — never crash (Rulebook r4).
     """
     rng = RangeAgg(start_ts=start_ts, end_ts=end_ts)
 
@@ -313,6 +342,8 @@ def aggregate_range(
         rng.output_tokens += r.output_tokens
         rng.cache_tokens += r.cache_tokens
         rng.cost += r.cost
+        if not r.known:
+            rng.unpriced_tokens += r.total_tokens
         rng.record_count += 1
         rng._add_model(r)
         # Local civil day of the record — the date-range concept is calendar-local.

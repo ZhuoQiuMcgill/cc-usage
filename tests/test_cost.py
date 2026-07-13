@@ -2,7 +2,8 @@
 
 import math
 
-from cc_usage.cost import compute_cost, get_rates, normalize_model
+from cc_usage.cost import Rates, compute_cost, get_rates, normalize_model
+from cc_usage.pricing import _coerce
 
 PRICING = {
     "claude-opus-4-8": {"input": 5.0, "output": 25.0},
@@ -14,6 +15,7 @@ def test_normalize_strips_suffixes():
     assert normalize_model("claude-opus-4-8[1m]") == "claude-opus-4-8"
     assert normalize_model("claude-opus-4-8") == "claude-opus-4-8"
     assert normalize_model("claude-sonnet-4-6-20251001") == "claude-sonnet-4-6"
+    assert normalize_model("gpt-5.4-2026-03-05") == "gpt-5.4"
     assert normalize_model("us.anthropic.claude-opus-4-8") == "claude-opus-4-8"
     assert normalize_model("  Claude-Opus-4-8  ") == "claude-opus-4-8"
     assert normalize_model(None) == ""
@@ -21,8 +23,8 @@ def test_normalize_strips_suffixes():
 
 
 def test_get_rates_known_and_unknown():
-    assert get_rates("claude-opus-4-8", PRICING) == (5.0, 25.0)
-    assert get_rates("claude-opus-4-8[1m]", PRICING) == (5.0, 25.0)
+    assert get_rates("claude-opus-4-8", PRICING) == Rates(5.0, 25.0)
+    assert get_rates("claude-opus-4-8[1m]", PRICING) == Rates(5.0, 25.0)
     assert get_rates("claude-mystery-9", PRICING) is None
     assert get_rates(None, PRICING) is None
 
@@ -35,8 +37,77 @@ def test_bundled_pricing_prices_sonnet_5():
 
     models = json.loads((files("cc_usage") / "data" / "pricing.json").read_text())["models"]
     assert models["claude-sonnet-5"] == {"input": 3.0, "output": 15.0}
-    assert get_rates("claude-sonnet-5", models) == (3.0, 15.0)
-    assert get_rates("claude-sonnet-5[1m]", models) == (3.0, 15.0)
+    assert get_rates("claude-sonnet-5", models) == Rates(3.0, 15.0)
+    assert get_rates("claude-sonnet-5[1m]", models) == Rates(3.0, 15.0)
+
+
+def test_bundled_openai_pricing_uses_official_standard_rates():
+    import json
+    from importlib.resources import files
+
+    models = json.loads((files("cc_usage") / "data" / "pricing.json").read_text())["models"]
+    assert models["gpt-5.6-sol"]["input"] == 5.0
+    assert models["gpt-5.6-sol"]["cache_read"] == 0.5
+    assert models["gpt-5.6-sol"]["cache_write"] == 6.25
+    assert models["gpt-5.6-sol"]["output"] == 30.0
+    assert models["gpt-5.6-terra"]["input"] == 2.5
+    assert models["gpt-5.5"]["output"] == 30.0
+    assert models["gpt-5.4"]["input"] == 2.5
+    assert models["gpt-5.4-mini"] == {
+        "input": 0.75,
+        "cache_read": 0.075,
+        "output": 4.5,
+    }
+    assert get_rates("gpt-5.4-2026-03-05", models) == get_rates("gpt-5.4", models)
+    assert get_rates("gpt-5.6", models) == get_rates("gpt-5.6-sol", models)
+
+
+def test_openai_long_context_and_explicit_cache_rates():
+    rates = Rates(
+        input=5.0,
+        cache_read=0.5,
+        cache_write=6.25,
+        output=30.0,
+        long_context_threshold=272_000,
+        long_context_input_multiplier=2.0,
+        long_context_output_multiplier=1.5,
+    )
+    cost = compute_cost(
+        input_tokens=100_000,
+        output_tokens=1_000,
+        cache_read=200_000,
+        cache_creation_total=0,
+        ephemeral_5m=0,
+        ephemeral_1h=0,
+        rates=rates,
+    )
+    expected = (100_000 * 10.0 + 200_000 * 1.0 + 1_000 * 45.0) / 1_000_000
+    assert math.isclose(cost, expected, abs_tol=1e-12)
+
+
+def test_editable_pricing_preserves_optional_official_rate_fields():
+    rows = _coerce(
+        {
+            "gpt-custom": {
+                "input": "2.5",
+                "cache_read": "0.25",
+                "cache_write": "3.125",
+                "output": "15",
+                "long_context_threshold": "272000",
+                "long_context_input_multiplier": "2",
+                "long_context_output_multiplier": "1.5",
+            }
+        }
+    )
+    assert rows["gpt-custom"] == {
+        "input": 2.5,
+        "cache_read": 0.25,
+        "cache_write": 3.125,
+        "output": 15.0,
+        "long_context_threshold": 272000.0,
+        "long_context_input_multiplier": 2.0,
+        "long_context_output_multiplier": 1.5,
+    }
 
 
 def test_cost_with_ephemeral_subbuckets():

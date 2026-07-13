@@ -43,6 +43,13 @@ _WINDOW_LABEL = {
 }
 
 
+def _cost_label(cost: float, unpriced_tokens: int = 0) -> str:
+    """Render priced spend without presenting unknown pricing as free."""
+    if unpriced_tokens > 0 and cost <= 0.0:
+        return "unpriced"
+    return human_money(cost)
+
+
 @dataclass
 class RenderState:
     windows: dict[str, WindowAgg]
@@ -54,6 +61,7 @@ class RenderState:
     unknown_models: set[str] = field(default_factory=set)
     warnings: list[str] = field(default_factory=list)
     heartbeat: Series | None = None  # T3 R2; None only for legacy/one-off paths
+    compact: bool = False  # narrow-terminal layout selected by the Textual app
 
 
 def _make_bar(pct: float, theme: dict[str, str]) -> Text:
@@ -67,9 +75,9 @@ def _make_bar(pct: float, theme: dict[str, str]) -> Text:
 
 def limits_block(state: RenderState, theme: dict[str, str]):
     if not state.buckets:
-        msg = "5h / 7d: n/a — run a Claude Code turn to populate"
+        msg = "limits unavailable · check provider login and network access"
         if state.rl_present:
-            msg = "limits: n/a — capture present but no usable buckets yet"
+            msg = "limits unavailable · provider data has no usable windows"
         return Text(msg, style=theme["dim"])
 
     t = Table(box=None, show_header=False, pad_edge=False, expand=False)
@@ -78,13 +86,9 @@ def limits_block(state: RenderState, theme: dict[str, str]):
     t.add_column(justify="right", style=theme["value"], no_wrap=True)  # pct
     t.add_column(style=theme["dim"], no_wrap=True)  # reset
     for b in state.buckets:
-        # The capture only refreshes on a Claude Code turn, so a bucket whose reset moment
-        # has passed is stale: the provider itself told us it resets at resets_at, so once
-        # now >= resets_at the truthful current utilization is 0%. Zero it here rather than
-        # echo the last-captured percentage (e.g. an overnight-stale 85%), and don't invent
-        # a next "resets in" countdown — the next window only starts on the user's next turn
-        # (unknowable now). Evaluated against state.now every tick, so the row flips live the
-        # first refresh after the boundary. Buckets are judged independently.
+        # Once the provider-reported reset moment passes, the captured percentage is stale.
+        # Show 0% until the next scheduled provider refresh rather than echoing an expired
+        # value or inventing the next reset timestamp. Buckets are judged independently.
         if state.now >= b.resets_at:
             ago = state.now - b.resets_at  # >= 0 by the guard above (never a negative duration)
             ago_text = human_duration(ago)
@@ -96,7 +100,7 @@ def limits_block(state: RenderState, theme: dict[str, str]):
                 b.label,
                 _make_bar(0.0, theme),
                 "0%",
-                f"reset {when} · awaiting next turn",
+                f"reset {when} · refresh pending",
             )
         else:
             remaining = b.resets_at - state.now  # > 0 here
@@ -110,8 +114,33 @@ def limits_block(state: RenderState, theme: dict[str, str]):
 
 
 def spend_block(state: RenderState, theme: dict[str, str]):
+    if state.compact:
+        t = Table(
+            box=None,
+            pad_edge=False,
+            expand=False,
+            title="Rolling usage",
+            title_justify="left",
+            title_style=theme["label"],
+        )
+        t.add_column("Window", style=theme["model"], no_wrap=True)
+        t.add_column("Tokens", justify="right", style=theme["value"])
+        if state.config.show_cost:
+            t.add_column("Cost", justify="right", style=theme["value"])
+        for key, label in _WINDOW_COLS:
+            cells = [label, human_tokens(state.windows[key].total_tokens)]
+            if state.config.show_cost:
+                cells.append(
+                    _cost_label(
+                        state.windows[key].cost,
+                        state.windows[key].unpriced_tokens,
+                    )
+                )
+            t.add_row(*cells)
+        return t
+
     t = Table(box=None, pad_edge=False, expand=False)
-    t.add_column("Spend", style=theme["label"], no_wrap=True)
+    t.add_column("Usage", style=theme["label"], no_wrap=True)
     for _key, label in _WINDOW_COLS:
         t.add_column(
             label, justify="right", style=theme["value"], no_wrap=True, header_style=theme["header"]
@@ -120,7 +149,13 @@ def spend_block(state: RenderState, theme: dict[str, str]):
         "tokens", *[human_tokens(state.windows[k].total_tokens) for k, _ in _WINDOW_COLS]
     )
     if state.config.show_cost:
-        t.add_row("cost", *[human_money(state.windows[k].cost) for k, _ in _WINDOW_COLS])
+        t.add_row(
+            "cost",
+            *[
+                _cost_label(state.windows[k].cost, state.windows[k].unpriced_tokens)
+                for k, _ in _WINDOW_COLS
+            ],
+        )
     return t
 
 
@@ -242,9 +277,9 @@ def heartbeat_renderable(state: RenderState, theme: dict[str, str]):
     if hb is None:
         return Text("heartbeat: n/a", style=theme["dim"])
 
-    metric_name = "cost" if hb.metric == "cost" else "tokens"
+    metric_name = "cost*" if hb.metric == "cost" and hb.unpriced_tokens else hb.metric
     header = Text()
-    header.append("heartbeat ", style=theme["label"])
+    header.append("Activity ", style=theme["label"])
     header.append(f"{metric_name}", style=theme["header"])
     header.append(" · ", style=theme["dim"])
     header.append(f"{hb.window}", style=theme["value"])
@@ -268,7 +303,12 @@ def heartbeat_renderable(state: RenderState, theme: dict[str, str]):
     # X-axis ticks (under the plot), then the peak-time / no-activity annotation.
     lines.append(Text(_x_axis_line(hb, plot_width, gutter + 1), style=theme["dim"]))
     if hb.is_empty:
-        lines.append(Text((" " * (gutter + 1)) + "no activity", style=theme["dim"]))
+        lines.append(
+            Text(
+                (" " * (gutter + 1)) + "no activity · ←/→ changes window",
+                style=theme["dim"],
+            )
+        )
     else:
         lines.append(
             Text((" " * (gutter + 1)) + _peak_annotation(hb), style=theme["value"])
@@ -282,50 +322,57 @@ def model_block(state: RenderState, theme: dict[str, str]):
     win = state.windows.get(win_key) or state.windows["all"]
     show_cost = state.config.show_cost
 
+    title = f"Models · {_WINDOW_LABEL.get(win_key, win_key)}"
     t = Table(
         box=None,
         pad_edge=False,
         expand=False,
-        title=f"By model · {_WINDOW_LABEL.get(win_key, win_key)}",
+        title=title,
         title_justify="left",
         title_style=theme["label"],
     )
     t.add_column("Model", style=theme["model"], no_wrap=True)
-    t.add_column("In", justify="right", header_style=theme["header"], style=theme["value"])
-    t.add_column("Out", justify="right", header_style=theme["header"], style=theme["value"])
-    t.add_column("Cache", justify="right", header_style=theme["header"], style=theme["value"])
+    if state.compact:
+        t.add_column(
+            "Tokens", justify="right", header_style=theme["header"], style=theme["value"]
+        )
+    else:
+        t.add_column("In", justify="right", header_style=theme["header"], style=theme["value"])
+        t.add_column("Out", justify="right", header_style=theme["header"], style=theme["value"])
+        t.add_column("Cache", justify="right", header_style=theme["header"], style=theme["value"])
     if show_cost:
         t.add_column("Cost", justify="right", header_style=theme["header"], style=theme["value"])
 
     rows = win.models_sorted()
     if not rows:
-        span = 4 + (1 if show_cost else 0)
-        t.add_row("no usage in this window", *([""] * (span - 1)), style=theme["dim"])
+        span = (2 if state.compact else 4) + (1 if show_cost else 0)
+        label = f"no usage in {_WINDOW_LABEL.get(win_key, win_key)} · s changes default"
+        t.add_row(label, *([""] * (span - 1)), style=theme["dim"])
         return t
 
     for m in rows:
         name = pretty_model_name(m.model)
         if not m.known:
             name += " *"
-        cells = [
+        cells = [name, human_tokens(m.total_tokens)] if state.compact else [
             name,
             human_tokens(m.input_tokens),
             human_tokens(m.output_tokens),
             human_tokens(m.cache_tokens),
         ]
         if show_cost:
-            cells.append(human_money(m.cost))
+            cells.append(_cost_label(m.cost, 0 if m.known else m.total_tokens))
         t.add_row(*cells, style=(theme["dim"] if not m.known else None))
 
     t.add_section()
-    total_cells = [
+    total_cells = ["Total", human_tokens(win.total_tokens)] if state.compact else [
         "Total",
         human_tokens(win.input_tokens),
         human_tokens(win.output_tokens),
         human_tokens(win.cache_tokens),
     ]
     if show_cost:
-        total_cells.append(human_money(win.cost))
+        total_cells.append(_cost_label(win.cost, win.unpriced_tokens))
     t.add_row(*total_cells, style=theme["total"])
     return t
 
@@ -341,9 +388,20 @@ def footnotes(state: RenderState, theme: dict[str, str]) -> list[Text]:
         )
     if state.unknown_models:
         names = ", ".join(sorted(state.unknown_models))
-        out.append(Text(f"* unknown model(s) priced at $0: {names}", style=theme["warn"]))
+        coverage = state.windows.get("all")
+        coverage_text = (
+            f" · {coverage.pricing_coverage:.1%} of all-time tokens priced"
+            if coverage is not None
+            else ""
+        )
+        out.append(
+            Text(
+                f"* price unavailable; tokens counted, cost excluded{coverage_text}: {names}",
+                style=theme["warn"],
+            )
+        )
     for w in state.warnings:
-        out.append(Text(f"⚠ {w}", style=theme["warn"]))
+        out.append(Text(f"warning · {w}", style=theme["warn"]))
     return out
 
 
@@ -370,7 +428,7 @@ def build_panel(state: RenderState) -> Panel:
         Group(*parts),
         title=Text("CC Usage", style=theme["title"]),
         title_align="left",
-        subtitle=Text(f"⟳ {state.interval}s · {clock}", style=theme["subtitle"]),
+        subtitle=Text(f"auto {state.interval}s · {clock}", style=theme["subtitle"]),
         subtitle_align="right",
         border_style=theme["border"],
         box=box.ROUNDED,
@@ -417,7 +475,9 @@ def range_totals_block(rng: RangeAgg, theme: dict[str, str], show_cost: bool = T
     t.add_row("cache", human_tokens(rng.cache_tokens))
     t.add_row("total tokens", human_tokens(rng.total_tokens))
     if show_cost:
-        t.add_row("cost", human_money(rng.cost))
+        t.add_row("cost", _cost_label(rng.cost, rng.unpriced_tokens))
+        if rng.unpriced_tokens:
+            t.add_row("pricing coverage", f"{rng.pricing_coverage:.1%} of tokens")
     t.add_row("active days", f"{rng.active_days} / {rng.n_days}")
     t.add_row("records", str(rng.record_count))
     return t
@@ -426,8 +486,8 @@ def range_totals_block(rng: RangeAgg, theme: dict[str, str], show_cost: bool = T
 def range_model_block(rng: RangeAgg, theme: dict[str, str], show_cost: bool = True):
     """By-model table for the range: Model · In · Out · Cache · Cost, cost desc.
 
-    Unknown models are flagged with `*` and contribute $0 (never a crash). An empty
-    range shows a single muted `no activity in this range` row.
+    Unknown models are flagged with `*`, retain their tokens, and render as unpriced.
+    An empty range shows a single muted `no activity in this range` row.
     """
     t = Table(
         box=None,
@@ -461,7 +521,7 @@ def range_model_block(rng: RangeAgg, theme: dict[str, str], show_cost: bool = Tr
             human_tokens(m.cache_tokens),
         ]
         if show_cost:
-            cells.append(human_money(m.cost))
+            cells.append(_cost_label(m.cost, 0 if m.known else m.total_tokens))
         t.add_row(*cells, style=(theme["dim"] if not m.known else None))
 
     t.add_section()
@@ -472,7 +532,7 @@ def range_model_block(rng: RangeAgg, theme: dict[str, str], show_cost: bool = Tr
         human_tokens(rng.cache_tokens),
     ]
     if show_cost:
-        total_cells.append(human_money(rng.cost))
+        total_cells.append(_cost_label(rng.cost, rng.unpriced_tokens))
     t.add_row(*total_cells, style=theme["total"])
     return t
 
@@ -506,7 +566,7 @@ def range_day_block(rng: RangeAgg, theme: dict[str, str], show_cost: bool = True
         tok = human_tokens(day.total_tokens) if active else "–"
         cells = [day.date.isoformat(), tok]
         if show_cost:
-            cells.append(human_money(day.cost))
+            cells.append(_cost_label(day.cost, day.unpriced_tokens))
         t.add_row(*cells, style=(None if active else theme["dim"]))
     return t
 
@@ -523,14 +583,15 @@ def range_chart(rng: RangeAgg, theme: dict[str, str], metric: str = "cost"):
     ]
     peak = max(values) if values else 0.0
     # "Empty" = genuinely NO activity in the range, NOT merely a $0 cost peak. A range with
-    # tokens but $0 cost (only unknown/unpriced models) is real activity: it draws a flat
-    # bar with a `$0.00` peak label, not "no activity" (F4). Base it on record_count so the
+    # tokens but no priced cost (only unknown/unpriced models) is real activity: it draws
+    # a flat bar, not "no activity" (F4). Base it on record_count so the
     # cost chart and the tokens chart agree on whether the range is empty.
     is_empty = rng.record_count == 0
 
     header = Text()
     header.append("Daily ", style=theme["label"])
-    header.append(metric, style=theme["header"])
+    metric_label = "cost*" if metric == "cost" and rng.unpriced_tokens else metric
+    header.append(metric_label, style=theme["header"])
     header.append("   (m: toggle cost/tokens)", style=theme["dim"])
 
     rows = _RANGE_CHART_ROWS

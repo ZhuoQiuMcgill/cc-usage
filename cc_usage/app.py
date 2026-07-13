@@ -6,7 +6,7 @@ Enter** (plus `q`/Ctrl-C to quit, Esc to back out of Settings):
   * ← / →            switch the heartbeat window (5h / 24h / 7d)
   * ↑ / ↓            toggle the heartbeat metric (cost / tokens); `t` is an extra shortcut
   * s  or  Enter     open Settings (refresh, default window incl. 7d/all-time, show-cost,
-                     theme, statusline install/restore) — itself fully arrow-navigable
+                     theme) — itself fully arrow-navigable
   * q / Ctrl-C       quit cleanly; Textual restores the terminal (alt-screen) on exit
 
 Data keeps refreshing on the configured interval via a Textual timer while the UI stays
@@ -15,6 +15,9 @@ live. No memorized CLI flags are required for any of this (the overriding T3 pri
 """
 
 from __future__ import annotations
+
+import threading
+import time
 
 from rich.console import Group
 from rich.text import Text
@@ -25,6 +28,8 @@ from textual.widgets import Footer, Rule, Static
 
 from .config import Config
 from .engine import Engine
+from .format import human_duration
+from .parser import ScanCancelled, ScanProgress
 from .render import (
     footnotes,
     heartbeat_renderable,
@@ -84,6 +89,7 @@ class CCUsageApp(App):
         Binding("down", "hb_metric", "HB metric", show=False, priority=True),
         Binding("t", "hb_metric", "HB metric", show=False),
         Binding("r", "refresh_now", "Refresh", show=False),
+        Binding("c", "cancel_scan", "Cancel scan", show=False),
     ]
 
     def __init__(self, engine: Engine) -> None:
@@ -91,6 +97,11 @@ class CCUsageApp(App):
         self.engine = engine
         self._data_timer = None
         self._tick_timer = None
+        self._limit_timer = None
+        self._scan_cancel = threading.Event()
+        self._scan_in_progress = False
+        self._scan_show_progress = False
+        self._progress_last_emit = 0.0
 
     @property
     def config(self) -> Config:
@@ -110,44 +121,107 @@ class CCUsageApp(App):
         yield Footer()
 
     def on_mount(self) -> None:
-        # If the engine already has data (a pre-warmed/seeded engine, e.g. tests), just
-        # render and start the timers. Otherwise paint an immediate placeholder and run
-        # the first scan OFF the UI thread so a large ~/.claude never freezes startup —
-        # the panel appears at once and fills in when the worker finishes.
+        # Warm caches render immediately; cold scans expose progress and cancellation.
         if self.engine.is_scanned:
             self.render_panel()
             self._start_timers()
+        elif self.engine.prime_cache():
+            self._start_background_scan(show_progress=False)
+            self.render_panel()
         else:
             self._render_scanning()
-            self.run_worker(self._background_scan, thread=True, exclusive=True)
+            self._start_background_scan(show_progress=True)
 
     def _render_scanning(self) -> None:
-        """Paint a lightweight 'scanning…' frame without touching the engine.
+        """Paint the initial discovery state without touching the engine."""
+        self._update_scan_status("discovering transcripts…  ·  c cancel")
 
-        Deliberately does NOT call snapshot() — that would trigger the (still-pending)
-        full scan synchronously on the UI thread, defeating the whole point.
-        """
+    def _update_scan_status(self, message: str) -> None:
         base = self.screen_stack[0] if self.screen_stack else None
         if base is None:
             return
         try:
-            base.query_one("#spend", Static).update(
-                Text("scanning transcripts…", style="dim")
-            )
+            base.query_one("#spend", Static).update(Text(message, style="dim"))
         except Exception:
             return
 
+    @staticmethod
+    def _format_bytes(value: int) -> str:
+        amount = float(max(0, value))
+        for unit in ("B", "KB", "MB", "GB", "TB"):
+            if amount < 1024 or unit == "TB":
+                return f"{amount:.0f} {unit}" if unit == "B" else f"{amount:.1f} {unit}"
+            amount /= 1024
+        return f"{amount:.1f} TB"
+
+    def _render_scan_progress(self, update: ScanProgress) -> None:
+        if update.phase == "discovering":
+            self._update_scan_status("discovering transcripts…  ·  c cancel")
+            return
+        if update.phase != "parsing":
+            return
+        if update.bytes_total > 0:
+            fraction = min(1.0, update.bytes_done / update.bytes_total)
+        elif update.files_total > 0:
+            fraction = min(1.0, update.files_done / update.files_total)
+        else:
+            fraction = 1.0
+        narrow = self.size.width < 76
+        width = 12 if narrow else 24
+        filled = min(width, int(fraction * width))
+        bar = "█" * filled + "░" * (width - filled)
+        counts = (
+            f"{update.files_done:,}/{update.files_total:,} files  ·  "
+            f"{self._format_bytes(update.bytes_done)}/{self._format_bytes(update.bytes_total)}"
+        )
+        if narrow:
+            message = f"scan  {bar}  {fraction:>4.0%}\n{counts}  ·  c cancel"
+        else:
+            message = f"scanning transcripts  {bar}  {fraction:>5.0%}  ·  {counts}  ·  c cancel"
+        self._update_scan_status(message)
+
+    def _start_background_scan(self, *, show_progress: bool) -> None:
+        if self._scan_in_progress:
+            return
+        self._scan_cancel.clear()
+        self._scan_in_progress = True
+        self._scan_show_progress = show_progress
+        self._progress_last_emit = 0.0
+        self.run_worker(self._background_scan, thread=True, exclusive=True)
+
     def _background_scan(self) -> None:
-        """Worker body (runs in a thread): the heavy first scan, then persist the cache
-        so the next launch is warm. Hands the result back to the UI thread to render."""
-        self.engine.scan()
+        """Heavy scan worker with throttled UI progress and resumable cancellation."""
+
+        def report(update: ScanProgress) -> None:
+            if not self._scan_show_progress:
+                return
+            now = time.monotonic()
+            if update.phase == "parsing" and now - self._progress_last_emit < 0.1:
+                return
+            self._progress_last_emit = now
+            self.call_from_thread(self._render_scan_progress, update)
+
+        try:
+            self.engine.scan(progress=report, cancelled=self._scan_cancel.is_set)
+        except ScanCancelled:
+            self.call_from_thread(self._on_scan_cancelled)
+            return
         self.engine.save_cache()
+        self.engine.refresh_limits()
         self.call_from_thread(self._on_initial_scan_done)
 
+    def _on_scan_cancelled(self) -> None:
+        self._scan_in_progress = False
+        if self.engine.is_scanned:
+            self.render_panel()
+            self._start_timers()
+        else:
+            self._update_scan_status("scan cancelled  ·  r resume  ·  q quit")
+
     def _on_initial_scan_done(self) -> None:
+        self._scan_in_progress = False
         self.render_panel()
         self._start_timers()
-
     def _start_timers(self) -> None:
         # Cancel any prior timers (used when the refresh interval changes live).
         if self._data_timer is not None:
@@ -155,6 +229,8 @@ class CCUsageApp(App):
         if self._tick_timer is None:
             # 1 s redraw keeps countdowns + heartbeat moving between data refreshes.
             self._tick_timer = self.set_interval(1.0, self.render_panel)
+        if self._limit_timer is None:
+            self._limit_timer = self.set_interval(300.0, self._refresh_limits)
         self._data_timer = self.set_interval(
             float(self.config.refresh_interval), self._refresh_data
         )
@@ -164,6 +240,13 @@ class CCUsageApp(App):
         self.engine.scan()
         self.render_panel()
 
+    def _refresh_limits(self) -> None:
+        self.run_worker(self._background_limit_refresh, thread=True, exclusive=True)
+
+    def _background_limit_refresh(self) -> None:
+        self.engine.refresh_limits()
+        self.call_from_thread(self.render_panel)
+
     def render_panel(self) -> None:
         # The panel widgets live on the base (main) screen. Query *that* screen, not the
         # active top-of-stack, so a refresh tick while Settings is open doesn't fail.
@@ -172,6 +255,7 @@ class CCUsageApp(App):
             return
         try:
             state = self.engine.snapshot()
+            state.compact = self.size.width < 76
             theme = get_theme(self.config.theme)
             base.query_one("#limits", Static).update(limits_block(state, theme))
             base.query_one("#spend", Static).update(spend_block(state, theme))
@@ -179,7 +263,14 @@ class CCUsageApp(App):
             base.query_one("#models", Static).update(model_block(state, theme))
             notes = footnotes(state, theme)
             base.query_one("#notes", Static).update(Group(*notes) if notes else Text(""))
-            self.sub_title = f"⟳ {self.config.refresh_interval}s"
+            if self._scan_in_progress:
+                freshness = "reconciling"
+            elif self.engine.last_scan_at is None:
+                freshness = "ready"
+            else:
+                age = max(0.0, time.time() - self.engine.last_scan_at)
+                freshness = "updated just now" if age < 60 else f"updated {human_duration(age)} ago"
+            self.sub_title = f"{freshness} · auto {self.config.refresh_interval}s"
         except Exception:  # never crash the UI on a transient data hiccup / mid-mount
             return
 
@@ -198,7 +289,15 @@ class CCUsageApp(App):
     # (`enter` also maps to `settings`, but a sub-screen's own `enter` binding wins, so it
     # never reaches the App action while a screen is up.) Quit stays available everywhere.
     _PANEL_ONLY_ACTIONS = frozenset(
-        {"hb_prev", "hb_next", "hb_metric", "date_range", "settings", "refresh_now"}
+        {
+            "hb_prev",
+            "hb_next",
+            "hb_metric",
+            "date_range",
+            "settings",
+            "refresh_now",
+            "cancel_scan",
+        }
     )
 
     def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
@@ -224,8 +323,17 @@ class CCUsageApp(App):
         self.render_panel()
 
     def action_refresh_now(self) -> None:
-        self._refresh_data()
+        if not self.engine.is_scanned:
+            self._render_scanning()
+            self._start_background_scan(show_progress=True)
+        else:
+            self._refresh_data()
 
+    def action_cancel_scan(self) -> None:
+        if self._scan_in_progress:
+            self._scan_cancel.set()
+            if self._scan_show_progress:
+                self._update_scan_status("cancelling scan…")
     def action_settings(self) -> None:
         # Re-render on return so any changed config/theme shows immediately.
         self.push_screen(SettingsScreen(self.config), lambda _=None: self.apply_config())
@@ -237,8 +345,8 @@ class CCUsageApp(App):
         self.push_screen(RangeScreen(self.engine), lambda _=None: self.render_panel())
 
     def action_quit(self) -> None:
+        self._scan_cancel.set()
         self.exit()
-
 
 def run_tui(config: Config) -> None:
     """Launch the interactive TUI (default `ccusage`)."""

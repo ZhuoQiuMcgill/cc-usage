@@ -83,7 +83,7 @@ def test_warm_start_records_identical_to_cold_scan(tmp_path, monkeypatch):
         _line("r1", "m1", 100, 10)
         + _line("r2", "m2", 200, 20)
         + _line("r2", "m2", 200, 20)  # duplicate -> must be dropped, once, in both paths
-        + _line("r3", "m3", 300, 30, model="claude-unknown-9")  # unknown model, cost 0
+        + _line("r3", "m3", 300, 30, model="claude-unknown-9")  # unpriced, tokens kept
     )
     _seed(tmp_path, monkeypatch, lines)
     cache = tmp_path / "cache.pkl"
@@ -306,4 +306,43 @@ def test_json_loads_orjson_stdlib_parity(monkeypatch):
     except ImportError:
         return
     monkeypatch.setattr(P, "_orjson", orjson)
-    assert _json_loads(raw) == stdlib_out
+
+
+def test_prime_cache_exposes_records_before_reconciliation(tmp_path, monkeypatch):
+    file = _seed(tmp_path, monkeypatch, _line("r1", "m1", 100))
+    cache = tmp_path / "cache.pkl"
+    writer = Parser(PRICING, cache_path=cache)
+    writer.scan()
+    writer.save_cache()
+
+    primed = Parser(PRICING, cache_path=cache)
+    assert primed.prime_cache() is True
+    assert [record.input_tokens for record in primed.records] == [100]
+
+    with file.open("a", encoding="utf-8") as handle:
+        handle.write(_line("r2", "m2", 200))
+    primed.scan()
+    assert sorted(record.input_tokens for record in primed.records) == [100, 200]
+
+
+def test_codex_archive_move_preserves_warm_cache(tmp_path, monkeypatch):
+    monkeypatch.setattr(P, "PROJECTS_DIR", tmp_path)
+    active = tmp_path / "active"
+    archived = tmp_path / "archived"
+    active.mkdir()
+    archived.mkdir()
+    original = active / "rollout-2026-test.jsonl"
+    original.write_text(_line("r1", "m1", 100), "utf-8")
+    cache = tmp_path / "cache.pkl"
+
+    writer = Parser(PRICING, cache_path=cache)
+    writer.scan()
+    writer.save_cache()
+    moved = archived / original.name
+    original.rename(moved)
+
+    warm = Parser(PRICING, cache_path=cache)
+    warm.scan()
+    assert len(warm.records) == 1
+    assert warm.stats.lines_read == 0
+    assert str(moved) in warm._files
