@@ -1,7 +1,6 @@
 """Filesystem locations. All config/cache lives under XDG ~/.config/cc-usage/.
 
-The only ~/.claude files this tool ever *modifies* are the statusline settings/script,
-and only reversibly (see statusline.py). Everything else here is read-only.
+Provider files are read-only except the explicit legacy statusline restore command.
 """
 
 from __future__ import annotations
@@ -11,11 +10,17 @@ from pathlib import Path
 
 HOME = Path.home()
 
-# ── Claude Code (read-only, except the statusline pair handled reversibly) ──
+# Claude Code transcripts and OAuth credentials are read-only.
 CLAUDE_DIR = HOME / ".claude"
 PROJECTS_DIR = CLAUDE_DIR / "projects"
 SETTINGS_JSON = CLAUDE_DIR / "settings.json"
 STATUSLINE_SCRIPT = CLAUDE_DIR / "statusline-command.sh"
+CLAUDE_CREDENTIALS = CLAUDE_DIR / ".credentials.json"
+
+# Codex / ChatGPT app is always read-only.
+CODEX_DIR = Path(os.environ.get("CODEX_HOME") or (HOME / ".codex"))
+CODEX_SESSIONS_DIR = CODEX_DIR / "sessions"
+CODEX_ARCHIVED_SESSIONS_DIR = CODEX_DIR / "archived_sessions"
 
 # ── Our own config/cache (XDG) ──
 XDG_CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME") or (HOME / ".config"))
@@ -24,6 +29,8 @@ BACKUPS_DIR = CONFIG_DIR / "backups"
 
 PRICING_JSON = CONFIG_DIR / "pricing.json"
 CONFIG_JSON = CONFIG_DIR / "config.json"
+LIMITS_CACHE_JSON = CONFIG_DIR / "provider-limits.json"
+# Legacy statusline artifacts retained only so --restore-statusline can clean them up.
 RATELIMITS_JSON = CONFIG_DIR / "ratelimits.json"
 WRAPPER_SCRIPT = CONFIG_DIR / "statusline-wrapper.sh"
 

@@ -10,6 +10,87 @@ See [VERSIONING.md](VERSIONING.md) for the release policy.
 
 _No unreleased changes yet._
 
+## [2.3.0] - 2026-07-13
+
+### Added
+
+- **Unified Claude Code and Codex / ChatGPT usage.** The transcript engine now discovers
+  both `~/.claude/projects/**/*.jsonl` and Codex active/archived rollout files, including
+  `CODEX_HOME` overrides. Codex cumulative token counters are converted into per-response
+  deltas, cached input is split from uncached input, and Claude plus Codex records feed the
+  same rolling windows, model tables, activity chart, and date-range analysis.
+- **Direct subscription-limit refresh for both providers.** Claude limits are fetched from
+  the authenticated read-only usage endpoint with the access token held only in memory;
+  expired credentials are refreshed by the installed official Claude client. Codex limits
+  are requested from the installed Codex app server over stdio. Provider-scoped windows
+  are combined instead of one provider replacing the other, refreshed in the background,
+  and retained in a normalized last-good cache that contains no credentials or raw replies.
+- **Cold-scan progress and cancellation.** First-time or invalidated scans show byte- and
+  file-weighted progress without blocking the TUI. Pressing `c` cancels at a complete JSONL
+  boundary, and `r` resumes from the persisted offset without double-counting records.
+- **OpenAI pricing capabilities.** The editable price schema now supports explicit cached
+  input/output rates and long-context thresholds/multipliers. Bundled standard API rates
+  cover the published GPT-5.4, GPT-5.4 mini, GPT-5.5, and GPT-5.6 families while preserving
+  the existing Claude rate and ephemeral-cache calculations.
+- **Pricing coverage reporting.** Unknown, preview, subscription-only, and local model IDs
+  retain all token/activity data while unavailable cost is labelled `unpriced`. Rolling,
+  per-model, chart, and date-range views report or mark partial pricing coverage instead of
+  presenting unavailable pricing as free usage.
+
+### Changed
+
+- **Immediate warm startup.** Cached aggregates render before filesystem reconciliation;
+  transcript discovery, active-to-archive Codex moves, appended-byte parsing, cache writes,
+  and live limit refresh continue off the UI thread. On the benchmarked 210,000-record
+  local history, cached totals became visible in about 0.43 seconds.
+- **Lower cold-scan memory pressure.** Changed rollouts stream through a 4 MiB read buffer
+  instead of being copied into memory whole. On the benchmarked 8.15 GB history this cut
+  peak private memory from roughly 1.26 GiB to 172 MiB while preserving exact totals,
+  line-boundary cancellation, and resume behavior.
+- **Adaptive terminal presentation.** Terminals narrower than 76 columns transpose rolling
+  windows, collapse model token subcolumns without dropping totals, and wrap scan progress
+  into a readable two-line layout. Settings selection and provider-aware labels were also
+  tightened for clearer keyboard navigation.
+- **Provider-neutral product language and metadata.** CLI help, package metadata, settings,
+  file ownership documentation, and panel labels now describe the combined Claude/Codex
+  experience. Windows output streams are configured for UTF-8 where supported.
+- **No new required runtime dependency.** The install contract remains Python 3.10+ with
+  the existing `textual` and `rich` requirements. `orjson` is used only when already
+  installed, with the standard-library JSON parser retained as the compatible fallback;
+  Rust performance work remains outside the distributed package for this release.
+
+### Removed
+
+- **Statusline capture dependency.** Current installs no longer require or install
+  `ccstatusline`, `jq`, a shell wrapper, or Claude `statusLine` configuration. The hidden
+  `--restore-statusline` command remains solely as a reversible migration path for users
+  who installed the integration through an older ccusage release.
+
+### Fixed
+
+- **Codex model attribution before `turn_context`.** Token events that arrive before a
+  rollout's first model marker are buffered as `codex-unattributed`, then reconciled and
+  repriced from the authoritative `turn_context`. Pending attribution survives incremental
+  scans, cancellation/resume, warm cache reloads, and active-to-archive rollout moves.
+- **Codex cache continuity.** Per-rollout model, cumulative-token, pending-attribution, and
+  last-observed limit state now round-trip through the persistent cache. Moving a rollout
+  from active to archived storage no longer forces a full rebuild when its identity and
+  offset remain valid.
+- **Provider failure isolation.** A transient Claude or Codex fetch failure keeps that
+  provider's last-good limits while allowing the other provider to refresh. Malformed
+  replies and credential-refresh failures surface as warnings without crashing the panel.
+- **Unpriced activity rendering.** Windows containing real tokens but zero known price no
+  longer look empty, and mixed known/unknown totals show the known dollar amount without
+  an ambiguous `+ ?` suffix.
+
+### Compatibility
+
+- The persistent parse-cache format advances to include Codex state. An older cache is
+  safely ignored and rebuilt once; provider transcripts remain read-only throughout.
+- Wheels and source distributions remain pure Python and installable with pip or uv on
+  Python 3.10–3.13. Existing configuration and custom pricing files remain supported;
+  newly supported pricing fields are optional.
+
 ## [2.2.2] - 2026-07-05
 
 ### Fixed
@@ -188,7 +269,8 @@ formal, pip-installable tool.
   a GitHub Release on each `v*` tag, with PyPI publishing gated on a
   `PYPI_API_TOKEN` secret.
 
-[Unreleased]: https://github.com/ZhuoQiuMcgill/cc-usage/compare/v2.2.2...HEAD
+[Unreleased]: https://github.com/ZhuoQiuMcgill/cc-usage/compare/v2.3.0...HEAD
+[2.3.0]: https://github.com/ZhuoQiuMcgill/cc-usage/compare/v2.2.2...v2.3.0
 [2.2.2]: https://github.com/ZhuoQiuMcgill/cc-usage/compare/v2.2.1...v2.2.2
 [2.2.1]: https://github.com/ZhuoQiuMcgill/cc-usage/compare/v2.2.0...v2.2.1
 [2.2.0]: https://github.com/ZhuoQiuMcgill/cc-usage/compare/v2.1.4...v2.2.0

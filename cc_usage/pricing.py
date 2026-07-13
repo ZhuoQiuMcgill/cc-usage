@@ -23,7 +23,59 @@ _HARDCODED_FALLBACK: dict[str, dict[str, float]] = {
     "claude-sonnet-4-6": {"input": 3.0, "output": 15.0},
     "claude-sonnet-4-5": {"input": 3.0, "output": 15.0},
     "claude-haiku-4-5": {"input": 1.0, "output": 5.0},
+    "gpt-5.6-sol": {
+        "input": 5.0,
+        "cache_read": 0.5,
+        "cache_write": 6.25,
+        "output": 30.0,
+        "long_context_threshold": 272000.0,
+        "long_context_input_multiplier": 2.0,
+        "long_context_output_multiplier": 1.5,
+    },
+    "gpt-5.6-terra": {
+        "input": 2.5,
+        "cache_read": 0.25,
+        "cache_write": 3.125,
+        "output": 15.0,
+        "long_context_threshold": 272000.0,
+        "long_context_input_multiplier": 2.0,
+        "long_context_output_multiplier": 1.5,
+    },
+    "gpt-5.6-luna": {
+        "input": 1.0,
+        "cache_read": 0.1,
+        "cache_write": 1.25,
+        "output": 6.0,
+        "long_context_threshold": 272000.0,
+        "long_context_input_multiplier": 2.0,
+        "long_context_output_multiplier": 1.5,
+    },
+    "gpt-5.5": {
+        "input": 5.0,
+        "cache_read": 0.5,
+        "output": 30.0,
+        "long_context_threshold": 272000.0,
+        "long_context_input_multiplier": 2.0,
+        "long_context_output_multiplier": 1.5,
+    },
+    "gpt-5.4": {
+        "input": 2.5,
+        "cache_read": 0.25,
+        "output": 15.0,
+        "long_context_threshold": 272000.0,
+        "long_context_input_multiplier": 2.0,
+        "long_context_output_multiplier": 1.5,
+    },
+    "gpt-5.4-mini": {"input": 0.75, "cache_read": 0.075, "output": 4.5},
 }
+
+_OPTIONAL_RATE_FIELDS = (
+    "cache_read",
+    "cache_write",
+    "long_context_threshold",
+    "long_context_input_multiplier",
+    "long_context_output_multiplier",
+)
 
 
 def _bundled_defaults() -> dict[str, dict[str, float]]:
@@ -38,7 +90,7 @@ def _bundled_defaults() -> dict[str, dict[str, float]]:
 
 
 def _coerce(models: object) -> dict[str, dict[str, float]]:
-    """Keep only well-formed {input, output} rows; ignore the rest."""
+    """Keep well-formed rate rows while preserving supported optional fields."""
     out: dict[str, dict[str, float]] = {}
     if not isinstance(models, dict):
         return out
@@ -46,9 +98,17 @@ def _coerce(models: object) -> dict[str, dict[str, float]]:
         if not isinstance(row, dict):
             continue
         try:
-            out[str(mid)] = {"input": float(row["input"]), "output": float(row["output"])}
+            parsed = {"input": float(row["input"]), "output": float(row["output"])}
         except (KeyError, TypeError, ValueError):
             continue
+        for field in _OPTIONAL_RATE_FIELDS:
+            if field not in row:
+                continue
+            try:
+                parsed[field] = float(row[field])
+            except (TypeError, ValueError):
+                continue
+        out[str(mid)] = parsed
     return out
 
 
@@ -68,7 +128,7 @@ def load_pricing() -> tuple[dict[str, dict[str, float]], list[str]]:
                 json.dumps(
                     {
                         "_comment": "USD per 1,000,000 tokens. Edit freely. "
-                        "Unknown models cost 0 and are flagged, never crash.",
+                        "Unknown models keep their tokens and are shown as unpriced.",
                         "models": defaults,
                     },
                     indent=2,

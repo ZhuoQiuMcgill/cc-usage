@@ -7,26 +7,30 @@ from a pull request.
 
 ## Scope
 
-ccusage is a keyboard-first, interactive terminal app that shows your **Claude Code**
-usage across all sessions: per-model token counts and API-equivalent dollar cost parsed
-from local transcripts, a usage heartbeat, rolling spend windows, and the official 5-hour
-and 7-day subscription limits.
+ccusage is a keyboard-first, interactive terminal app that shows local **Claude Code and
+Codex / ChatGPT app** usage across sessions: per-model token counts, API-equivalent cost,
+activity history, rolling windows, and provider-reported subscription limits.
 
 **In scope:** the TUI and its keyboard navigation, the transcript parser, the cost model
-and pricing table, the heartbeat, rolling-window math, the reversible statusline capture,
-and the self-update path (`--update` / `--check-update`).
+and pricing table, activity/range views, rolling-window math, direct background limit
+refresh, the legacy statusline-restore migration, and the self-update path
+(`--update` / `--check-update`).
 
-**Out of scope:** the OAuth `/api/oauth/usage` endpoint, multi-user or remote operation,
-and historical charts beyond the current windows. These are intentionally not part of the
-tool.
+**Out of scope:** multi-user or remote transcript collection, modifying provider
+transcripts, proxying model requests, or storing provider credentials.
 
-Two hard product rules apply to every change and are non-negotiable:
+Three hard product rules apply to every change and are non-negotiable:
 
-- **Never read or transmit credentials**, and make **no network calls on the panel/data
-  path.** The only network access is the explicit, user-invoked `--update` /
-  `--check-update`.
-- **Treat `~/.claude` transcripts as read-only.** The only files the tool may modify are
-  the statusline settings/script, and only reversibly, with backups.
+- **Keep credentials ephemeral.** Provider access tokens may be read only for an
+  authenticated, read-only limits request, must remain in memory, and must never be logged,
+  included in errors, or written to ccusage caches. Credential refresh is delegated to the
+  installed official provider client.
+- **Keep provider data read-only.** Treat Claude and Codex transcripts/configuration as
+  read-only. The sole exception is the explicit legacy `--restore-statusline` migration,
+  which restores previously backed-up Claude settings and removes ccusage's old wrapper.
+- **Keep network work off the render path.** Provider-limit refreshes run in background
+  workers and retain normalized last-good results on failure. Update checks/installations
+  remain explicit user actions.
 
 ## Development setup
 

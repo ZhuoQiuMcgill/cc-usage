@@ -1,7 +1,7 @@
 """Command-line entry point (T3 R4) — deliberately tiny.
 
     ccusage                    launch the full interactive TUI (default; keyboard-only)
-    ccusage --once             print a single static frame and exit (for scripts/statusline)
+    ccusage --once             print a single static frame and exit (for scripts)
     ccusage --check-update     report current vs latest GitHub release (installs nothing)
     ccusage --update           upgrade to the latest GitHub release via pip
     ccusage --update-pr <N>    install the head of open PR #N for testing (UNREVIEWED code)
@@ -11,28 +11,39 @@
     ccusage --version          print the version
     ccusage --help             usage
 
-No flag is *required* for normal use: everything — viewing, switching the heartbeat,
-and ALL configuration (incl. the statusline install/restore) — happens inside the TUI
-with arrow keys + Enter (the overriding T3 principle). The statusline install/restore
-flags survive only as **hidden** scriptable aliases; the in-app Settings path is primary.
-
-The --update / --check-update commands are explicit user actions and may reach the
-network; the passive panel/data path remains strictly no-network.
+No flag is required for normal use. Provider usage limits refresh in the background.
+A hidden restore command exists only to remove integrations installed by older versions.
 """
 
 from __future__ import annotations
 
 import argparse
+import os
+import sys
 
 from . import __version__
 from .config import load_config
 
 
+def _configure_unicode_output(stream, *, windows: bool | None = None) -> None:
+    """Prevent redirected Windows output from failing on the Unicode dashboard."""
+    if windows is None:
+        windows = os.name == "nt"
+    if not windows or str(getattr(stream, "encoding", "")).lower().replace("-", "") == "utf8":
+        return
+    reconfigure = getattr(stream, "reconfigure", None)
+    if callable(reconfigure):
+        try:
+            reconfigure(encoding="utf-8", errors="replace")
+        except (OSError, ValueError):
+            pass
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="ccusage",
-        description="Interactive panel of Claude Code usage (tokens + API-equivalent "
-        "cost) across all sessions, plus the 5h/7d subscription limits. "
+        description="Interactive panel of Claude Code and Codex usage (tokens + API-equivalent "
+        "cost) across all sessions, plus live provider-reported subscription limits. "
         "Launch it and drive everything with arrow keys + Enter — no flags to memorize.",
         # Exact option names only: --update must never match --update-pr etc.
         allow_abbrev=False,
@@ -72,9 +83,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="report current vs latest prerelease tag (installs nothing)",
     )
-    # Hidden scriptable aliases for the reversible statusline capture. The primary,
-    # documented path is in-app: ccusage -> Settings -> Statusline 5h/7d capture.
-    p.add_argument("--install-statusline", action="store_true", help=argparse.SUPPRESS)
+    # Legacy cleanup only: new versions never install or depend on a statusline.
     p.add_argument("--restore-statusline", action="store_true", help=argparse.SUPPRESS)
     return p
 
@@ -86,8 +95,10 @@ def run_once(config) -> None:
     from .engine import Engine
     from .render import build_panel
 
+    _configure_unicode_output(sys.stdout)
     engine = Engine(config)
     engine.scan()
+    engine.refresh_limits()
     # Persist parse state right after the (expensive) scan — before rendering — so the
     # next launch starts warm even if the terminal render hiccups.
     engine.save_cache()
@@ -98,6 +109,7 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
 
     # Explicit self-update commands (network allowed; never the panel/data path).
+
     if args.check_update:
         from .update import check_update
 
@@ -129,10 +141,10 @@ def main(argv: list[str] | None = None) -> int:
 
         return check_prerelease()
 
-    if args.install_statusline or args.restore_statusline:
-        from .statusline import format_result, install, restore
+    if args.restore_statusline:
+        from .statusline import format_result, restore
 
-        result = install() if args.install_statusline else restore()
+        result = restore()
         print(format_result(result))
         return 0 if result.get("ok") else 1
 

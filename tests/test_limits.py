@@ -4,8 +4,8 @@ Unit tests of the pure renderer, mirroring the render-helper style in test_serie
 test_range.py: build synthetic Buckets + a minimal RenderState, render to plain text and
 assert on it. No I/O, no real capture file — everything here is fabricated.
 
-The fix under test: the 5h/7d capture only refreshes on a Claude Code turn, so once a
-bucket's reset moment has passed the last-captured percentage is stale. At render time a
+The fix under test: once a provider snapshot's reset moment has passed, its captured
+percentage is stale. At render time a
 bucket with now >= resets_at must show 0% + an empty bar + a "reset … ago" note ("reset
 just now" within the first sub-second frame at the boundary), never a fabricated next
 countdown, and the row must flip live the first tick after the boundary.
@@ -53,9 +53,9 @@ def test_expired_bucket_zeroes_and_says_ago_not_resets_in():
     assert "▓" not in out and "░" in out  # bar drained to empty
     assert "ago" in out
     assert "resets in" not in out  # must not fabricate a next-window countdown
-    assert "awaiting next turn" in out  # signals fresh data needs a Claude Code turn
+    assert "refresh pending" in out
     # Pin the whole row byte-exactly so the wording itself is guarded, not just fragments.
-    assert out == "5-HOUR  ░░░░░░░░░░░░░░  0%  reset 3h00m ago · awaiting next turn\n"
+    assert out == "5-HOUR  ░░░░░░░░░░░░░░  0%  reset 3h00m ago · refresh pending\n"
 
 
 # ── 2. boundary counts as expired ─────────────────────────────────────────────
@@ -68,7 +68,7 @@ def test_boundary_now_equals_resets_at_is_expired_and_says_just_now():
     assert "resets in" not in out
     assert "reset now ago" not in out  # the contradictory wording this guards against
     # Pin the whole row byte-exactly so the boundary wording is guarded.
-    assert out == "5-HOUR  ░░░░░░░░░░░░░░  0%  reset just now · awaiting next turn\n"
+    assert out == "5-HOUR  ░░░░░░░░░░░░░░  0%  reset just now · refresh pending\n"
 
 
 # ── 3. buckets judged independently ───────────────────────────────────────────
@@ -94,7 +94,7 @@ def test_unknown_bucket_key_gets_same_expired_treatment():
     no fabricated countdown. The expiry rule uses only the bucket's own resets_at."""
     b = _bucket(NOW - 7_200, key="monthly", label=label_for("monthly"), pct=60.0)
     out = _plain(limits_block(_state([b]), THEME))
-    assert out == "MONTHLY  ░░░░░░░░░░░░░░  0%  reset 2h00m ago · awaiting next turn\n"
+    assert out == "MONTHLY  ░░░░░░░░░░░░░░  0%  reset 2h00m ago · refresh pending\n"
     assert "60%" not in out and "▓" not in out and "resets in" not in out
 
 
@@ -143,11 +143,11 @@ def test_no_buckets_no_capture_shows_populate_hint():
     st = _state([])
     st.rl_present = False  # no capture file at all
     out = _plain(limits_block(st, THEME))
-    assert "run a Claude Code turn to populate" in out
+    assert "check provider login and network access" in out
 
 
 def test_rl_present_but_no_buckets_shows_capture_hint():
     st = _state([])
     st.rl_present = True  # capture exists but held no usable buckets
     out = _plain(limits_block(st, THEME))
-    assert "capture present but no usable buckets yet" in out
+    assert "provider data has no usable windows" in out

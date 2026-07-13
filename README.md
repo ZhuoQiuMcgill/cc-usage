@@ -1,9 +1,9 @@
 # ccusage
 
-A keyboard-first, interactive terminal app for your **Claude Code** usage across **all**
-sessions — per-model token counts and **API-equivalent dollar cost** parsed from local
-transcripts, a compact usage **heartbeat**, rolling spend windows, plus your official
-**5-hour and 7-day subscription limits**. So you never have to run `/usage` again.
+A keyboard-first, interactive terminal app for your **Claude Code and Codex / ChatGPT app**
+usage across **all** local sessions — per-model token counts, API-equivalent dollar cost,
+a compact usage **heartbeat**, rolling spend windows, and locally reported subscription
+limits fetched directly from both providers.
 
 **One command launches it; you drive everything — viewing, switching views, and all
 configuration — with arrow keys + Enter. There are no flags to memorize.**
@@ -16,12 +16,12 @@ CC Usage
 WEEKLY   ▓▓░░░░░░░░░░░░  13%  resets in 5d03h
 ─────────────────────────────────────────────────────────────────────
 
-Spend      1h      5h      24h       7d   all-time
+Usage      1h      5h      24h       7d   all-time
 tokens   9.2M   51.0M   128.0M   402.0M       3.7B
 cost    $8.40  $52.10  $131.50  $455.00  $4,120.00
 ─────────────────────────────────────────────────────────────────────
 
-heartbeat cost · 24h   (left/right = window · up/down = metric)
+Activity cost · 24h   (left/right = window · up/down = metric)
 $12.40 ⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⡇⠀⠀⠀⠀⠀⢠⠀⠀⠀
        ⠀⠀⠀⠀⠀⠀⠀⠀⠀⡆⢸⠀⠀⠀⣿⡆⢸⡇⠀⠀⣸⠀⠀⠀
  $6.20 ⠀⠀⠀⠀⠀⠀⠀⠀⠀⡇⢸⠀⠀⠀⣿⡇⣿⡇⠀⠀⣿⢰⡇⠀
@@ -31,7 +31,7 @@ $12.40 ⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⡇⠀⠀⠀⠀⠀⢠⠀⠀⠀
        peak $12.40/bucket · 14:30 (3h ago)
 ─────────────────────────────────────────────────────────────────────
 
-By model · all-time
+Models · all-time
 Model        In    Out   Cache       Cost
 Opus 4.8   2.6M  18.0M    2.7B  $2,600.00
 Fable 5    610K   4.6M  920.0M  $1,510.00
@@ -48,8 +48,8 @@ render at exact monospace width; in a real terminal the columns line up.*
 
 ## Install
 
-Requires **Python 3.10+** and `jq` (used by the statusline wrapper; you almost certainly
-already have it). Any installer below puts the `ccusage` command on your `PATH` — **uv is
+Requires **Python 3.10+**. There are no required shell utilities or external statusline
+packages. Any installer below puts the `ccusage` command on your `PATH` — **uv is
 recommended.**
 
 ### With uv (recommended)
@@ -200,9 +200,10 @@ key). No flag is required for anything.
 |---|---|
 | **← / →** | Switch the **heartbeat window** — 5h / 24h / 7d (default 24h) |
 | **↑ / ↓** | Toggle the heartbeat **metric** — cost / tokens (`t` also works, as a shortcut) |
-| **s** or **Enter** | Open **Settings** (refresh interval, default table window, show-cost, theme, and the statusline 5h/7d capture install/restore) |
+| **s** or **Enter** | Open **Settings** (refresh interval, default table window, show-cost, theme) |
 | **↑ / ↓** | Move the selection inside Settings and its pickers; **Enter** confirms |
 | **Esc** | Back out of Settings / a picker |
+| **c** | Cancel a cold transcript scan; **r** resumes it from the last completed line |
 | **q** or **Ctrl-C** | Quit cleanly — the terminal is restored |
 
 Data keeps refreshing on the configured interval while the UI stays responsive; the reset
@@ -213,7 +214,7 @@ timers and the heartbeat update live.
 | Command | What it does |
 |---|---|
 | `ccusage` | Launch the interactive TUI (default). |
-| `ccusage --once` | Print a single static frame and exit (handy for scripts / a statusline). |
+| `ccusage --once` | Print a single static frame and exit (handy for scripts). |
 | `ccusage --check-update` | Report your version vs the latest GitHub release (installs nothing). |
 | `ccusage --update` | Upgrade to the latest release via pip. |
 | `ccusage --update-pr <N>` | Install the head of open PR #N for testing (force-reinstall; **unreviewed code**). |
@@ -222,9 +223,9 @@ timers and the heartbeat update live.
 | `ccusage --check-prerelease` | Report your version vs the latest prerelease tag (installs nothing). |
 | `ccusage --version` / `--help` | Version / usage. |
 
-(`--install-statusline` / `--restore-statusline` still exist as **hidden** scriptable
-aliases, but the primary, documented path is in-app: **Settings → Statusline 5h/7d
-capture**.)
+Older releases could install a Claude statusline integration. Current releases never
+install or depend on one. If you used that older feature, run the hidden one-time cleanup
+command `ccusage --restore-statusline`.
 
 ## The heartbeat
 
@@ -253,41 +254,30 @@ Press **s** (or **Enter**) on the panel. Every value is chosen from a list — n
 - **Default table window** — all-time / 1h / 5h / 24h / **7d**
 - **Show cost column** — on / off
 - **Theme** — dark / light / high-contrast
-- **Statusline 5h/7d capture** — Install wrapper / Restore original
 
 Choices persist to `~/.config/cc-usage/config.json` and apply live.
 
-## The 5h / 7d limits — how capture works (and how to undo it)
+## Subscription limits
 
-Claude Code passes a JSON document on **stdin** to your `statusLine` command on every
-assistant turn; for Pro/Max accounts it includes a `rate_limits` object. ccusage reads
-those numbers **only** from a small local cache — it never touches credentials and makes
-**no network calls** on the panel/data path.
+Both providers are fetched automatically in the background and shown together with
+provider-tagged labels. A normalized last-good snapshot is cached so startup remains
+fast and temporary network or rate-limit errors do not blank the panel.
 
-To populate that cache, install the wrapper from **Settings → Statusline 5h/7d capture →
-Install wrapper** (all keyboard-driven). The wrapper:
+- **Codex / ChatGPT:** ccusage starts the installed Codex app server and calls its
+  documented `account/rateLimits/read` RPC. Codex owns authentication and token refresh;
+  ccusage never reads Codex credentials.
+- **Claude Code:** ccusage reads the access token from Claude Code's local credential
+  file in memory and calls Anthropic's read-only OAuth usage endpoint. If the token has
+  expired, credential renewal is delegated to the official `claude` executable using an
+  empty zero-turn invocation. Token values and raw responses are never logged or cached.
 
-1. **Backs up** your `settings.json` and `statusline-command.sh` first.
-2. Repoints `settings.json` → `statusLine.command` at a small wrapper script that reads
-   stdin once, writes `.rate_limits` (+ a capture timestamp) to
-   `~/.config/cc-usage/ratelimits.json`, then **runs your original statusline with the same
-   stdin and emits its output byte-for-byte unchanged**. Install *proves* the output is
-   byte-identical before it repoints anything — your visible statusline does not change.
+Limits refresh after the initial transcript scan and then every five minutes. On a warm
+start, cached transcript totals and cached limits render immediately while reconciliation
+and live fetching continue off the UI thread.
 
-The limits then appear within a few seconds, on your next turn. Until the wrapper is
-installed (or if you use an API key with no subscription limits) the panel shows
-`5h / 7d: n/a — run a Claude Code turn to populate`.
-
-**Undo at any time** — fully reversible, from **Settings → Statusline 5h/7d capture →
-Restore original**. Restore reverts **both** `settings.json` and `statusline-command.sh`
-to their originals (verified by sha256), removes the wrapper, and clears the cached limits.
-If you ever need to do it by hand:
-
-```bash
-cp -p ~/.config/cc-usage/backups/settings.json.orig         ~/.claude/settings.json
-cp -p ~/.config/cc-usage/backups/statusline-command.sh.orig ~/.claude/statusline-command.sh
-rm -f ~/.config/cc-usage/statusline-wrapper.sh ~/.config/cc-usage/ratelimits.json
-```
+There is no `ccstatusline`, `jq`, shell wrapper, or statusline configuration dependency.
+The hidden `ccusage --restore-statusline` command exists only to undo integrations
+installed by older ccusage versions.
 
 ## Pricing (editable)
 
@@ -298,22 +288,30 @@ yours to edit; a malformed file falls back to the bundled defaults. The cost mod
 ```
 cost =  input_tokens              * input_rate
       + output_tokens             * output_rate
-      + cache_read_input_tokens   * input_rate * 0.10
+      + cache_read_input_tokens   * cache_read_rate
       + ephemeral_5m_input_tokens * input_rate * 1.25
       + ephemeral_1h_input_tokens * input_rate * 2.00
 ```
 
 (If a record lacks the `ephemeral_*` sub-buckets, cache creation falls back to
-`cache_creation_input_tokens * input_rate * 1.25`.) Unknown model ids contribute **$0**,
-are flagged with a `*`, and never crash the tool. Model ids are matched tolerantly —
-`[1m]` and date suffixes are stripped.
+`cache_creation_input_tokens * input_rate * 1.25`.) When a row omits `cache_read`, the
+legacy 10% input-rate rule is used. Bundled defaults cover Claude plus published standard
+API rates for GPT-5.4, GPT-5.4 mini, GPT-5.5, and the GPT-5.6 family. The cost engine also
+applies the official >272K-input multipliers to models that publish them. Subscription-only
+aliases, research previews without a token rate, local models, and future unknown ids
+keep their token counts but are shown as **unpriced**; their unavailable cost is excluded
+from totals, pricing coverage is reported, and they are flagged with a `*`.
 
 ## How it works
 
-- **Transcripts** (`~/.claude/projects/**/*.jsonl`, read-only) are scanned **recursively** —
-  including subagent/workflow transcripts, which are real spend. Each assistant record with
-  a usage object is **deduplicated by `(requestId, message.id)`** so retries/echoes count
-  once.
+- **Claude transcripts** (`~/.claude/projects/**/*.jsonl`, read-only) are scanned
+  recursively, including subagent/workflow usage. Streaming records are merged by
+  `(requestId, message.id)`.
+- **Codex / ChatGPT rollouts** (`~/.codex/sessions/**/*.jsonl` and
+  `~/.codex/archived_sessions/*.jsonl`, read-only) contribute each response's
+  `last_token_usage` and active model. Local rate-limit snapshots are fallback data only.
+- **Live limits:** Claude is fetched from its OAuth usage endpoint; Codex is fetched via
+  `account/rateLimits/read`. Normalized last-good results are cached without credentials.
 - **Rolling windows** (last 1h / 5h / 24h / **7d** / all-time) are computed from record
   timestamps — pure epoch math, timezone-independent.
 - **Heartbeat series** — the records in the chosen window are bucketed into ~48 equal time
@@ -321,52 +319,60 @@ are flagged with a `*`, and never crash the tool. Model ids are matched tolerant
 - **Incremental parsing:** each file's byte offset + size + mtime are remembered; later
   refreshes read only newly appended lines (no full re-scan per tick) and stay smooth across
   hundreds of files.
-- **Warm startup (persistent cache):** that incremental state is also saved to disk
-  (`parse-cache.pkl`), so a **relaunch re-parses only the bytes appended since last time**
-  instead of the whole corpus — a multi-GB history that took seconds to scan cold opens in
-  a fraction of that warm. The cache is pure derived data: it's invalidated automatically
-  when the pricing table changes, a transcript is deleted, or the format version bumps, and
-  a missing/corrupt cache silently falls back to a full scan (results are always identical
-  to a cold parse). The **first** scan also runs off the UI thread, so even a cold start
-  paints immediately (a brief `scanning transcripts…`) instead of freezing. If the optional
-  [`orjson`](https://github.com/ijl/orjson) package happens to be installed, it's used to
-  speed up that cold parse; it is not required.
+- **Immediate warm startup:** cached combined Claude + Codex aggregates are loaded and
+  rendered before walking the transcript trees. File discovery, archive-move reconciliation,
+  and appended-byte parsing continue in the background. Codex moving a rollout from active
+  to archived storage preserves the warm cache instead of triggering a cold rebuild.
+- **Persistent incremental cache:** `parse-cache.pkl` remembers every file offset. A pricing
+  change, true transcript deletion, incompatible format, or corrupt cache safely falls back
+  to a cold scan; results remain identical. The first-ever cold scan also runs off the UI
+  thread. Discovery starts with an indeterminate status, followed by a byte-weighted
+  progress bar with file and byte counts. Press `c` to cancel at a line boundary and
+  `r` to resume without duplicating already parsed usage.
+- **Memory-safe cold scans:** changed rollouts stream through a bounded read buffer rather
+  than being copied into RAM whole, avoiding a history-sized allocation on large installs.
+- **Adaptive terminal layout:** below 76 columns, rolling windows transpose vertically,
+  model token columns collapse into a readable total, and scan progress wraps to two
+  lines. No metrics are dropped.
+- **Optional JSON acceleration:** if
+  [`orjson`](https://github.com/ijl/orjson) is installed, ccusage uses it to speed up cold
+  parsing; it is not required.
 
 ## Files ccusage owns
 
-Everything under `~/.config/cc-usage/`:
+Derived data and settings live under `~/.config/cc-usage/`:
 
 ```
-config.json                 your settings
-pricing.json                editable price table
-ratelimits.json             last captured 5h/7d limits (only while the wrapper is installed)
-statusline-wrapper.sh       the capture wrapper (only while installed)
-parse-cache.pkl             warm-start parse cache (derived; safe to delete anytime)
-backups/                    settings.json.orig, statusline-command.sh.orig, snapshots
+config.json                  your settings
+pricing.json                 editable price table
+provider-limits.json         normalized last-good Claude and Codex limits
+parse-cache.pkl              warm-start parse cache (derived; safe to delete anytime)
+backups/                     legacy statusline restore data, if an older version made it
 ```
+
+Claude and Codex transcript directories remain read-only. The only provider-owned write
+that may occur is Claude's own executable refreshing its expired OAuth credentials.
 
 ## Tests
 
 ```bash
-.venv/bin/python -m pytest -q
+uv run pytest -q
 ```
 
-Covers the cost model, dedup/extraction against a hand-verified fixture (with a malformed
-line, an unknown model, and a duplicate), rolling-window boundaries (incl. **7d**), the
-**heartbeat series** (rate-per-bucket semantics, window scoping, edges, empty window, the
-braille renderer), config persistence, the **interactive TUI flows** driven by Textual's
-test harness (arrow/Enter navigation, heartbeat window/metric switching, opening Settings
-and changing a setting, clean quit), and the **statusline install→restore** flow proven
-byte-identical by sha256 — plus incremental parsing.
+Covers the cost model, dedup/extraction against hand-verified fixtures, rolling-window
+boundaries, heartbeat rendering, config persistence, keyboard-driven Textual flows,
+Claude and Codex provider normalization, expired Claude credential refresh, credential
+non-leakage, Codex rollout parsing, legacy statusline restoration, and incremental
+warm-cache parsing.
 
 ## Scope & safety
 
-- **No credentials are ever read; no network calls on the panel/data path.** Limits come
-  only from the local statusline capture. The only network access is the explicit,
-  user-invoked update commands (`--update` / `--check-update` and the test-channel
-  `--update-pr` / `--update-prerelease` / `--update-stable` / `--check-prerelease`); they
-  use the public-repo release/PR APIs and `git+https`, which need no auth.
-- `~/.claude` transcripts are treated as read-only. The only files ccusage modifies are the
-  statusline settings/script, and only reversibly, with backups.
-- Out of scope: the OAuth `/api/oauth/usage` endpoint, multi-user, remote, historical
-  charts.
+- Live subscription limits require network access. Codex authentication stays behind its
+  app-server broker. Claude's OAuth access token is read only in memory; persisted limit
+  data contains percentages, labels, capture times, and reset times only.
+- `~/.claude` and `~/.codex` transcripts are read-only. ccusage never changes a
+  statusline. The hidden restore command changes Claude settings only when explicitly
+  invoked to remove an older ccusage integration.
+- Provider failures retain the last good normalized snapshot and surface a warning.
+  Subscription percentages are provider-reported current values, distinct from the
+  locally calculated token and API-equivalent cost history.

@@ -27,9 +27,14 @@ import pickle
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Callable
 
 from .cost import compute_cost, get_rates, normalize_model
-from .paths import PROJECTS_DIR
+from .paths import (
+    CODEX_ARCHIVED_SESSIONS_DIR,
+    CODEX_SESSIONS_DIR,
+    PROJECTS_DIR,
+)
 
 # Optional fast JSON. orjson (a C extension) parses bytes directly and is ~2x the
 # stdlib on this workload; it's NOT a hard dependency, so we use it only if the user
@@ -52,17 +57,24 @@ def _json_loads(raw: bytes):
     return json.loads(raw.decode("utf-8", "replace"))
 
 
-# Cheap byte prefilter: an assistant usage line must contain both markers. No false
-# negatives (an assistant record with usage always has them), so this only skips
-# lines we'd discard anyway — it just avoids a full json.loads on most lines.
+# Cheap byte prefilter for the two supported rollout schemas.
 _MARK_USAGE = b'"usage"'
 _MARK_ASSISTANT = b"assistant"
+_MARK_TOKEN_COUNT = b'"token_count"'
+_MARK_TURN_CONTEXT = b'"turn_context"'
+
+# Keep file reads bounded even when a cold scan encounters a multi-gigabyte rollout.
+# Individual JSONL records are still returned whole by readline(), but the file itself is
+# never duplicated into one giant bytes object before parsing.
+_READ_BUFFER_BYTES = 4 * 1024 * 1024
 
 # Persistent-cache format version. Bump whenever the on-disk shape below or the
 # extraction/cost logic changes, so an older cache is ignored rather than mis-read.
 # v2: records gained the private cache_creation sub-buckets and the cache now stores
 # a per-record dedup key so streaming merges (T9) survive a warm start.
-_CACHE_VERSION = 2
+# v4: Codex records seen before their first turn_context are retained as pending so a
+# later model marker can reconcile them across incremental scans and warm starts.
+_CACHE_VERSION = 4
 
 
 @dataclass(slots=True)
@@ -70,7 +82,7 @@ class UsageRecord:
     ts: float  # epoch seconds (UTC)
     model_raw: str
     model_norm: str
-    known: bool  # False -> model not in pricing (cost contributed 0)
+    known: bool  # False -> model not in pricing (tokens kept; cost is unavailable)
     input_tokens: int
     output_tokens: int
     cache_read: int
@@ -100,6 +112,26 @@ class ParseStats:
     duplicates: int = 0  # repeat-key lines merged into an existing record (T9)
     malformed: int = 0
     unknown_models: set[str] = field(default_factory=set)
+
+
+@dataclass(frozen=True, slots=True)
+class ScanProgress:
+    """One progress snapshot for transcript discovery or parsing."""
+
+    phase: str
+    files_done: int = 0
+    files_total: int = 0
+    bytes_done: int = 0
+    bytes_total: int = 0
+    current_file: str | None = None
+
+
+class ScanCancelled(RuntimeError):
+    """The caller requested a resumable transcript-scan cancellation."""
+
+
+ProgressCallback = Callable[[ScanProgress], None]
+CancelCheck = Callable[[], bool]
 
 
 @dataclass
@@ -133,22 +165,32 @@ def parse_timestamp(ts: object) -> float | None:
     return dt.timestamp()
 
 
-def iter_transcript_files() -> list[Path]:
-    """All transcript files across every project dir (sorted, deterministic).
+def iter_transcript_files(cancelled: CancelCheck | None = None) -> list[Path]:
+    """All Claude and Codex transcript files, sorted deterministically.
 
-    Recursive: subagent/workflow transcripts live deeper, under
-    `<session>/subagents/workflows/wf_*/...`. Their usage is real spend (T0 §4A),
-    so we must descend into them — a one-level glob misses ~90% of the data.
-    Global dedup by (requestId, message.id) prevents double-counting lines that a
-    parent session and a subagent file both contain.
+    Claude project trees are recursive because subagent/workflow usage lives below
+    the session root. Codex stores active rollouts by date and archived rollouts in
+    a flat sibling directory. All sources are read-only.
+
+    When tests or embedders monkeypatch PROJECTS_DIR, scan only that explicit tree;
+    this preserves the parser's long-standing hermetic override behavior.
     """
-    if not PROJECTS_DIR.is_dir():
-        return []
-    try:
-        return sorted(PROJECTS_DIR.rglob("*.jsonl"))
-    except OSError:
-        return []
-
+    canonical_claude = Path.home() / ".claude" / "projects"
+    roots = [PROJECTS_DIR]
+    if PROJECTS_DIR == canonical_claude:
+        roots.extend([CODEX_SESSIONS_DIR, CODEX_ARCHIVED_SESSIONS_DIR])
+    files: set[Path] = set()
+    for root in roots:
+        if not root.is_dir():
+            continue
+        try:
+            for path in root.rglob("*.jsonl"):
+                if cancelled is not None and cancelled():
+                    raise ScanCancelled("transcript discovery cancelled")
+                files.add(path)
+        except OSError:
+            continue
+    return sorted(files)
 
 def _dedup_key(obj: dict, msg: dict) -> tuple[object, object] | None:
     """(requestId, message.id). None when message.id is absent (can't dedup -> count)."""
@@ -191,6 +233,7 @@ class Parser:
         # and touches no cache — which is what the unit tests rely on.
         self.cache_path = cache_path
         self._cache_loaded = False
+        self._cache_unvalidated = False
         self.records: list[UsageRecord] = []
         self.stats = ParseStats()
         # One kept UsageRecord per unique (requestId, message.id). A repeat key
@@ -199,6 +242,16 @@ class Parser:
         # by aggregate()/series(). Persists across scans (and, via the cache, runs).
         self._by_key: dict[tuple[object, object], UsageRecord] = {}
         self._files: dict[str, _FileState] = {}
+        # Codex token_count events carry the model in the preceding turn_context.
+        self._file_models: dict[str, str] = {}
+        # Some rollouts emit token_count before their first turn_context. Keep object
+        # references so the first authoritative model marker can reattribute/reprice
+        # those records instead of permanently inventing a literal `codex` model.
+        self._codex_pending: dict[str, list[UsageRecord]] = {}
+        self._codex_totals: dict[str, tuple[int, int, int]] = {}
+        # Canonical local rate-limit capture, newest event across all Codex files.
+        self.latest_rate_limits: dict | None = None
+
 
     # ── extraction ────────────────────────────────────────────────────────
     def _extract(self, obj: dict) -> UsageRecord | None:
@@ -304,10 +357,141 @@ class Parser:
             self._by_key[key] = rec
         return rec
 
-    def _ingest_line(self, raw: bytes) -> None:
-        if _MARK_USAGE not in raw or _MARK_ASSISTANT not in raw:
+    @staticmethod
+    def _codex_int(value: object) -> int:
+        return value if isinstance(value, int) and value >= 0 else 0
+
+    def _capture_codex_limits(self, payload: dict, ts: float) -> None:
+        limits = payload.get("rate_limits")
+        if not isinstance(limits, dict):
             return
-        self.stats.lines_read += 1
+        buckets: dict[str, dict[str, float]] = {}
+        for name in ("primary", "secondary"):
+            value = limits.get(name)
+            if not isinstance(value, dict):
+                continue
+            used = value.get("used_percent")
+            resets = value.get("resets_at")
+            if not isinstance(used, (int, float)) or not isinstance(resets, (int, float)):
+                continue
+            bucket: dict[str, float] = {
+                "used_percentage": float(used),
+                "resets_at": float(resets),
+            }
+            minutes = value.get("window_minutes")
+            if isinstance(minutes, (int, float)):
+                bucket["window_minutes"] = float(minutes)
+            buckets[f"codex_{name}"] = bucket
+        if not buckets:
+            return
+        capture = {"captured_at": ts, "source": "codex", "rate_limits": buckets}
+        current_ts = (self.latest_rate_limits or {}).get("captured_at", float("-inf"))
+        if not isinstance(current_ts, (int, float)) or ts >= current_ts:
+            self.latest_rate_limits = capture
+
+    def _reconcile_codex_model(self, source: str, model: str) -> None:
+        """Make a turn_context authoritative for pre-context records in one rollout."""
+        self._file_models[source] = model
+        pending = self._codex_pending.pop(source, [])
+        if not pending:
+            return
+        model_norm = normalize_model(model) or "codex-unattributed"
+        rates = get_rates(model, self.pricing)
+        known = rates is not None
+        for record in pending:
+            record.model_raw = model
+            record.model_norm = model_norm
+            record.known = known
+            record.cost = compute_cost(
+                input_tokens=record.input_tokens,
+                output_tokens=record.output_tokens,
+                cache_read=record.cache_read,
+                cache_creation_total=record.cache_creation,
+                ephemeral_5m=record._eph_5m,
+                ephemeral_1h=record._eph_1h,
+                rates=rates,
+            )
+        # Rebuild rather than discard one name blindly: another file may still contain
+        # genuinely unattributed records, and the authoritative model may itself be
+        # unpriced (for example codex-auto-review).
+        self.stats.unknown_models = {
+            record.model_norm
+            for record in self.records
+            if not record.known and record.model_norm
+        }
+
+    def _extract_codex(self, obj: dict, source: str) -> UsageRecord | None:
+        payload = obj.get("payload")
+        if not isinstance(payload, dict) or payload.get("type") != "token_count":
+            return None
+        ts = parse_timestamp(obj.get("timestamp"))
+        if ts is None:
+            return None
+        self._capture_codex_limits(payload, ts)
+        info = payload.get("info")
+        if not isinstance(info, dict):
+            return None
+        total = info.get("total_token_usage")
+        last = info.get("last_token_usage")
+        current_total = None
+        if isinstance(total, dict):
+            current_total = (
+                self._codex_int(total.get("input_tokens")),
+                self._codex_int(total.get("cached_input_tokens")),
+                self._codex_int(total.get("output_tokens")),
+            )
+        if isinstance(last, dict):
+            raw_input = self._codex_int(last.get("input_tokens"))
+            cache_read = min(raw_input, self._codex_int(last.get("cached_input_tokens")))
+            output_tokens = self._codex_int(last.get("output_tokens"))
+        elif current_total is not None:
+            previous = self._codex_totals.get(source, (0, 0, 0))
+            raw_input = max(0, current_total[0] - previous[0])
+            cache_read = min(raw_input, max(0, current_total[1] - previous[1]))
+            output_tokens = max(0, current_total[2] - previous[2])
+        else:
+            return None
+        if current_total is not None:
+            self._codex_totals[source] = current_total
+        if raw_input == 0 and output_tokens == 0:
+            return None
+
+        # Codex input_tokens includes cached_input_tokens; keep cached input separate.
+        input_tokens = raw_input - cache_read
+        model_raw = self._file_models.get(source, "codex-unattributed")
+        model_norm = normalize_model(model_raw) or "codex-unattributed"
+        rates = get_rates(model_raw, self.pricing)
+        known = rates is not None
+        if not known:
+            self.stats.unknown_models.add(model_norm)
+        cost = compute_cost(
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            cache_read=cache_read,
+            cache_creation_total=0,
+            ephemeral_5m=0,
+            ephemeral_1h=0,
+            rates=rates,
+        )
+        return UsageRecord(
+            ts=ts,
+            model_raw=model_raw,
+            model_norm=model_norm,
+            known=known,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            cache_read=cache_read,
+            cache_creation=0,
+            cost=cost,
+            _eph_5m=0,
+            _eph_1h=0,
+        )
+
+    def _ingest_line(self, raw: bytes, source: str = "") -> None:
+        is_claude = _MARK_USAGE in raw and _MARK_ASSISTANT in raw
+        is_codex = _MARK_TOKEN_COUNT in raw or _MARK_TURN_CONTEXT in raw
+        if not is_claude and not is_codex:
+            return
         try:
             obj = _json_loads(raw)
         except (json.JSONDecodeError, ValueError):
@@ -315,13 +499,28 @@ class Parser:
             return
         if not isinstance(obj, dict):
             return
-        rec = self._extract(obj)
+        if obj.get("type") == "turn_context":
+            payload = obj.get("payload")
+            model = payload.get("model") if isinstance(payload, dict) else None
+            if isinstance(model, str) and model:
+                self._reconcile_codex_model(source, model)
+            return
+        self.stats.lines_read += 1
+        rec = self._extract_codex(obj, source) if is_codex else self._extract(obj)
         if rec is not None:
             self.records.append(rec)
+            if is_codex and source not in self._file_models:
+                self._codex_pending.setdefault(source, []).append(rec)
             self.stats.records += 1
 
     # ── incremental file reading ──────────────────────────────────────────
-    def _read_new(self, path: Path) -> None:
+    def _read_new(
+        self,
+        path: Path,
+        *,
+        on_bytes: Callable[[int], None] | None = None,
+        cancelled: CancelCheck | None = None,
+    ) -> None:
         sp = str(path)
         try:
             st = path.stat()
@@ -332,48 +531,167 @@ class Parser:
             state = _FileState()
             self._files[sp] = state
         elif st.st_size == state.size and st.st_mtime == state.mtime:
-            return  # unchanged since last scan -> skip entirely (the M6 win)
+            return
 
         start = state.offset
         if st.st_size < start:
-            start = 0  # truncated/rotated -> re-read from the top
+            start = 0
 
+        consumed = 0
         try:
-            with open(path, "rb") as fh:
+            with open(path, "rb", buffering=_READ_BUFFER_BYTES) as fh:
                 fh.seek(start)
-                chunk = fh.read()
+                while raw_line := fh.readline():
+                    if cancelled is not None and cancelled():
+                        # Persist the last ingested line boundary so retry resumes safely.
+                        state.offset = start + consumed
+                        raise ScanCancelled("transcript scan cancelled")
+                    if not raw_line.endswith(b"\n"):
+                        # Leave an incomplete tail before the offset. When it is appended
+                        # to, the size/mtime change below makes the next scan revisit it.
+                        if on_bytes is not None:
+                            on_bytes(len(raw_line))
+                        break
+                    line = raw_line[:-1]
+                    if line.strip():
+                        self._ingest_line(line, sp)
+                    consumed += len(raw_line)
+                    if on_bytes is not None:
+                        on_bytes(len(raw_line))
+        except ScanCancelled:
+            raise
         except OSError:
+            # A later scan resumes after the last complete line already ingested rather
+            # than repeating non-deduplicated Codex token-count events.
+            state.offset = start + consumed
             return
 
-        last_nl = chunk.rfind(b"\n")
-        if last_nl == -1:
-            # No complete line yet (mid-append); leave offset, just refresh stat.
-            state.size, state.mtime = st.st_size, st.st_mtime
-            return
-        complete = chunk[: last_nl + 1]
-        for line in complete.split(b"\n"):
-            if line.strip():
-                self._ingest_line(line)
-
-        state.offset = start + last_nl + 1
+        state.offset = start + consumed
         state.size = st.st_size
         state.mtime = st.st_mtime
 
-    def scan(self) -> ParseStats:
-        """Read any new transcript lines and fold them into running aggregates.
+    def scan(
+        self,
+        progress: ProgressCallback | None = None,
+        cancelled: CancelCheck | None = None,
+    ) -> ParseStats:
+        """Reconcile cached paths, then read new bytes with progress/cancellation."""
+        if progress is not None:
+            progress(ScanProgress(phase="discovering"))
+        files = iter_transcript_files(cancelled)
+        if cancelled is not None and cancelled():
+            if progress is not None:
+                progress(ScanProgress(phase="cancelled", files_total=len(files)))
+            raise ScanCancelled("transcript scan cancelled")
 
-        On the *first* scan, if a cache path is configured, previously persisted
-        state (records + dedup set + per-file offsets) is loaded first, so only
-        transcript bytes appended since that snapshot are read now (M6 across runs).
-        """
-        files = iter_transcript_files()
+        current_paths = {str(p) for p in files}
         if self.cache_path is not None and not self._cache_loaded:
             self._cache_loaded = True
-            self._load_cache({str(p) for p in files})
+            self._load_cache(current_paths)
+        elif self._cache_unvalidated:
+            if not self._reconcile_cached_paths(current_paths):
+                self._clear_cache_state()
+            self._cache_unvalidated = False
         self.stats.files_seen = len(files)
+
+        pending_bytes: dict[Path, int] = {}
         for path in files:
-            self._read_new(path)
+            try:
+                st = path.stat()
+            except OSError:
+                pending_bytes[path] = 0
+                continue
+            state = self._files.get(str(path))
+            if state is not None and st.st_size == state.size and st.st_mtime == state.mtime:
+                pending_bytes[path] = 0
+            else:
+                start = state.offset if state is not None else 0
+                pending_bytes[path] = st.st_size if st.st_size < start else st.st_size - start
+
+        bytes_total = sum(pending_bytes.values())
+        bytes_done = 0
+
+        def emit(phase: str, files_done: int, current_file: str | None = None) -> None:
+            if progress is not None:
+                progress(
+                    ScanProgress(
+                        phase=phase,
+                        files_done=files_done,
+                        files_total=len(files),
+                        bytes_done=bytes_done,
+                        bytes_total=max(bytes_total, bytes_done),
+                        current_file=current_file,
+                    )
+                )
+
+        emit("parsing", 0)
+        for index, path in enumerate(files):
+            if cancelled is not None and cancelled():
+                emit("cancelled", index)
+                raise ScanCancelled("transcript scan cancelled")
+
+            def advance(count: int, *, _path: Path = path, _index: int = index) -> None:
+                nonlocal bytes_done
+                bytes_done += count
+                emit("parsing", _index, _path.name)
+
+            self._read_new(path, on_bytes=advance, cancelled=cancelled)
+            emit("parsing", index + 1, path.name)
+
+        emit("complete", len(files))
         return self.stats
+    def prime_cache(self) -> bool:
+        """Load cached aggregates immediately; filesystem reconciliation can follow."""
+        if self.cache_path is None:
+            return False
+        if self._cache_loaded:
+            return bool(self.records)
+        self._cache_loaded = True
+        loaded = self._load_cache(None)
+        self._cache_unvalidated = loaded
+        return loaded
+
+    def _clear_cache_state(self) -> None:
+        self.records = []
+        self.stats = ParseStats()
+        self._by_key = {}
+        self._files = {}
+        self._file_models = {}
+        self._codex_pending = {}
+        self._codex_totals = {}
+        self.latest_rate_limits = None
+        self._cache_unvalidated = False
+
+    def _reconcile_cached_paths(self, current_paths: set[str]) -> bool:
+        """Accept Codex active→archive moves without invalidating the whole cache."""
+        missing = [path for path in self._files if path not in current_paths]
+        if not missing:
+            return True
+        by_name: dict[str, list[str]] = {}
+        for path in current_paths - set(self._files):
+            by_name.setdefault(Path(path).name, []).append(path)
+        remaps: dict[str, str] = {}
+        for old in missing:
+            name = Path(old).name
+            candidates = by_name.get(name, [])
+            if not name.startswith("rollout-") or len(candidates) != 1:
+                return False
+            new = candidates[0]
+            try:
+                if Path(new).stat().st_size < self._files[old].offset:
+                    return False
+            except OSError:
+                return False
+            remaps[old] = new
+        for old, new in remaps.items():
+            self._files[new] = self._files.pop(old)
+            if old in self._file_models:
+                self._file_models[new] = self._file_models.pop(old)
+            if old in self._codex_pending:
+                self._codex_pending[new] = self._codex_pending.pop(old)
+            if old in self._codex_totals:
+                self._codex_totals[new] = self._codex_totals.pop(old)
+        return True
 
     # ── persistent cache (M6 across process runs) ─────────────────────────────
     def _pricing_fingerprint(self) -> str:
@@ -385,66 +703,72 @@ class Parser:
         blob = json.dumps(self.pricing, sort_keys=True, default=str).encode("utf-8")
         return hashlib.sha256(blob).hexdigest()
 
-    def _load_cache(self, current_paths: set[str]) -> None:
-        """Populate state from the on-disk cache, or leave it empty on any mismatch.
-
-        The cache is honoured only when it is fully consistent with *this* run:
-        matching format version, matching pricing fingerprint, and every cached file
-        still present on disk. That last check matters — records don't carry their
-        source file, so a *deleted* transcript couldn't be subtracted from the flat
-        record list; discarding the cache and rescanning keeps a warm start's totals
-        byte-identical to a cold one. ANY error (missing/corrupt/incompatible pickle)
-        degrades silently to an empty state → a normal full scan (Rulebook r4).
-        """
+    def _load_cache(self, current_paths: set[str] | None) -> bool:
+        """Load a validated cache; optionally reconcile it with current paths."""
         try:
             with open(self.cache_path, "rb") as fh:
                 data = pickle.load(fh)
         except Exception:
-            # Deliberately broad: unpickling malformed input can raise almost anything
-            # (the pickle docs say as much). A bad cache must never be fatal — it just
-            # means a cold scan this time (Rulebook r4). The data is re-validated below.
-            return
+            return False
         if not isinstance(data, dict):
-            return
+            return False
         if data.get("version") != _CACHE_VERSION:
-            return
+            return False
         if data.get("pricing_fp") != self._pricing_fingerprint():
-            return
+            return False
         files = data.get("files")
         records = data.get("records")
         keys = data.get("keys")
-        if not isinstance(files, dict) or records is None or keys is None:
-            return
-        # A cached file that no longer exists would leave orphaned records we can't
-        # remove → discard the whole cache and let scan() rebuild from disk.
-        if any(p not in current_paths for p in files):
-            return
+        codex = data.get("codex")
+        if (
+            not isinstance(files, dict)
+            or records is None
+            or keys is None
+            or not isinstance(codex, dict)
+        ):
+            return False
         try:
-            recs = [UsageRecord(*t) for t in records]
-            # Rebuild the per-message index from the parallel key list, pointing at
-            # the SAME record objects so a streaming line appended after this warm
-            # start merges into the cached record in place (T9).
+            recs = [UsageRecord(*item) for item in records]
             by_key: dict[tuple[object, object], UsageRecord] = {}
-            for rec, k in zip(recs, keys, strict=True):
-                if k is not None:
-                    by_key[tuple(k)] = rec
+            for rec, key in zip(recs, keys, strict=True):
+                if key is not None:
+                    by_key[tuple(key)] = rec
             self.records = recs
             self._by_key = by_key
             self._files = {
-                p: _FileState(offset=o, size=s, mtime=m)
-                for p, (o, s, m) in files.items()
+                path: _FileState(offset=offset, size=size, mtime=mtime)
+                for path, (offset, size, mtime) in files.items()
             }
-        except (TypeError, ValueError):
-            # A shape we don't recognise — treat exactly like a cold start.
-            self.records = []
-            self._by_key = {}
-            self._files = {}
-            return
+            file_models = codex.get("file_models", {})
+            pending = codex.get("pending", {})
+            totals = codex.get("totals", {})
+            latest = codex.get("latest_rate_limits")
+            if (
+                not isinstance(file_models, dict)
+                or not isinstance(pending, dict)
+                or not isinstance(totals, dict)
+            ):
+                raise TypeError("invalid Codex cache state")
+            self._file_models = {str(key): str(value) for key, value in file_models.items()}
+            self._codex_pending = {
+                str(source): [self.records[int(index)] for index in indices]
+                for source, indices in pending.items()
+            }
+            self._codex_totals = {str(key): tuple(value) for key, value in totals.items()}
+            self.latest_rate_limits = latest if isinstance(latest, dict) else None
+        except (IndexError, KeyError, OverflowError, TypeError, ValueError):
+            self._clear_cache_state()
+            return False
         self.stats.records = len(self.records)
         self.stats.unknown_models = {
-            r.model_norm for r in self.records if not r.known and r.model_norm
+            record.model_norm
+            for record in self.records
+            if not record.known and record.model_norm
         }
-
+        if current_paths is not None and not self._reconcile_cached_paths(current_paths):
+            self._clear_cache_state()
+            return False
+        return True
     def save_cache(self) -> None:
         """Persist current state to the cache path (atomic; no-op if unconfigured).
 
@@ -457,6 +781,7 @@ class Parser:
         # Reverse index: the dedup key (if any) that points at each record, so a
         # warm start can rebuild self._by_key with the same object identity (T9).
         rec_key = {id(r): k for k, r in self._by_key.items()}
+        rec_index = {id(r): index for index, r in enumerate(self.records)}
         data = {
             "version": _CACHE_VERSION,
             "pricing_fp": self._pricing_fingerprint(),
@@ -480,6 +805,15 @@ class Parser:
                 for r in self.records
             ],
             "keys": [rec_key.get(id(r)) for r in self.records],
+            "codex": {
+                "file_models": self._file_models,
+                "pending": {
+                    source: [rec_index[id(record)] for record in records]
+                    for source, records in self._codex_pending.items()
+                },
+                "totals": self._codex_totals,
+                "latest_rate_limits": self.latest_rate_limits,
+            },
         }
         try:
             self.cache_path.parent.mkdir(parents=True, exist_ok=True)
@@ -496,6 +830,6 @@ class Parser:
             with open(path, "rb") as fh:
                 for line in fh:
                     if line.strip():
-                        self._ingest_line(line)
+                        self._ingest_line(line, str(path))
         except OSError:
             return

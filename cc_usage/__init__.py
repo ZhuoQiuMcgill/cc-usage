@@ -1,9 +1,8 @@
-"""ccusage — a keyboard-first interactive TUI of Claude Code usage across all sessions.
+"""Interactive local usage TUI for Claude Code and Codex / ChatGPT app.
 
-Token counts + API-equivalent cost parsed from local transcripts, a compact usage
-heartbeat, rolling spend windows (1h/5h/24h/7d/all-time), plus the official 5-hour /
-7-day subscription limits captured (reversibly) from the statusline. Everything —
-viewing, switching views, and all configuration — is driven by arrow keys + Enter.
+Token counts and activity history come from local provider transcripts. Current
+subscription limits are fetched directly from Claude and Codex and cached in normalized,
+credential-free form.
 """
 
-__version__ = "2.2.2"
+__version__ = "2.3.0"

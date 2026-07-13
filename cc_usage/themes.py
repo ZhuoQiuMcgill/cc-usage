@@ -1,7 +1,7 @@
 """A few Rich style palettes (T0 §7). Each maps semantic roles to style strings.
 
-`bar_style(theme, pct)` picks the gauge colour by usage threshold (mirrors the
-statusline's <50 / <80 / >=80 banding).
+`bar_style(theme, pct)` picks the gauge colour by the shared <50 / <80 / >=80
+usage thresholds.
 """
 
 from __future__ import annotations

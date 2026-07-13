@@ -1,9 +1,7 @@
-"""Read the captured 5h/7d limits (T0 §4B) from ~/.config/cc-usage/ratelimits.json.
+"""Normalize and render provider usage-limit buckets.
 
-The file is written by the reversible statusline wrapper (statusline.py). We render
-*whatever* buckets appear (Guardrail 3 — don't hardcode two) and never assert weekly
-semantics (Guardrail 2). If the file is missing or has no usable buckets, callers show
-the n/a line (Guardrail 4 / T0 §10.6) — this module never raises.
+Current versions receive normalized captures from direct Claude and Codex fetchers.
+The legacy JSON loader remains for compatibility. This module never raises.
 """
 
 from __future__ import annotations
@@ -31,6 +29,21 @@ class Bucket:
 def label_for(key: str) -> str:
     return _LABELS.get(key) or key.replace("_", " ").upper()
 
+def label_for_minutes(minutes: object, fallback: str) -> str:
+    """Human label for Codex's duration-based primary/secondary buckets."""
+    if not isinstance(minutes, (int, float)) or minutes <= 0:
+        return label_for(fallback)
+    value = int(minutes)
+    if value % 10_080 == 0:
+        weeks = value // 10_080
+        return "WEEKLY" if weeks == 1 else f"{weeks}-WEEK"
+    if value % 1_440 == 0:
+        return f"{value // 1_440}-DAY"
+    if value % 60 == 0:
+        return f"{value // 60}-HOUR"
+    return f"{value}-MIN"
+
+
 
 def load_ratelimits(path: Path = RATELIMITS_JSON) -> dict | None:
     """Parsed capture dict, or None if absent/unreadable. Never raises."""
@@ -41,7 +54,7 @@ def load_ratelimits(path: Path = RATELIMITS_JSON) -> dict | None:
     return data if isinstance(data, dict) else None
 
 
-def get_buckets(data: dict | None) -> list[Bucket]:
+def get_buckets(data: dict | None, provider: str | None = None) -> list[Bucket]:
     """Extract every well-formed bucket under .rate_limits, ordered deterministically."""
     if not isinstance(data, dict):
         return []
@@ -56,8 +69,13 @@ def get_buckets(data: dict | None) -> list[Bucket]:
         ra = val.get("resets_at")
         if not isinstance(up, (int, float)) or not isinstance(ra, (int, float)):
             continue
+        label = val.get("label")
+        if not isinstance(label, str) or not label:
+            label = label_for_minutes(val.get("window_minutes"), key)
+        if provider:
+            label = f"{provider.upper()} {label}"
         found.append(
-            Bucket(key=key, label=label_for(key), used_percentage=float(up), resets_at=float(ra))
+            Bucket(key=key, label=label, used_percentage=float(up), resets_at=float(ra))
         )
 
     def sort_key(b: Bucket) -> tuple[int, str]:
@@ -66,9 +84,6 @@ def get_buckets(data: dict | None) -> list[Bucket]:
     return sorted(found, key=sort_key)
 
 
-def captured_at(data: dict | None) -> float | None:
-    if isinstance(data, dict):
-        ts = data.get("captured_at")
-        if isinstance(ts, (int, float)):
-            return float(ts)
-    return None
+def provider_buckets(claude: dict | None, codex: dict | None) -> list[Bucket]:
+    """Return both providers' limits; never collapse one into the other."""
+    return get_buckets(claude, "Claude") + get_buckets(codex, "Codex")

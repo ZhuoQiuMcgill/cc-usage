@@ -133,7 +133,7 @@ def test_open_settings_and_change_window_by_arrows(tmp_config):
             assert isinstance(app.screen, SettingsScreen)
             metric_before = app.engine.hb_metric
 
-            # Settings list order: refresh, window, cost, theme, statusline.
+            # Settings list order: refresh, window, cost, theme.
             # Move down to "Default table window" (index 1) and activate it. The ↓ here
             # must navigate the list, NOT flip the (priority-bound) heartbeat metric.
             await pilot.press("down")  # highlight window row
@@ -188,86 +188,36 @@ def test_change_theme_and_cost_by_keyboard(tmp_config):
     asyncio.run(scenario())
 
 
-def test_settings_highlight_restored_after_pick_without_arrow(tmp_config, monkeypatch):
-    """After Enter-selecting in a picker, the Settings list must come back *focused*
-    AND visibly highlighted — with NO arrow press. A ListView only paints its cursor
-    while focused, so this proves the highlight is restored on screen resume.
-
-    Also covers the statusline ResultScreen pop path (a different push/pop than the
-    value pickers) to prove the resume-focus is uniform. That path is kept hermetic:
-    statusline status()/install() are stubbed so the real ~/.claude is never touched.
-    """
-    import cc_usage.settings_screen as ss
-
-    # Hermetic statusline: never read/write ~/.claude. status() drives the menu label
-    # and _refresh_list(); install() drives the ResultScreen text we then dismiss.
-    monkeypatch.setattr(ss, "status", lambda: {"installed": False})
-    monkeypatch.setattr(
-        ss, "install", lambda: {"ok": True, "action": "install", "msg": "stubbed"}
-    )
+def test_settings_highlight_restored_after_pick_without_arrow(tmp_config):
+    """A picker returns to a focused, visibly highlighted Settings row."""
 
     async def scenario():
         app = _app()
         async with app.run_test() as pilot:
             from textual.widgets import ListView
 
-            from cc_usage.settings_screen import (
-                ChoiceScreen,
-                ResultScreen,
-                SettingsScreen,
-            )
+            from cc_usage.settings_screen import ChoiceScreen, SettingsScreen
 
-            await pilot.press("s")  # open Settings
+            await pilot.press("s")
             await pilot.pause()
             assert isinstance(app.screen, SettingsScreen)
-
-            # Open the window picker (row 1) and Enter-select a value.
-            await pilot.press("down")  # highlight "window"
-            await pilot.press("enter")  # open the picker
+            await pilot.press("down")
+            await pilot.press("enter")
             await pilot.pause()
             assert isinstance(app.screen, ChoiceScreen)
-            await pilot.press("enter")  # confirm current value, pop back
+            await pilot.press("enter")
             await pilot.pause()
 
-            # Back on Settings — assert WITHOUT pressing any arrow key:
             assert isinstance(app.screen, SettingsScreen)
             lv = app.screen.query_one("#settings-list", ListView)
-            # 1) the list regained focus (cursor only paints while focused)
             assert lv.has_focus
             assert app.screen.focused is lv
-            # 2) a row is highlighted and that ListItem actually exists
             assert lv.index is not None
             assert lv.highlighted_child is not None
             assert lv.highlighted_child in list(lv.children)
-            # 3) THE BUG: the highlighted ListItem must actually carry the
-            #    `-highlight` class — that (with focus) is what paints the visible
-            #    cursor. Pre-fix the rebuild left it off, so the cursor was invisible
-            #    until an arrow press. No arrow was pressed above.
-            assert lv.highlighted_child.has_class("-highlight")
-
-            # ── statusline ResultScreen path (Install -> result -> pop) ──
-            # Jump to the statusline row (last) and open its menu.
-            await pilot.press("down")
-            await pilot.press("down")
-            await pilot.press("down")  # now on "statusline" (index 4)
-            await pilot.press("enter")  # statusline menu (a ChoiceScreen)
-            await pilot.pause()
-            assert isinstance(app.screen, ChoiceScreen)
-            await pilot.press("enter")  # choose "Install" (first row) -> ResultScreen
-            await pilot.pause()
-            assert isinstance(app.screen, ResultScreen)
-            await pilot.press("enter")  # dismiss ResultScreen, pop back to Settings
-            await pilot.pause()
-
-            assert isinstance(app.screen, SettingsScreen)
-            lv = app.screen.query_one("#settings-list", ListView)
-            assert lv.has_focus  # restored after ResultScreen too, no arrow press
-            assert lv.index is not None
-            assert lv.highlighted_child is not None
             assert lv.highlighted_child.has_class("-highlight")
 
     asyncio.run(scenario())
-
 
 def test_startup_scan_runs_in_background_and_fills_panel(tmp_config, tmp_path, monkeypatch):
     """A not-yet-scanned engine must NOT block on_mount: the first scan runs in a worker
@@ -309,10 +259,9 @@ def test_startup_scan_runs_in_background_and_fills_panel(tmp_config, tmp_path, m
     scan_ran = {}
     orig_scan = eng.scan
 
-    def _recording_scan():
+    def _recording_scan(*args, **kwargs):
         scan_ran["on_main_thread"] = threading.current_thread() is threading.main_thread()
-        orig_scan()
-
+        orig_scan(*args, **kwargs)
     monkeypatch.setattr(eng, "scan", _recording_scan)
     app = CCUsageApp(eng)
 
