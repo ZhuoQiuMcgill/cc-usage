@@ -31,6 +31,11 @@ CODEX_ACCOUNT = "codex"
 # The always-present default root's label (``~/.claude``).
 DEFAULT_LABEL = "personal"
 
+# Labels no Claude root may claim: the Codex account tag and the ``all`` scope
+# sentinel (a root literally labelled "all" could never be isolated — cycling to
+# it would read as the all-accounts scope). Colliding roots get a numeric suffix.
+_RESERVED_LABELS = frozenset({CODEX_ACCOUNT, "all"})
+
 
 @dataclass(frozen=True)
 class Root:
@@ -65,8 +70,8 @@ def _derive_label(path: Path) -> str:
 def _dedupe_label(label: str, used: set[str]) -> str:
     """Return ``label`` or a numeric-suffixed variant if it is already taken.
 
-    ``used`` is seeded with ``CODEX_ACCOUNT`` by the caller so no Claude root can
-    claim the reserved Codex tag.
+    ``used`` is seeded with ``_RESERVED_LABELS`` by the caller so no Claude root
+    can claim the Codex tag or the ``all`` scope sentinel.
     """
     if label not in used:
         used.add(label)
@@ -127,7 +132,7 @@ def discover_claude_roots(config, *, home: Path | None = None, environ=None) -> 
         candidates.append((Path(raw).expanduser(), "config", label_override, cfg_enabled))
 
     seen: set[str] = set()
-    used_labels: set[str] = {CODEX_ACCOUNT}
+    used_labels: set[str] = set(_RESERVED_LABELS)
     roots: list[Root] = []
     for path, source, label_override, cfg_enabled in candidates:
         try:

@@ -9,6 +9,7 @@ import io
 import json
 from pathlib import Path
 
+import pytest
 from rich.console import Console
 
 import cc_usage.engine as engine_module
@@ -24,9 +25,11 @@ from cc_usage.engine import Engine
 from cc_usage.limits_fetch import (
     LimitFetchError,
     fetch_account_limits,
+    load_limits_cache,
     normalize_claude_limits,
+    save_limits_cache,
 )
-from cc_usage.parser import Parser, UsageRecord
+from cc_usage.parser import Parser, ScanCancelled, UsageRecord
 from cc_usage.ratelimits import account_buckets
 from cc_usage.render import (
     RenderState,
@@ -136,6 +139,20 @@ def test_discovery_codex_label_is_reserved(tmp_path):
     assert roots[-1].label == "codex-2"
 
 
+def test_discovery_all_label_is_reserved(tmp_path):
+    """`all` is the scope sentinel: a root labelled "all" could never be isolated
+    (cycling to it would read as the all-accounts scope), so it must be suffixed."""
+    home = tmp_path / "home"
+    _mkroot(home, ".claude")
+    a = _mkroot(tmp_path / "x", ".claude-all")  # would derive "all"
+    b = _mkroot(tmp_path / "y", "work")
+    cfg = Config(claude_roots=[{"path": str(a)}, {"path": str(b), "label": "all"}])
+    roots = discover_claude_roots(cfg, home=home, environ={})
+    labels = [r.label for r in roots]
+    assert "all" not in labels
+    assert labels == ["personal", "all-2", "all-3"]
+
+
 def test_discovery_enabled_false_and_disabled_roots(tmp_path):
     home = tmp_path / "home"
     _mkroot(home, ".claude")
@@ -215,6 +232,24 @@ def test_root_set_change_invalidates_cache_and_rescans(tmp_path):
     restored = Parser(PRICING, cache_path=cache, roots=both)
     restored.scan()
     assert {r.account for r in restored.records} == {"personal", "company"}
+
+
+def test_label_rename_only_invalidates_cache(tmp_path):
+    """Same paths, changed label: cached records carry the OLD label, so the roots
+    fingerprint must treat a rename as a changed root set and rebuild (labels are
+    part of _roots_fingerprint, not just the path set)."""
+    r1 = _mkroot(tmp_path, "personal")
+    (r1 / "projects" / "s.jsonl").write_text(_claude_line("a", "a", 100))
+    cache = tmp_path / "cache.pkl"
+
+    writer = Parser(PRICING, cache_path=cache, roots=[(r1 / "projects", "personal")])
+    writer.scan()
+    writer.save_cache()
+
+    renamed = Parser(PRICING, cache_path=cache, roots=[(r1 / "projects", "corp")])
+    renamed.scan()
+    assert renamed.stats.lines_read == 1  # full re-read, not served warm
+    assert {r.account for r in renamed.records} == {"corp"}  # new label applied
 
 
 # ── R3/R4 engine helpers ────────────────────────────────────────────────────────
@@ -317,44 +352,54 @@ def test_single_account_no_codex_is_zero_noise():
     assert by_account_block(s, THEME) is None
 
     # Full-panel byte pin against the fixture captured from the pre-T11 build_panel.
+    # The clock strings in the panel are local-time, so pin TZ=UTC for the render and
+    # restore it afterwards (never leak process-global TZ state into other tests).
     import os
     import time
 
+    old_tz = os.environ.get("TZ")
     os.environ["TZ"] = "UTC"
     time.tzset()
-    from cc_usage.aggregate import ModelAgg, WindowAgg, series
+    try:
+        from cc_usage.aggregate import ModelAgg, WindowAgg, series
 
-    now = 1_700_000_000.0
-    windows = {}
-    for key in ("1h", "5h", "24h", "7d", "all"):
-        w = WindowAgg(name=key, input_tokens=1200, output_tokens=300, cache_tokens=8500, cost=4.75)
-        w.models["claude-opus-4-8"] = ModelAgg(
-            model="claude-opus-4-8", input_tokens=1200, output_tokens=300, cache_tokens=8500, cost=4.75
-        )
-        windows[key] = w
-    recs = [
-        UsageRecord(
-            ts=now - 3600, model_raw="claude-opus-4-8", model_norm="claude-opus-4-8", known=True,
-            input_tokens=1200, output_tokens=300, cache_read=8500, cache_creation=0, cost=4.75,
-        )
-    ]
-    from cc_usage.ratelimits import Bucket
+        now = 1_700_000_000.0
+        windows = {}
+        for key in ("1h", "5h", "24h", "7d", "all"):
+            w = WindowAgg(name=key, input_tokens=1200, output_tokens=300, cache_tokens=8500, cost=4.75)
+            w.models["claude-opus-4-8"] = ModelAgg(
+                model="claude-opus-4-8", input_tokens=1200, output_tokens=300, cache_tokens=8500, cost=4.75
+            )
+            windows[key] = w
+        recs = [
+            UsageRecord(
+                ts=now - 3600, model_raw="claude-opus-4-8", model_norm="claude-opus-4-8", known=True,
+                input_tokens=1200, output_tokens=300, cache_read=8500, cache_creation=0, cost=4.75,
+            )
+        ]
+        from cc_usage.ratelimits import Bucket
 
-    state = RenderState(
-        windows=windows,
-        buckets=[
-            Bucket(key="five_hour", label="5-HOUR", used_percentage=33.0, resets_at=now + 7860),
-            Bucket(key="seven_day", label="WEEKLY", used_percentage=60.0, resets_at=now + 200000),
-        ],
-        now=now,
-        config=Config(default_window="all"),
-        interval=5,
-        rl_present=True,
-        heartbeat=series(recs, now, "24h", "cost"),
-    )
-    out = _plain(build_panel(state), width=100)
-    golden = (Path(__file__).parent / "fixtures" / "panel_single_account.txt").read_text("utf-8")
-    assert out == golden
+        state = RenderState(
+            windows=windows,
+            buckets=[
+                Bucket(key="five_hour", label="5-HOUR", used_percentage=33.0, resets_at=now + 7860),
+                Bucket(key="seven_day", label="WEEKLY", used_percentage=60.0, resets_at=now + 200000),
+            ],
+            now=now,
+            config=Config(default_window="all"),
+            interval=5,
+            rl_present=True,
+            heartbeat=series(recs, now, "24h", "cost"),
+        )
+        out = _plain(build_panel(state), width=100)
+        golden = (Path(__file__).parent / "fixtures" / "panel_single_account.txt").read_text("utf-8")
+        assert out == golden
+    finally:
+        if old_tz is None:
+            os.environ.pop("TZ", None)
+        else:
+            os.environ["TZ"] = old_tz
+        time.tzset()
 
 
 def test_aggregate_accounts_idle_account_gets_a_zero_row():
@@ -411,6 +456,44 @@ def test_fetch_account_limits_isolates_failures(monkeypatch):
     assert captures["claude:personal"] is good  # the healthy account refreshed
     assert captures["claude:rdqcc"] is last_good  # the failed account kept its last-good
     assert any("rdqcc" in w for w in warnings)
+
+
+def test_legacy_bare_claude_limits_cache_key_is_pruned(tmp_path):
+    """A pre-multi-account provider-limits.json holds a bare `claude` key that the
+    per-account renderer can't show. It must be dropped on load (so the panel never
+    claims usable-but-unrenderable data) and never re-saved as cruft."""
+    path = tmp_path / "provider-limits.json"
+    legacy = normalize_claude_limits(_CLAUDE_RESPONSE, now=1)
+    codex_capture = {
+        "captured_at": 2.0,
+        "source": "codex",
+        "rate_limits": {"codex_primary": {"used_percentage": 10.0, "resets_at": 999.0}},
+    }
+    path.write_text(
+        json.dumps({"providers": {"claude": legacy, "codex": codex_capture}}), "utf-8"
+    )
+
+    loaded = load_limits_cache(path)
+    assert set(loaded) == {"codex"}  # bare legacy key pruned, codex kept
+
+    save_limits_cache(loaded, path)  # a later save must not resurrect the cruft
+    assert set(json.loads(path.read_text("utf-8"))["providers"]) == {"codex"}
+
+    # Per-account keys round-trip untouched.
+    per_account = {"claude:personal": legacy}
+    save_limits_cache(per_account, path)
+    assert load_limits_cache(path) == per_account
+
+
+def test_rl_present_ignores_legacy_bare_claude_key():
+    """rl_present must reflect only renderable (account-keyed / codex) captures, so a
+    stray bare `claude` capture shows the honest 'check provider login' hint instead
+    of 'provider data has no usable windows'."""
+    eng = _engine_with([_rec("personal", cost=1.0, inp=10)], ["personal"])
+    eng.limit_captures = {"claude": normalize_claude_limits(_CLAUDE_RESPONSE, now=1)}
+    assert eng.snapshot(NOW).rl_present is False
+    eng.limit_captures = {"claude:personal": normalize_claude_limits(_CLAUDE_RESPONSE, now=1)}
+    assert eng.snapshot(NOW).rl_present is True
 
 
 def test_t10_expiry_applies_per_account():
@@ -474,3 +557,90 @@ def test_engine_reload_roots_rescans_on_toggle(tmp_path, monkeypatch):
 
     # No change -> reload_roots reports no change (no needless rescan).
     assert eng.reload_roots() is False
+
+
+def test_reload_roots_syncs_config_scope(monkeypatch):
+    """Disabling the account the scope points at resets the scope to `all` AND syncs
+    config.account_scope, so a later save_config can't persist a dead scope."""
+    both = [
+        Root("personal", Path("/x/.claude"), Path("/x/.claude/projects"), "auto"),
+        Root("rdqcc", Path("/x/.claude-rdqcc"), Path("/x/.claude-rdqcc/projects"), "config"),
+    ]
+    toggled = [
+        both[0],
+        Root("rdqcc", Path("/x/.claude-rdqcc"), Path("/x/.claude-rdqcc/projects"), "config", enabled=False),
+    ]
+    current = {"roots": both}
+    monkeypatch.setattr(engine_module, "discover_claude_roots", lambda cfg: current["roots"])
+
+    eng = Engine(Config(account_scope="rdqcc"), cache_path=None)
+    assert eng.account_scope == "rdqcc"  # valid while rdqcc is enabled
+
+    current["roots"] = toggled
+    assert eng.reload_roots() is True
+    assert eng.account_scope == "all"
+    assert eng.config.account_scope == "all"  # kept in step for the next save_config
+
+
+def test_mid_scan_root_toggle_discards_stale_scan_and_cache(tmp_path, monkeypatch):
+    """The toggle-during-scan race: reload_roots() swaps the parser while a scan of
+    the old parser is still running. The engine's generation guard must make that
+    stale scan discard itself (ScanCancelled) instead of marking the fresh empty
+    parser as scanned, save_cache must refuse to persist the empty swap-in, and the
+    relaunched scan of the new root set must produce a correct, warm-startable
+    cache. Deterministic: the 'mid-flight' toggle happens re-entrantly inside the
+    captured parser's scan call."""
+    import cc_usage.parser as parser_module
+
+    r1 = _mkroot(tmp_path, "personal")
+    r2 = _mkroot(tmp_path, "company")
+    (r1 / "projects" / "s.jsonl").write_text(_claude_line("a", "a", 100))
+    (r2 / "projects" / "s.jsonl").write_text(_claude_line("b", "b", 200))
+    both = [
+        Root("personal", r1, r1 / "projects", "auto"),
+        Root("company", r2, r2 / "projects", "config"),
+    ]
+    toggled = [
+        Root("personal", r1, r1 / "projects", "auto"),
+        Root("company", r2, r2 / "projects", "config", enabled=False),
+    ]
+    current = {"roots": both}
+    monkeypatch.setattr(engine_module, "discover_claude_roots", lambda cfg: current["roots"])
+    monkeypatch.setattr(parser_module, "PROJECTS_DIR", r1 / "projects")
+    monkeypatch.setattr(engine_module, "CODEX_SESSIONS_DIR", tmp_path / "no-codex")
+    monkeypatch.setattr(engine_module, "CODEX_ARCHIVED_SESSIONS_DIR", tmp_path / "no-codex2")
+    monkeypatch.setattr(engine_module, "LIMITS_CACHE_JSON", tmp_path / "limits.json")
+    cache = tmp_path / "cache.pkl"
+
+    eng = Engine(Config(), cache_path=cache)
+    stale_parser = eng.parser
+    orig_scan = stale_parser.scan
+
+    def scan_with_midflight_toggle(progress=None, cancelled=None):
+        result = orig_scan(progress=progress, cancelled=cancelled)
+        # The user toggles a root off while this "worker" scan is still in flight.
+        current["roots"] = toggled
+        assert eng.reload_roots() is True
+        return result
+
+    monkeypatch.setattr(stale_parser, "scan", scan_with_midflight_toggle)
+
+    with pytest.raises(ScanCancelled):
+        eng.scan()  # the stale scan detects the generation bump and discards itself
+    assert eng.is_scanned is False
+    assert len(stale_parser.records) == 2  # the stale parser did read both roots...
+    assert eng.parser.records == []  # ...but the live parser is the fresh swap-in
+
+    eng.save_cache()  # the stale worker's save after the swap must be a no-op
+    assert not cache.exists(), "an EMPTY cache was persisted after the root swap"
+
+    eng.scan()  # the relaunched scan reads exactly the new root set
+    assert {r.account for r in eng.parser.records} == {"personal"}
+    eng.save_cache()
+    assert cache.exists()
+
+    # A fresh engine (same toggled roots) warm-starts from the correct, non-empty cache.
+    eng2 = Engine(Config(), cache_path=cache)
+    eng2.scan()
+    assert eng2.parser.stats.lines_read == 0  # served warm, no re-read
+    assert {r.account for r in eng2.parser.records} == {"personal"}

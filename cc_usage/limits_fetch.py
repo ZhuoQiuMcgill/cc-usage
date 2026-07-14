@@ -331,14 +331,15 @@ def load_limits_cache(path: Path = LIMITS_CACHE_JSON) -> dict[str, dict]:
         return {}
     if not isinstance(providers, dict):
         return {}
-    # Accept the per-account keys (`claude:<label>`, T11) plus `codex` and the legacy
-    # bare `claude` from a pre-multi-account cache (harmlessly ignored at render until
-    # the next refresh overwrites it with per-account captures).
+    # Accept the per-account keys (`claude:<label>`, T11) plus `codex`. A bare legacy
+    # `claude` key from a pre-multi-account cache is pruned here — the per-account
+    # renderer can't show it, so keeping it would make the panel claim usable provider
+    # data it cannot render, and it would be re-persisted as cruft on every save.
     return {
         name: capture
         for name, capture in providers.items()
         if isinstance(capture, dict)
-        and (name == "codex" or name == "claude" or name.startswith("claude:"))
+        and (name == "codex" or name.startswith("claude:"))
     }
 
 

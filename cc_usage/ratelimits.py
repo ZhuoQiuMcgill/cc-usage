@@ -84,11 +84,6 @@ def get_buckets(data: dict | None, provider: str | None = None) -> list[Bucket]:
     return sorted(found, key=sort_key)
 
 
-def provider_buckets(claude: dict | None, codex: dict | None) -> list[Bucket]:
-    """Return both providers' limits; never collapse one into the other."""
-    return get_buckets(claude, "Claude") + get_buckets(codex, "Codex")
-
-
 def account_buckets(
     captures: dict[str, dict], claude_labels: list[str], *, multi: bool
 ) -> list[Bucket]:

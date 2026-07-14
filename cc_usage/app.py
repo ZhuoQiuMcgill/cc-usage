@@ -108,6 +108,9 @@ class CCUsageApp(App):
         self._scan_in_progress = False
         self._scan_show_progress = False
         self._progress_last_emit = 0.0
+        # Set when a root toggle lands while a scan is in flight: the old worker is
+        # cancelled and its completion callback relaunches the scan exactly once.
+        self._rescan_pending = False
 
     @property
     def config(self) -> Config:
@@ -218,8 +221,19 @@ class CCUsageApp(App):
         self.engine.refresh_limits()
         self.call_from_thread(self._on_initial_scan_done)
 
+    def _consume_pending_rescan(self) -> bool:
+        """Relaunch the queued root-toggle rescan once the previous worker is dead."""
+        if not self._rescan_pending:
+            return False
+        self._rescan_pending = False
+        self._render_scanning()
+        self._start_background_scan(show_progress=True)
+        return True
+
     def _on_scan_cancelled(self) -> None:
         self._scan_in_progress = False
+        if self._consume_pending_rescan():
+            return
         if self.engine.is_scanned:
             self.render_panel()
             self._start_timers()
@@ -228,6 +242,8 @@ class CCUsageApp(App):
 
     def _on_initial_scan_done(self) -> None:
         self._scan_in_progress = False
+        if self._consume_pending_rescan():
+            return
         self.render_panel()
         self._start_timers()
     def _start_timers(self) -> None:
@@ -245,6 +261,11 @@ class CCUsageApp(App):
 
     # ── data / render ────────────────────────────────────────────────────────
     def _refresh_data(self) -> None:
+        if self._scan_in_progress or not self.engine.is_scanned:
+            # A worker scan is in flight (or a root toggle just reset the data set):
+            # a second concurrent scan of the same parser is not safe. The worker's
+            # completion callback repaints and restarts the cadence.
+            return
         self.engine.scan()
         self.render_panel()
 
@@ -260,6 +281,11 @@ class CCUsageApp(App):
         # active top-of-stack, so a refresh tick while Settings is open doesn't fail.
         base = self.screen_stack[0] if self.screen_stack else None
         if base is None:
+            return
+        if not self.engine.is_scanned:
+            # A (re)scan owns the panel right now — the status line is showing its
+            # progress, and snapshot() would otherwise trigger a synchronous scan on
+            # the UI thread, racing the worker on the same parser.
             return
         try:
             state = self.engine.snapshot()
@@ -364,9 +390,20 @@ class CCUsageApp(App):
         anything else is just a live re-render + cadence reset."""
         if self.engine.reload_roots():
             self._render_scanning()
-            self._start_background_scan(show_progress=True)
+            self._request_rescan()
         else:
             self.apply_config()
+
+    def _request_rescan(self) -> None:
+        """Launch a fresh scan for a changed root set. If a scan is already in flight
+        it is scanning the swapped-out parser: cancel it and queue the relaunch — the
+        worker's completion callback starts the new scan exactly once (the engine's
+        generation guard makes the stale worker discard its result either way)."""
+        if self._scan_in_progress:
+            self._rescan_pending = True
+            self._scan_cancel.set()
+        else:
+            self._start_background_scan(show_progress=True)
 
     def action_date_range(self) -> None:
         # The date-range analysis screen (T7). Re-render the main panel on return so it
@@ -375,6 +412,7 @@ class CCUsageApp(App):
         self.push_screen(RangeScreen(self.engine), lambda _=None: self.render_panel())
 
     def action_quit(self) -> None:
+        self._rescan_pending = False  # never relaunch a scan during teardown
         self._scan_cancel.set()
         self.exit()
 

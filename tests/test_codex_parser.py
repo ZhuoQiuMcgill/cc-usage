@@ -4,7 +4,7 @@ import json
 import math
 
 from cc_usage.parser import Parser
-from cc_usage.ratelimits import get_buckets, provider_buckets
+from cc_usage.ratelimits import account_buckets, get_buckets
 
 
 def _line(obj):
@@ -177,7 +177,9 @@ def test_provider_limits_are_combined_not_selected():
             }
         }
     }
-    buckets = provider_buckets(claude, codex)
+    buckets = account_buckets(
+        {"claude:personal": claude, "codex": codex}, ["personal"], multi=False
+    )
     assert [bucket.label for bucket in buckets] == ["CLAUDE 5-HOUR", "CODEX WEEKLY"]
 
 def test_codex_limits_survive_warm_cache(tmp_path, monkeypatch):

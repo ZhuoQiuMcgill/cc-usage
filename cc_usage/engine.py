@@ -17,6 +17,7 @@ PROJECTS_DIR-driven behaviour and single-account output stays byte-identical.
 
 from __future__ import annotations
 
+import threading
 import time
 from pathlib import Path
 
@@ -39,7 +40,7 @@ from .limits_fetch import (
     load_limits_cache,
     save_limits_cache,
 )
-from .parser import CancelCheck, Parser, ProgressCallback, UsageRecord
+from .parser import CancelCheck, Parser, ProgressCallback, ScanCancelled, UsageRecord
 from .paths import (
     CODEX_ARCHIVED_SESSIONS_DIR,
     CODEX_SESSIONS_DIR,
@@ -64,6 +65,13 @@ class Engine:
         self.parser = Parser(pricing, cache_path=cache_path, roots=self._parser_roots())
         self._scanned = False
         self._persist = cache_path is not None
+        # Root-swap guard (T11). `reload_roots()` swaps in a fresh parser; a scan of the
+        # old parser may still be running on a worker thread. The generation counter
+        # lets that stale scan detect the swap and discard itself, and the lock makes
+        # the check-and-publish of scan results atomic against the swap, so a stale
+        # worker can never mark the fresh (empty) parser as scanned or persist it.
+        self._generation = 0
+        self._swap_lock = threading.Lock()
         self.limits_cache_path = LIMITS_CACHE_JSON if cache_path is not None else None
         self.limit_captures = (
             load_limits_cache(self.limits_cache_path)
@@ -147,18 +155,29 @@ class Engine:
     def reload_roots(self) -> bool:
         """Re-discover roots after a settings change; rebuild the parser and force a
         fresh scan when the enabled set changed. Returns True if it changed (so the
-        caller can kick off a rescan). The cache's root fingerprint invalidates any
-        stale state, so a disabled root's records drop after the rescan."""
+        caller can relaunch a scan). The swap bumps the scan generation, so any
+        in-flight scan of the old parser discards itself instead of publishing
+        stale/empty state, and the cache's root fingerprint invalidates old on-disk
+        state — a disabled root's records drop after the rescan. (Change detection
+        compares (label, enabled) pairs; a pure path change under an unchanged
+        label isn't reachable live — the settings screen only toggles `enabled`.)"""
         before = [(r.label, r.enabled) for r in self.roots]
         self.roots = discover_claude_roots(self.config)
         if [(r.label, r.enabled) for r in self.roots] == before:
             return False
-        self.parser = Parser(
-            self.parser.pricing, cache_path=self.parser.cache_path, roots=self._parser_roots()
-        )
-        self._scanned = False
-        self._codex_in_data = False
-        self.account_scope = self._valid_scope(self.account_scope)
+        with self._swap_lock:
+            self.parser = Parser(
+                self.parser.pricing,
+                cache_path=self.parser.cache_path,
+                roots=self._parser_roots(),
+            )
+            self._generation += 1
+            self._scanned = False
+            self._codex_in_data = False
+            self.account_scope = self._valid_scope(self.account_scope)
+            # Keep the persisted config in step with the (possibly reset) scope so a
+            # later save_config never writes back a scope that no longer exists.
+            self.config.account_scope = self.account_scope
         return True
 
     def _refresh_account_flags(self) -> None:
@@ -174,13 +193,24 @@ class Engine:
         progress: ProgressCallback | None = None,
         cancelled: CancelCheck | None = None,
     ) -> None:
-        """Read new transcript lines, optionally reporting progress/cancellation."""
+        """Read new transcript lines, optionally reporting progress/cancellation.
+
+        The parser and root generation are captured at entry: if `reload_roots()`
+        swaps the parser while this scan runs (a Settings root toggle mid-scan),
+        the stale result is discarded by raising ScanCancelled rather than marking
+        the fresh, empty parser as scanned — which would blank the panel and let
+        the worker persist an empty cache."""
         started = time.perf_counter()
-        self.parser.scan(progress=progress, cancelled=cancelled)
-        self.last_scan_seconds = time.perf_counter() - started
-        self.last_scan_at = time.time()
-        self._scanned = True
-        self._refresh_account_flags()
+        parser = self.parser
+        generation = self._generation
+        parser.scan(progress=progress, cancelled=cancelled)
+        with self._swap_lock:
+            if generation != self._generation:
+                raise ScanCancelled("account roots changed during the scan")
+            self.last_scan_seconds = time.perf_counter() - started
+            self.last_scan_at = time.time()
+            self._scanned = True
+            self._refresh_account_flags()
 
     def prime_cache(self) -> bool:
         """Expose cached aggregates immediately while reconciliation runs later."""
@@ -192,8 +222,16 @@ class Engine:
 
     def save_cache(self) -> None:
         """Persist the parser's state so the next launch starts warm (no-op if the
-        engine was built with cache_path=None, e.g. in tests)."""
-        self.parser.save_cache()
+        engine was built with cache_path=None, e.g. in tests).
+
+        Skipped when nothing is scanned: after a mid-scan root swap the current
+        parser is fresh and empty, and persisting it would poison the warm-start
+        cache with zero records under the new root fingerprint."""
+        with self._swap_lock:
+            if not self._scanned:
+                return
+            parser = self.parser
+        parser.save_cache()
 
     def ensure_scanned(self) -> None:
         if not self._scanned:
@@ -261,7 +299,13 @@ class Engine:
             now=now,
             config=self.config,
             interval=self.config.refresh_interval,
-            rl_present=any(v for v in self.limit_captures.values()),
+            # Only account-keyed Claude captures (`claude:<label>`) and `codex` are
+            # renderable by account_buckets; a stray legacy bare `claude` key must not
+            # make the panel claim usable provider data it cannot show.
+            rl_present=any(
+                capture and (name == "codex" or name.startswith("claude:"))
+                for name, capture in self.limit_captures.items()
+            ),
             unknown_models=set(self.parser.stats.unknown_models),
             warnings=[*self.warnings, *self.limit_warnings],
             heartbeat=hb,
