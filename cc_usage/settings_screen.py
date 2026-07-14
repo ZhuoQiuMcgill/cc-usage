@@ -17,6 +17,7 @@ from textual.containers import Center, Vertical, VerticalScroll
 from textual.screen import ModalScreen
 from textual.widgets import Button, Footer, Label, ListItem, ListView, Static
 
+from .accounts import discover_claude_roots
 from .config import (
     REFRESH_CHOICES,
     THEME_CHOICES,
@@ -96,6 +97,83 @@ class ChoiceScreen(ModalScreen):
         self.dismiss(None)
 
 
+class AccountsScreen(ModalScreen):
+    """Read-only list of discovered Claude account roots with an enable toggle (T11 R7).
+
+    Arrow keys move, Enter toggles the highlighted root's `enabled` flag (persisted to
+    `config.json`'s `disabled_roots`), Esc backs out. Adding a *new* root is a manual
+    `config.json` edit — surfaced in the hint. Toggling here changes what the next
+    rescan reads; the parent Settings screen's close handler triggers that rescan.
+    """
+
+    BINDINGS = [
+        Binding("escape", "dismiss_none", "Back", show=True),
+        Binding("q", "dismiss_none", "Back", show=False),
+    ]
+
+    def __init__(self, config: Config) -> None:
+        super().__init__()
+        self.config = config
+
+    def compose(self) -> ComposeResult:
+        with Center():
+            with Vertical(id="choice-box"):
+                yield Static("Accounts", id="choice-title")
+                yield ListView(id="accounts-list")
+                yield Static(
+                    "● enabled · ↑/↓ move · ↵ toggle · Esc back  (add a root: edit config.json)",
+                    id="choice-hint",
+                )
+
+    async def on_mount(self) -> None:
+        await self._refresh_list()
+
+    async def _refresh_list(self, keep_index: int | None = None) -> None:
+        lv = self.query_one("#accounts-list", ListView)
+        idx = lv.index if keep_index is None else keep_index
+        if idx is None:
+            idx = 0
+        await lv.clear()
+        rows = []
+        for root in discover_claude_roots(self.config):
+            mark = "●" if root.enabled else "○"
+            rows.append(
+                _ChoiceRow(
+                    str(root.path),
+                    f"{mark} {root.label:<12}  {root.source:<6}  {root.path}",
+                )
+            )
+        await lv.extend(rows)
+        lv.index = max(0, min(idx, len(lv) - 1))
+        self._focus_list()
+
+    def _focus_list(self) -> None:
+        lv = self.query_one("#accounts-list", ListView)
+        lv.focus()
+        if len(lv) == 0:
+            return
+        idx = 0 if lv.index is None else max(0, min(lv.index, len(lv) - 1))
+        lv.index = idx
+        child = lv.highlighted_child
+        if child is not None:
+            child.highlighted = True
+
+    @on(ListView.Selected, "#accounts-list")
+    def _toggle(self, event: ListView.Selected) -> None:
+        path = event.item.value  # type: ignore[attr-defined]
+        disabled = [p for p in self.config.disabled_roots if isinstance(p, str)]
+        if path in disabled:
+            disabled.remove(path)
+        else:
+            disabled.append(path)
+        self.config.disabled_roots = disabled
+        save_config(self.config)
+        keep = self.query_one("#accounts-list", ListView).index
+        self.run_worker(self._refresh_list(keep), exclusive=True)
+
+    def action_dismiss_none(self) -> None:
+        self.dismiss(None)
+
 
 class SettingsScreen(ModalScreen):
     """Top-level Settings list. Selecting a row opens the matching picker."""
@@ -105,9 +183,20 @@ class SettingsScreen(ModalScreen):
         Binding("q", "close", "Back", show=False),
     ]
 
-    def __init__(self, config: Config) -> None:
+    def __init__(self, config: Config, engine=None) -> None:
         super().__init__()
         self.config = config
+        # The engine (optional) exposes discovered roots so the Accounts row appears
+        # only for multi-root setups — single-account Settings is unchanged.
+        self.engine = engine
+
+    def _extra_rows(self) -> list[tuple[str, str, str]]:
+        """The Accounts management row, shown only when >1 root is discovered."""
+        if self.engine is None or len(getattr(self.engine, "roots", [])) <= 1:
+            return []
+        roots = discover_claude_roots(self.config)
+        enabled = sum(1 for r in roots if r.enabled)
+        return [("accounts", "Accounts", f"{enabled}/{len(roots)} enabled")]
 
     # ── layout ───────────────────────────────────────────────────────────────
     def compose(self) -> ComposeResult:
@@ -164,7 +253,7 @@ class SettingsScreen(ModalScreen):
         await lv.clear()
         rows = [
             _ChoiceRow(row_id, f"{left:<26}· {value}")
-            for row_id, left, value in _summary(self.config)
+            for row_id, left, value in [*_summary(self.config), *self._extra_rows()]
         ]
         await lv.extend(rows)
         lv.index = max(0, min(idx, len(lv) - 1))
@@ -217,6 +306,13 @@ class SettingsScreen(ModalScreen):
                 self.config.theme,
                 self._set_theme,
                 keep,
+            )
+        elif row_id == "accounts":
+            # Toggling a root persists to config inside AccountsScreen; on return just
+            # rebuild this list so the "N/M enabled" summary reflects the change. The
+            # rescan happens when the Settings screen itself closes (app handler).
+            self.app.push_screen(
+                AccountsScreen(self.config), lambda _=None: self._refresh_list_soon(keep)
             )
 
     def _pick(self, title, choices, current, setter, keep) -> None:

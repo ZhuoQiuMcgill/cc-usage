@@ -161,7 +161,7 @@ def test_expired_claude_token_is_refreshed_before_fetch(tmp_path, monkeypatch):
     monkeypatch.setattr(
         limits_fetch,
         "_refresh_claude_credentials",
-        lambda path, timeout: "fresh-token",
+        lambda path, timeout, config_dir=None: "fresh-token",
     )
 
     def opener(request, timeout):

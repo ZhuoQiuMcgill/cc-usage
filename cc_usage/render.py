@@ -24,7 +24,7 @@ from rich.rule import Rule
 from rich.table import Table
 from rich.text import Text
 
-from .aggregate import RangeAgg, Series, WindowAgg
+from .aggregate import AccountAgg, RangeAgg, Series, WindowAgg
 from .braille import chart_rows
 from .config import Config
 from .format import human_duration, human_money, human_tokens, pretty_model_name
@@ -62,6 +62,13 @@ class RenderState:
     warnings: list[str] = field(default_factory=list)
     heartbeat: Series | None = None  # T3 R2; None only for legacy/one-off paths
     compact: bool = False  # narrow-terminal layout selected by the Textual app
+    # Multi-account (T11). All default to the single-account "nothing extra" state so a
+    # single-root panel renders byte-identical to before: `accounts` empty (no by-account
+    # block) and `account_ui` False (no scope line, `a` key inert).
+    accounts: list[AccountAgg] = field(default_factory=list)
+    account_scope: str = "all"
+    account_names: list[str] = field(default_factory=list)
+    account_ui: bool = False
 
 
 def _make_bar(pct: float, theme: dict[str, str]) -> Text:
@@ -377,6 +384,72 @@ def model_block(state: RenderState, theme: dict[str, str]):
     return t
 
 
+# ── Multi-account (T11) ─────────────────────────────────────────────────────────
+# Both renderers return None when there's nothing account-specific to show, so a
+# single-account panel omits them entirely (byte-identical to pre-T11 output). The
+# by-account block collapses its Share column below the compact (narrow-terminal)
+# threshold the Textual app already uses (width < 76); the rollup itself stays — it's
+# only three columns wide and reads fine on a narrow terminal.
+
+
+def _pretty_account(agg: AccountAgg) -> str:
+    return "Codex" if agg.is_codex else agg.label
+
+
+def account_scope_line(state: RenderState, theme: dict[str, str]):
+    """One-line active-account-scope indicator (R3), or None when the account UI is
+    inert (a single Claude account with no Codex data)."""
+    if not state.account_ui:
+        return None
+    t = Text()
+    t.append("account: ", style=theme["label"])
+    scope = state.account_scope
+    t.append(
+        "all" if scope == "all" else scope,
+        style=theme["value"] if scope == "all" else theme["good"],
+    )
+    t.append("   ·   a cycles", style=theme["dim"])
+    if not state.compact and state.account_names:
+        t.append(f"  ({', '.join(state.account_names)})", style=theme["dim"])
+    return t
+
+
+def by_account_block(state: RenderState, theme: dict[str, str]):
+    """Per-account rollup for the model window (R4), or None when there's nothing to
+    show. Columns: Account · Tokens · Cost · Share-of-cost. Rows arrive sorted by cost
+    desc from the engine. The Share column collapses away on a compact terminal."""
+    rows = state.accounts
+    if not rows:
+        return None
+    show_cost = state.config.show_cost
+    include_share = show_cost and not state.compact
+    total_cost = sum(a.cost for a in rows)
+    win_key = state.config.default_window
+    t = Table(
+        box=None,
+        pad_edge=False,
+        expand=False,
+        title=f"By account · {_WINDOW_LABEL.get(win_key, win_key)}",
+        title_justify="left",
+        title_style=theme["label"],
+    )
+    t.add_column("Account", style=theme["model"], no_wrap=True)
+    t.add_column("Tokens", justify="right", header_style=theme["header"], style=theme["value"])
+    if show_cost:
+        t.add_column("Cost", justify="right", header_style=theme["header"], style=theme["value"])
+    if include_share:
+        t.add_column("Share", justify="right", header_style=theme["header"], style=theme["value"])
+    for a in rows:
+        cells = [_pretty_account(a), human_tokens(a.total_tokens)]
+        if show_cost:
+            cells.append(_cost_label(a.cost, a.unpriced_tokens))
+        if include_share:
+            share = (a.cost / total_cost * 100.0) if total_cost > 0 else 0.0
+            cells.append(f"{share:.0f}%")
+        t.add_row(*cells)
+    return t
+
+
 def footnotes(state: RenderState, theme: dict[str, str]) -> list[Text]:
     out: list[Text] = []
     if state.config.show_cost:
@@ -410,15 +483,26 @@ def build_panel(state: RenderState) -> Panel:
     theme = get_theme(state.config.theme)
     clock = time.strftime("%H:%M:%S", time.localtime(state.now))
 
-    parts: list = [
-        limits_block(state, theme),
-        Rule(style=theme["dim"]),
-        spend_block(state, theme),
-        Rule(style=theme["dim"]),
-        heartbeat_renderable(state, theme),
-        Rule(style=theme["dim"]),
-        model_block(state, theme),
-    ]
+    parts: list = []
+    scope = account_scope_line(state, theme)
+    if scope is not None:
+        parts.append(scope)
+        parts.append(Rule(style=theme["dim"]))
+    parts.extend(
+        [
+            limits_block(state, theme),
+            Rule(style=theme["dim"]),
+            spend_block(state, theme),
+            Rule(style=theme["dim"]),
+            heartbeat_renderable(state, theme),
+            Rule(style=theme["dim"]),
+            model_block(state, theme),
+        ]
+    )
+    accounts = by_account_block(state, theme)
+    if accounts is not None:
+        parts.append(Rule(style=theme["dim"]))
+        parts.append(accounts)
     notes = footnotes(state, theme)
     if notes:
         parts.append(Text(""))

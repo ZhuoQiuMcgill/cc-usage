@@ -278,6 +278,110 @@ def test_startup_scan_runs_in_background_and_fills_panel(tmp_config, tmp_path, m
     asyncio.run(scenario())
 
 
+def _multi_account_app() -> CCUsageApp:
+    """An app whose engine reports two enabled Claude accounts + tagged records, so the
+    account scope UI (the `a` key + scope line) and the by-account block are active."""
+    from pathlib import Path
+
+    from cc_usage.accounts import Root
+
+    eng = Engine(Config(), cache_path=None)
+    eng.roots = [
+        Root("personal", Path("/x/.claude"), Path("/x/.claude/projects"), "auto"),
+        Root("rdqcc", Path("/x/.claude-rdqcc"), Path("/x/.claude-rdqcc/projects"), "config"),
+    ]
+    now = time.time()
+
+    def rec(account: str, inp: int, cost: float):
+        return UsageRecord(
+            ts=now - 100, model_raw="claude-opus-4-8", model_norm="claude-opus-4-8", known=True,
+            input_tokens=inp, output_tokens=0, cache_read=0, cache_creation=0, cost=cost, account=account,
+        )
+
+    eng.parser.records = [rec("personal", 100, 2.0), rec("rdqcc", 300, 6.0)]
+    eng._scanned = True
+    eng._refresh_account_flags()
+    return CCUsageApp(eng)
+
+
+def test_account_scope_cycles_with_a_key(tmp_config):
+    """`a` cycles all -> personal -> rdqcc -> all for a multi-account engine, and the
+    scope line reflects it; a single-account app treats `a` as a no-op."""
+
+    async def scenario():
+        app = _multi_account_app()
+        async with app.run_test() as pilot:
+            from textual.widgets import Static
+
+            assert app.engine.account_scope == "all"
+            await pilot.press("a")
+            assert app.engine.account_scope == "personal"
+            scope_text = str(app.query_one("#scope", Static).renderable)
+            assert "account" in scope_text and "personal" in scope_text
+            await pilot.press("a")
+            assert app.engine.account_scope == "rdqcc"
+            await pilot.press("a")
+            assert app.engine.account_scope == "all"
+
+    asyncio.run(scenario())
+
+
+def test_account_scope_key_is_noop_for_single_account(tmp_config):
+    async def scenario():
+        app = _app()  # single default account, no codex -> account UI inert
+        async with app.run_test() as pilot:
+            from textual.widgets import Static
+
+            assert app.engine.account_scope == "all"
+            await pilot.press("a")
+            assert app.engine.account_scope == "all"  # no-op
+            assert str(app.query_one("#scope", Static).renderable) == ""  # no scope line
+
+    asyncio.run(scenario())
+
+
+def test_settings_accounts_row_and_toggle(tmp_config, monkeypatch):
+    """Multi-account Settings shows an Accounts row; opening it and pressing Enter on a
+    root toggles its enabled flag, persisted to config.disabled_roots (R7)."""
+    from pathlib import Path
+
+    import cc_usage.settings_screen as ss
+    from cc_usage.accounts import Root
+
+    fake_roots = [
+        Root("personal", Path("/x/.claude"), Path("/x/.claude/projects"), "auto"),
+        Root("rdqcc", Path("/x/.claude-rdqcc"), Path("/x/.claude-rdqcc/projects"), "config"),
+    ]
+    monkeypatch.setattr(ss, "discover_claude_roots", lambda cfg: fake_roots)
+
+    async def scenario():
+        app = _multi_account_app()
+        async with app.run_test() as pilot:
+            from textual.widgets import ListView
+
+            from cc_usage.settings_screen import AccountsScreen, SettingsScreen
+
+            await pilot.press("s")
+            await pilot.pause()
+            assert isinstance(app.screen, SettingsScreen)
+            values = [item.value for item in app.screen.query_one("#settings-list", ListView).children]
+            assert "accounts" in values  # the Accounts row is present
+
+            # Navigate to the Accounts row (last) and open it.
+            for _ in range(values.index("accounts")):
+                await pilot.press("down")
+            await pilot.press("enter")
+            await pilot.pause()
+            assert isinstance(app.screen, AccountsScreen)
+
+            # Enter on the highlighted (first) root toggles it off, persisted to config.
+            await pilot.press("enter")
+            await pilot.pause()
+            assert "/x/.claude" in app.config.disabled_roots
+
+    asyncio.run(scenario())
+
+
 def test_quit_is_clean(tmp_config):
     async def scenario():
         app = _app()

@@ -127,13 +127,20 @@ def _claude_token_expired(path: Path) -> bool:
     return isinstance(expires_at, (int, float)) and expires_at <= time.time() * 1000 + 30_000
 
 
-def _refresh_claude_credentials(path: Path, timeout: float) -> str:
+def _refresh_claude_credentials(
+    path: Path, timeout: float, config_dir: Path | None = None
+) -> str:
     executable = shutil.which("claude.exe" if os.name == "nt" else "claude")
     if executable is None and os.name == "nt":
         executable = shutil.which("claude")
     if executable is None:
         raise LimitFetchError("Claude credentials expired and the Claude executable was not found")
     before = _read_claude_access_token(path)
+    # For a non-default account (T11) point the official client at that config dir so
+    # it refreshes the right account's token; the default account inherits the env.
+    env = None
+    if config_dir is not None:
+        env = {**os.environ, "CLAUDE_CONFIG_DIR": str(config_dir)}
     try:
         subprocess.run(
             [executable, "--print", "--max-turns", "0", ""],
@@ -141,6 +148,7 @@ def _refresh_claude_credentials(path: Path, timeout: float) -> str:
             stderr=subprocess.DEVNULL,
             timeout=timeout,
             check=False,
+            env=env,
         )
     except (OSError, subprocess.SubprocessError) as exc:
         raise LimitFetchError(f"Claude credential refresh failed: {exc}") from exc
@@ -152,12 +160,13 @@ def _refresh_claude_credentials(path: Path, timeout: float) -> str:
 def fetch_claude_limits(
     credentials_path: Path = CLAUDE_CREDENTIALS,
     *,
+    config_dir: Path | None = None,
     timeout: float = 15,
     opener: Callable = urllib.request.urlopen,
 ) -> dict:
     path = Path(credentials_path)
     token = (
-        _refresh_claude_credentials(path, timeout)
+        _refresh_claude_credentials(path, timeout, config_dir)
         if _claude_token_expired(path)
         else _read_claude_access_token(path)
     )
@@ -181,7 +190,7 @@ def fetch_claude_limits(
         if exc.code != 401:
             raise LimitFetchError(f"Claude usage fetch failed: HTTP {exc.code}") from exc
         try:
-            data = request_usage(_refresh_claude_credentials(path, timeout))
+            data = request_usage(_refresh_claude_credentials(path, timeout, config_dir))
         except (OSError, ValueError, urllib.error.URLError) as retry_exc:
             raise LimitFetchError(f"Claude usage fetch failed: {retry_exc}") from retry_exc
     except (OSError, ValueError, urllib.error.URLError) as exc:
@@ -322,10 +331,14 @@ def load_limits_cache(path: Path = LIMITS_CACHE_JSON) -> dict[str, dict]:
         return {}
     if not isinstance(providers, dict):
         return {}
+    # Accept the per-account keys (`claude:<label>`, T11) plus `codex` and the legacy
+    # bare `claude` from a pre-multi-account cache (harmlessly ignored at render until
+    # the next refresh overwrites it with per-account captures).
     return {
         name: capture
         for name, capture in providers.items()
-        if name in {"claude", "codex"} and isinstance(capture, dict)
+        if isinstance(capture, dict)
+        and (name == "codex" or name == "claude" or name.startswith("claude:"))
     }
 
 
@@ -355,4 +368,35 @@ def fetch_provider_limits(
             captures[provider] = fetcher()
         except LimitFetchError as exc:
             warnings.append(str(exc))
+    return captures, warnings
+
+
+def fetch_account_limits(
+    roots, existing: dict[str, dict] | None = None
+) -> tuple[dict[str, dict], list[str]]:
+    """Fetch each enabled Claude account's + Codex limits (T11 R5).
+
+    `roots` are the enabled Claude `Root`s. Each account is fetched from its own
+    `<root>/.credentials.json` — the access token held only in memory, the default
+    account inheriting the env and any other pointed at its config dir for a
+    credential refresh. Accounts are isolated: one account's failure keeps its
+    last-good capture (carried in `existing`) and appends a warning without
+    blocking the others. Returns captures keyed `claude:<label>` per account plus
+    `codex`, and the collected warnings. Reuses the single-provider fetchers — no
+    forked fetch path.
+    """
+    captures = dict(existing or {})
+    warnings: list[str] = []
+    for root in roots:
+        try:
+            captures[f"claude:{root.label}"] = fetch_claude_limits(
+                root.path / ".credentials.json",
+                config_dir=None if getattr(root, "source", None) == "auto" else root.path,
+            )
+        except LimitFetchError as exc:
+            warnings.append(f"{root.label}: {exc}")
+    try:
+        captures["codex"] = fetch_codex_limits()
+    except LimitFetchError as exc:
+        warnings.append(str(exc))
     return captures, warnings

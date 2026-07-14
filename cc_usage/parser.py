@@ -29,6 +29,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 
+from .accounts import CODEX_ACCOUNT, DEFAULT_LABEL
 from .cost import compute_cost, get_rates, normalize_model
 from .paths import (
     CODEX_ARCHIVED_SESSIONS_DIR,
@@ -74,7 +75,9 @@ _READ_BUFFER_BYTES = 4 * 1024 * 1024
 # a per-record dedup key so streaming merges (T9) survive a warm start.
 # v4: Codex records seen before their first turn_context are retained as pending so a
 # later model marker can reconcile them across incremental scans and warm starts.
-_CACHE_VERSION = 4
+# v5: records carry their account label (T11 multi-account) and the cache pins the
+# active root set, so a changed root set rebuilds once instead of being mis-read.
+_CACHE_VERSION = 5
 
 
 @dataclass(slots=True)
@@ -94,6 +97,11 @@ class UsageRecord:
     # fallback). Not part of the public token/cost surface.
     _eph_5m: int | None = None
     _eph_1h: int | None = None
+    # Account label the record belongs to (T11). A Claude root's label for Claude
+    # records, `CODEX_ACCOUNT` for Codex. Defaults empty so records built without a
+    # root (unit tests) round-trip harmlessly; the engine's scope filter and the
+    # by-account rollup key on it. Kept last so positional cache tuples stay stable.
+    account: str = ""
 
     @property
     def cache_tokens(self) -> int:
@@ -165,32 +173,21 @@ def parse_timestamp(ts: object) -> float | None:
     return dt.timestamp()
 
 
-def iter_transcript_files(cancelled: CancelCheck | None = None) -> list[Path]:
-    """All Claude and Codex transcript files, sorted deterministically.
+def _legacy_default_roots() -> list[tuple[Path, str]]:
+    """The pre-multi-account single Claude root: ``PROJECTS_DIR`` (+ the Codex
+    active/archived dirs only when it is the canonical ``~/.claude/projects``).
 
-    Claude project trees are recursive because subagent/workflow usage lives below
-    the session root. Codex stores active rollouts by date and archived rollouts in
-    a flat sibling directory. All sources are read-only.
-
-    When tests or embedders monkeypatch PROJECTS_DIR, scan only that explicit tree;
-    this preserves the parser's long-standing hermetic override behavior.
+    Read at call time so tests/embedders that monkeypatch ``PROJECTS_DIR`` scan
+    only that explicit tree — and never pull in real Codex data — preserving the
+    parser's long-standing hermetic override behavior. The engine passes explicit
+    roots for genuine multi-account setups (see `Parser.__init__`).
     """
-    canonical_claude = Path.home() / ".claude" / "projects"
-    roots = [PROJECTS_DIR]
-    if PROJECTS_DIR == canonical_claude:
-        roots.extend([CODEX_SESSIONS_DIR, CODEX_ARCHIVED_SESSIONS_DIR])
-    files: set[Path] = set()
-    for root in roots:
-        if not root.is_dir():
-            continue
-        try:
-            for path in root.rglob("*.jsonl"):
-                if cancelled is not None and cancelled():
-                    raise ScanCancelled("transcript discovery cancelled")
-                files.add(path)
-        except OSError:
-            continue
-    return sorted(files)
+    roots: list[tuple[Path, str]] = [(PROJECTS_DIR, DEFAULT_LABEL)]
+    if PROJECTS_DIR == Path.home() / ".claude" / "projects":
+        roots.append((CODEX_SESSIONS_DIR, CODEX_ACCOUNT))
+        roots.append((CODEX_ARCHIVED_SESSIONS_DIR, CODEX_ACCOUNT))
+    return roots
+
 
 def _dedup_key(obj: dict, msg: dict) -> tuple[object, object] | None:
     """(requestId, message.id). None when message.id is absent (can't dedup -> count)."""
@@ -226,12 +223,24 @@ class Parser:
         self,
         pricing: dict[str, dict[str, float]],
         cache_path: Path | None = None,
+        roots: list[tuple[Path, str]] | None = None,
     ):
         self.pricing = pricing
         # When set, scan() loads persisted state before its first read and save_cache()
         # can write it back. Left None (the default) the parser is fully self-contained
         # and touches no cache — which is what the unit tests rely on.
         self.cache_path = cache_path
+        # Transcript roots to scan, each an (projects_dir, account_label) pair. The
+        # engine passes explicit roots for multi-account setups; roots=None keeps the
+        # legacy single-root behaviour driven by PROJECTS_DIR (hermetic under tests).
+        self._roots: list[tuple[Path, str]] = (
+            [(Path(p), str(label)) for p, label in roots]
+            if roots is not None
+            else _legacy_default_roots()
+        )
+        self._default_label = self._roots[0][1] if self._roots else DEFAULT_LABEL
+        # path str -> account label; rebuilt on every discovery pass.
+        self._account_by_path: dict[str, str] = {}
         self._cache_loaded = False
         self._cache_unvalidated = False
         self.records: list[UsageRecord] = []
@@ -487,7 +496,9 @@ class Parser:
             _eph_1h=0,
         )
 
-    def _ingest_line(self, raw: bytes, source: str = "") -> None:
+    def _ingest_line(
+        self, raw: bytes, source: str = "", account_label: str | None = None
+    ) -> None:
         is_claude = _MARK_USAGE in raw and _MARK_ASSISTANT in raw
         is_codex = _MARK_TOKEN_COUNT in raw or _MARK_TURN_CONTEXT in raw
         if not is_claude and not is_codex:
@@ -508,6 +519,12 @@ class Parser:
         self.stats.lines_read += 1
         rec = self._extract_codex(obj, source) if is_codex else self._extract(obj)
         if rec is not None:
+            # Codex records are always the Codex account regardless of where the file
+            # sits; Claude records take their root's label (looked up from the path
+            # when the caller didn't supply one, e.g. ingest_file / a bare _read_new).
+            if account_label is None:
+                account_label = self._account_by_path.get(source, self._default_label)
+            rec.account = CODEX_ACCOUNT if is_codex else account_label
             self.records.append(rec)
             if is_codex and source not in self._file_models:
                 self._codex_pending.setdefault(source, []).append(rec)
@@ -522,6 +539,7 @@ class Parser:
         cancelled: CancelCheck | None = None,
     ) -> None:
         sp = str(path)
+        account = self._account_by_path.get(sp, self._default_label)
         try:
             st = path.stat()
         except OSError:
@@ -554,7 +572,7 @@ class Parser:
                         break
                     line = raw_line[:-1]
                     if line.strip():
-                        self._ingest_line(line, sp)
+                        self._ingest_line(line, sp, account)
                     consumed += len(raw_line)
                     if on_bytes is not None:
                         on_bytes(len(raw_line))
@@ -570,6 +588,30 @@ class Parser:
         state.size = st.st_size
         state.mtime = st.st_mtime
 
+    def _discover_files(self, cancelled: CancelCheck | None = None) -> list[Path]:
+        """All transcript files across the configured roots, sorted, tagged by account.
+
+        Claude project trees are recursive (subagent/workflow usage lives below the
+        session root); Codex active + archived rollouts are flat siblings. All roots
+        are read-only. Rebuilds `self._account_by_path` so each file's records can be
+        tagged with its root's label; the first root to claim a path wins (roots are
+        already deduplicated by the engine, so this only guards pathological overlap).
+        """
+        tagged: dict[Path, str] = {}
+        for projects_dir, label in self._roots:
+            if not projects_dir.is_dir():
+                continue
+            try:
+                for path in projects_dir.rglob("*.jsonl"):
+                    if cancelled is not None and cancelled():
+                        raise ScanCancelled("transcript discovery cancelled")
+                    tagged.setdefault(path, label)
+            except OSError:
+                continue
+        ordered = sorted(tagged)
+        self._account_by_path = {str(p): tagged[p] for p in ordered}
+        return ordered
+
     def scan(
         self,
         progress: ProgressCallback | None = None,
@@ -578,7 +620,7 @@ class Parser:
         """Reconcile cached paths, then read new bytes with progress/cancellation."""
         if progress is not None:
             progress(ScanProgress(phase="discovering"))
-        files = iter_transcript_files(cancelled)
+        files = self._discover_files(cancelled)
         if cancelled is not None and cancelled():
             if progress is not None:
                 progress(ScanProgress(phase="cancelled", files_total=len(files)))
@@ -703,6 +745,17 @@ class Parser:
         blob = json.dumps(self.pricing, sort_keys=True, default=str).encode("utf-8")
         return hashlib.sha256(blob).hexdigest()
 
+    def _roots_fingerprint(self) -> str:
+        """Stable hash of the active root set (T11).
+
+        Cached records carry an account label tied to a specific set of roots, so a
+        changed root set (a root added, removed, enabled or disabled) must rebuild the
+        cache once rather than serve stale/mislabeled records. Order-independent."""
+        blob = json.dumps(
+            sorted([str(p), label] for p, label in self._roots), sort_keys=True
+        ).encode("utf-8")
+        return hashlib.sha256(blob).hexdigest()
+
     def _load_cache(self, current_paths: set[str] | None) -> bool:
         """Load a validated cache; optionally reconcile it with current paths."""
         try:
@@ -715,6 +768,8 @@ class Parser:
         if data.get("version") != _CACHE_VERSION:
             return False
         if data.get("pricing_fp") != self._pricing_fingerprint():
+            return False
+        if data.get("roots_fp") != self._roots_fingerprint():
             return False
         files = data.get("files")
         records = data.get("records")
@@ -785,6 +840,7 @@ class Parser:
         data = {
             "version": _CACHE_VERSION,
             "pricing_fp": self._pricing_fingerprint(),
+            "roots_fp": self._roots_fingerprint(),
             "files": {
                 p: (s.offset, s.size, s.mtime) for p, s in self._files.items()
             },
@@ -801,6 +857,7 @@ class Parser:
                     r.cost,
                     r._eph_5m,
                     r._eph_1h,
+                    r.account,
                 )
                 for r in self.records
             ],

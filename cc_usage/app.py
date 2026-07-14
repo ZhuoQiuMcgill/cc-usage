@@ -31,6 +31,8 @@ from .engine import Engine
 from .format import human_duration
 from .parser import ScanCancelled, ScanProgress
 from .render import (
+    account_scope_line,
+    by_account_block,
     footnotes,
     heartbeat_renderable,
     limits_block,
@@ -83,6 +85,10 @@ class CCUsageApp(App):
         Binding("s", "settings", "Settings", show=True),
         Binding("enter", "settings", "Settings", show=True),
         Binding("d", "date_range", "Date range", show=True),
+        # `a` cycles the account scope (T11). `a` is free — no other app/screen binds
+        # it. Hidden in the footer because it's a no-op for single-account users; the
+        # on-panel scope line advertises it when it's actually live.
+        Binding("a", "account_scope", "Account scope", show=False),
         Binding("left", "hb_prev", "HB ◄ window", show=True, priority=True),
         Binding("right", "hb_next", "HB ► window", show=True, priority=True),
         Binding("up", "hb_metric", "HB metric", show=True, priority=True),
@@ -110,6 +116,7 @@ class CCUsageApp(App):
     # ── layout ───────────────────────────────────────────────────────────────
     def compose(self) -> ComposeResult:
         with VerticalScroll(id="panel"):
+            yield Static(id="scope", classes="block")
             yield Static(id="limits", classes="block")
             yield Rule()
             yield Static(id="spend", classes="block")
@@ -117,6 +124,7 @@ class CCUsageApp(App):
             yield Static(id="hb", classes="block")
             yield Rule()
             yield Static(id="models", classes="block")
+            yield Static(id="accounts", classes="block")
             yield Static(id="notes", classes="block")
         yield Footer()
 
@@ -257,10 +265,16 @@ class CCUsageApp(App):
             state = self.engine.snapshot()
             state.compact = self.size.width < 76
             theme = get_theme(self.config.theme)
+            scope = account_scope_line(state, theme)
+            base.query_one("#scope", Static).update(scope if scope is not None else Text(""))
             base.query_one("#limits", Static).update(limits_block(state, theme))
             base.query_one("#spend", Static).update(spend_block(state, theme))
             base.query_one("#hb", Static).update(heartbeat_renderable(state, theme))
             base.query_one("#models", Static).update(model_block(state, theme))
+            accounts = by_account_block(state, theme)
+            base.query_one("#accounts", Static).update(
+                accounts if accounts is not None else Text("")
+            )
             notes = footnotes(state, theme)
             base.query_one("#notes", Static).update(Group(*notes) if notes else Text(""))
             if self._scan_in_progress:
@@ -293,6 +307,7 @@ class CCUsageApp(App):
             "hb_prev",
             "hb_next",
             "hb_metric",
+            "account_scope",
             "date_range",
             "settings",
             "refresh_now",
@@ -322,6 +337,11 @@ class CCUsageApp(App):
         self.engine.toggle_hb_metric()
         self.render_panel()
 
+    def action_account_scope(self) -> None:
+        # Cycle all -> each Claude account -> all (no-op for single-account users).
+        self.engine.cycle_account_scope()
+        self.render_panel()
+
     def action_refresh_now(self) -> None:
         if not self.engine.is_scanned:
             self._render_scanning()
@@ -336,7 +356,17 @@ class CCUsageApp(App):
                 self._update_scan_status("cancelling scan…")
     def action_settings(self) -> None:
         # Re-render on return so any changed config/theme shows immediately.
-        self.push_screen(SettingsScreen(self.config), lambda _=None: self.apply_config())
+        self.push_screen(SettingsScreen(self.config, self.engine), lambda _=None: self._on_settings_closed())
+
+    def _on_settings_closed(self) -> None:
+        """Apply Settings changes on return. A toggled account root changes the data
+        set, so rebuild the parser and rescan (with progress, off the UI thread);
+        anything else is just a live re-render + cadence reset."""
+        if self.engine.reload_roots():
+            self._render_scanning()
+            self._start_background_scan(show_progress=True)
+        else:
+            self.apply_config()
 
     def action_date_range(self) -> None:
         # The date-range analysis screen (T7). Re-render the main panel on return so it
