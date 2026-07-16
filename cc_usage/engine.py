@@ -201,8 +201,12 @@ class Engine:
         the fresh, empty parser as scanned — which would blank the panel and let
         the worker persist an empty cache."""
         started = time.perf_counter()
-        parser = self.parser
-        generation = self._generation
+        with self._swap_lock:
+            # Capture the pair atomically: read outside the lock, a swap landing
+            # between the two reads could pair the old parser with the new
+            # generation and slip past the staleness check below.
+            parser = self.parser
+            generation = self._generation
         parser.scan(progress=progress, cancelled=cancelled)
         with self._swap_lock:
             if generation != self._generation:

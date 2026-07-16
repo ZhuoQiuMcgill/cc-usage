@@ -571,6 +571,91 @@ def test_root_toggle_during_scan_relaunches_once_and_keeps_cache_sane(
     asyncio.run(scenario())
 
 
+def test_date_range_gated_during_inflight_scan(tmp_config, tmp_path, monkeypatch):
+    """`d` while a scan is in flight must NOT open RangeScreen: the screen computes
+    synchronously through engine.ensure_scanned(), which would run a second scan of
+    the same parser on the UI thread, racing the worker. The scanning status stays
+    up instead, and `d` works normally once the scan completes."""
+    import threading
+
+    import cc_usage.parser as parser_module
+    from cc_usage.parser import ScanCancelled
+
+    proj = tmp_path / "projects"
+    proj.mkdir()
+    (proj / "s.jsonl").write_text(
+        json.dumps(
+            {
+                "type": "assistant",
+                "requestId": "r1",
+                "timestamp": "2026-06-01T00:00:00.000Z",
+                "message": {
+                    "id": "m1",
+                    "model": "claude-opus-4-8",
+                    "usage": {"input_tokens": 100, "output_tokens": 10},
+                },
+            }
+        )
+        + "\n"
+    )
+    monkeypatch.setattr(parser_module, "PROJECTS_DIR", proj)
+    eng = Engine(Config(), cache_path=None)
+    monkeypatch.setattr(eng, "refresh_limits", lambda: None)
+
+    # Scan-entry counter + a gate holding the first (worker) scan open.
+    scan_entries = []
+    started = threading.Event()
+    release = threading.Event()
+    parser = eng.parser
+    orig_scan = parser.scan
+
+    def blocking_scan(progress=None, cancelled=None):
+        scan_entries.append(threading.current_thread().name)
+        started.set()
+        while not release.is_set():
+            if cancelled is not None and cancelled():
+                raise ScanCancelled("cancelled in test")
+            time.sleep(0.005)
+        return orig_scan(progress=progress, cancelled=cancelled)
+
+    monkeypatch.setattr(parser, "scan", blocking_scan)
+    app = CCUsageApp(eng)
+
+    async def scenario():
+        async with app.run_test() as pilot:
+            from textual.widgets import Static
+
+            from cc_usage.range_screen import RangeScreen
+
+            for _ in range(400):
+                if started.is_set():
+                    break
+                await pilot.pause()
+            assert started.is_set()  # the worker is inside the parser's scan
+            assert len(scan_entries) == 1
+
+            await pilot.press("d")  # gated: nothing pushed, no second scan
+            await pilot.pause()
+            assert not isinstance(app.screen, RangeScreen)
+            assert [type(s).__name__ for s in app.screen_stack] == ["Screen"]
+            assert len(scan_entries) == 1  # no synchronous scan raced the worker
+            status = str(app.query_one("#spend", Static).renderable)
+            assert "c cancel" in status  # the scanning status still owns the panel
+
+            release.set()
+            for _ in range(600):
+                await pilot.pause()
+                if eng.is_scanned and not app._scan_in_progress:
+                    break
+            assert eng.is_scanned is True
+
+            await pilot.press("d")  # after the scan, the screen opens normally
+            await pilot.pause()
+            assert isinstance(app.screen, RangeScreen)
+
+    asyncio.run(scenario())
+
+
 def test_quit_is_clean(tmp_config):
     async def scenario():
         app = _app()

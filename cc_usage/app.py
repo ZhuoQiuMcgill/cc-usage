@@ -409,6 +409,12 @@ class CCUsageApp(App):
         # The date-range analysis screen (T7). Re-render the main panel on return so it
         # reflects any data refresh that ticked while the screen was open. The heartbeat
         # arrows are already gated by check_action() while this (non-base) screen is on top.
+        if self._scan_in_progress or not self.engine.is_scanned:
+            # RangeScreen computes synchronously through engine.ensure_scanned():
+            # opened mid-(re)scan it would run a second scan of the same parser on
+            # the UI thread, racing the worker (same guard as _refresh_data /
+            # render_panel). The scanning/cancelled status line already says why.
+            return
         self.push_screen(RangeScreen(self.engine), lambda _=None: self.render_panel())
 
     def action_quit(self) -> None:
