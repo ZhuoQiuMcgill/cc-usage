@@ -31,6 +31,8 @@ from .engine import Engine
 from .format import human_duration
 from .parser import ScanCancelled, ScanProgress
 from .render import (
+    account_scope_line,
+    by_account_block,
     footnotes,
     heartbeat_renderable,
     limits_block,
@@ -83,6 +85,10 @@ class CCUsageApp(App):
         Binding("s", "settings", "Settings", show=True),
         Binding("enter", "settings", "Settings", show=True),
         Binding("d", "date_range", "Date range", show=True),
+        # `a` cycles the account scope (T11). `a` is free — no other app/screen binds
+        # it. Hidden in the footer because it's a no-op for single-account users; the
+        # on-panel scope line advertises it when it's actually live.
+        Binding("a", "account_scope", "Account scope", show=False),
         Binding("left", "hb_prev", "HB ◄ window", show=True, priority=True),
         Binding("right", "hb_next", "HB ► window", show=True, priority=True),
         Binding("up", "hb_metric", "HB metric", show=True, priority=True),
@@ -102,6 +108,9 @@ class CCUsageApp(App):
         self._scan_in_progress = False
         self._scan_show_progress = False
         self._progress_last_emit = 0.0
+        # Set when a root toggle lands while a scan is in flight: the old worker is
+        # cancelled and its completion callback relaunches the scan exactly once.
+        self._rescan_pending = False
 
     @property
     def config(self) -> Config:
@@ -110,6 +119,7 @@ class CCUsageApp(App):
     # ── layout ───────────────────────────────────────────────────────────────
     def compose(self) -> ComposeResult:
         with VerticalScroll(id="panel"):
+            yield Static(id="scope", classes="block")
             yield Static(id="limits", classes="block")
             yield Rule()
             yield Static(id="spend", classes="block")
@@ -117,6 +127,7 @@ class CCUsageApp(App):
             yield Static(id="hb", classes="block")
             yield Rule()
             yield Static(id="models", classes="block")
+            yield Static(id="accounts", classes="block")
             yield Static(id="notes", classes="block")
         yield Footer()
 
@@ -210,8 +221,19 @@ class CCUsageApp(App):
         self.engine.refresh_limits()
         self.call_from_thread(self._on_initial_scan_done)
 
+    def _consume_pending_rescan(self) -> bool:
+        """Relaunch the queued root-toggle rescan once the previous worker is dead."""
+        if not self._rescan_pending:
+            return False
+        self._rescan_pending = False
+        self._render_scanning()
+        self._start_background_scan(show_progress=True)
+        return True
+
     def _on_scan_cancelled(self) -> None:
         self._scan_in_progress = False
+        if self._consume_pending_rescan():
+            return
         if self.engine.is_scanned:
             self.render_panel()
             self._start_timers()
@@ -220,6 +242,8 @@ class CCUsageApp(App):
 
     def _on_initial_scan_done(self) -> None:
         self._scan_in_progress = False
+        if self._consume_pending_rescan():
+            return
         self.render_panel()
         self._start_timers()
     def _start_timers(self) -> None:
@@ -237,6 +261,11 @@ class CCUsageApp(App):
 
     # ── data / render ────────────────────────────────────────────────────────
     def _refresh_data(self) -> None:
+        if self._scan_in_progress or not self.engine.is_scanned:
+            # A worker scan is in flight (or a root toggle just reset the data set):
+            # a second concurrent scan of the same parser is not safe. The worker's
+            # completion callback repaints and restarts the cadence.
+            return
         self.engine.scan()
         self.render_panel()
 
@@ -253,14 +282,25 @@ class CCUsageApp(App):
         base = self.screen_stack[0] if self.screen_stack else None
         if base is None:
             return
+        if not self.engine.is_scanned:
+            # A (re)scan owns the panel right now — the status line is showing its
+            # progress, and snapshot() would otherwise trigger a synchronous scan on
+            # the UI thread, racing the worker on the same parser.
+            return
         try:
             state = self.engine.snapshot()
             state.compact = self.size.width < 76
             theme = get_theme(self.config.theme)
+            scope = account_scope_line(state, theme)
+            base.query_one("#scope", Static).update(scope if scope is not None else Text(""))
             base.query_one("#limits", Static).update(limits_block(state, theme))
             base.query_one("#spend", Static).update(spend_block(state, theme))
             base.query_one("#hb", Static).update(heartbeat_renderable(state, theme))
             base.query_one("#models", Static).update(model_block(state, theme))
+            accounts = by_account_block(state, theme)
+            base.query_one("#accounts", Static).update(
+                accounts if accounts is not None else Text("")
+            )
             notes = footnotes(state, theme)
             base.query_one("#notes", Static).update(Group(*notes) if notes else Text(""))
             if self._scan_in_progress:
@@ -293,6 +333,7 @@ class CCUsageApp(App):
             "hb_prev",
             "hb_next",
             "hb_metric",
+            "account_scope",
             "date_range",
             "settings",
             "refresh_now",
@@ -322,6 +363,11 @@ class CCUsageApp(App):
         self.engine.toggle_hb_metric()
         self.render_panel()
 
+    def action_account_scope(self) -> None:
+        # Cycle all -> each Claude account -> all (no-op for single-account users).
+        self.engine.cycle_account_scope()
+        self.render_panel()
+
     def action_refresh_now(self) -> None:
         if not self.engine.is_scanned:
             self._render_scanning()
@@ -336,15 +382,43 @@ class CCUsageApp(App):
                 self._update_scan_status("cancelling scan…")
     def action_settings(self) -> None:
         # Re-render on return so any changed config/theme shows immediately.
-        self.push_screen(SettingsScreen(self.config), lambda _=None: self.apply_config())
+        self.push_screen(SettingsScreen(self.config, self.engine), lambda _=None: self._on_settings_closed())
+
+    def _on_settings_closed(self) -> None:
+        """Apply Settings changes on return. A toggled account root changes the data
+        set, so rebuild the parser and rescan (with progress, off the UI thread);
+        anything else is just a live re-render + cadence reset."""
+        if self.engine.reload_roots():
+            self._render_scanning()
+            self._request_rescan()
+        else:
+            self.apply_config()
+
+    def _request_rescan(self) -> None:
+        """Launch a fresh scan for a changed root set. If a scan is already in flight
+        it is scanning the swapped-out parser: cancel it and queue the relaunch — the
+        worker's completion callback starts the new scan exactly once (the engine's
+        generation guard makes the stale worker discard its result either way)."""
+        if self._scan_in_progress:
+            self._rescan_pending = True
+            self._scan_cancel.set()
+        else:
+            self._start_background_scan(show_progress=True)
 
     def action_date_range(self) -> None:
         # The date-range analysis screen (T7). Re-render the main panel on return so it
         # reflects any data refresh that ticked while the screen was open. The heartbeat
         # arrows are already gated by check_action() while this (non-base) screen is on top.
+        if self._scan_in_progress or not self.engine.is_scanned:
+            # RangeScreen computes synchronously through engine.ensure_scanned():
+            # opened mid-(re)scan it would run a second scan of the same parser on
+            # the UI thread, racing the worker (same guard as _refresh_data /
+            # render_panel). The scanning/cancelled status line already says why.
+            return
         self.push_screen(RangeScreen(self.engine), lambda _=None: self.render_panel())
 
     def action_quit(self) -> None:
+        self._rescan_pending = False  # never relaunch a scan during teardown
         self._scan_cancel.set()
         self.exit()
 

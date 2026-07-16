@@ -278,6 +278,384 @@ def test_startup_scan_runs_in_background_and_fills_panel(tmp_config, tmp_path, m
     asyncio.run(scenario())
 
 
+def _multi_account_app() -> CCUsageApp:
+    """An app whose engine reports two enabled Claude accounts + tagged records, so the
+    account scope UI (the `a` key + scope line) and the by-account block are active."""
+    from pathlib import Path
+
+    from cc_usage.accounts import Root
+
+    eng = Engine(Config(), cache_path=None)
+    eng.roots = [
+        Root("personal", Path("/x/.claude"), Path("/x/.claude/projects"), "auto"),
+        Root("rdqcc", Path("/x/.claude-rdqcc"), Path("/x/.claude-rdqcc/projects"), "config"),
+    ]
+    now = time.time()
+
+    def rec(account: str, inp: int, cost: float):
+        return UsageRecord(
+            ts=now - 100, model_raw="claude-opus-4-8", model_norm="claude-opus-4-8", known=True,
+            input_tokens=inp, output_tokens=0, cache_read=0, cache_creation=0, cost=cost, account=account,
+        )
+
+    eng.parser.records = [rec("personal", 100, 2.0), rec("rdqcc", 300, 6.0)]
+    eng._scanned = True
+    eng._refresh_account_flags()
+    return CCUsageApp(eng)
+
+
+def test_account_scope_cycles_with_a_key(tmp_config):
+    """`a` cycles all -> personal -> rdqcc -> all for a multi-account engine, and the
+    scope line reflects it; a single-account app treats `a` as a no-op."""
+
+    async def scenario():
+        app = _multi_account_app()
+        async with app.run_test() as pilot:
+            from textual.widgets import Static
+
+            assert app.engine.account_scope == "all"
+            await pilot.press("a")
+            assert app.engine.account_scope == "personal"
+            scope_text = str(app.query_one("#scope", Static).renderable)
+            assert "account" in scope_text and "personal" in scope_text
+            await pilot.press("a")
+            assert app.engine.account_scope == "rdqcc"
+            await pilot.press("a")
+            assert app.engine.account_scope == "all"
+
+    asyncio.run(scenario())
+
+
+def test_account_scope_key_is_noop_for_single_account(tmp_config):
+    async def scenario():
+        app = _app()  # single default account, no codex -> account UI inert
+        async with app.run_test() as pilot:
+            from textual.widgets import Static
+
+            assert app.engine.account_scope == "all"
+            await pilot.press("a")
+            assert app.engine.account_scope == "all"  # no-op
+            assert str(app.query_one("#scope", Static).renderable) == ""  # no scope line
+
+    asyncio.run(scenario())
+
+
+def test_settings_accounts_row_and_toggle(tmp_config, monkeypatch):
+    """Multi-account Settings shows an Accounts row; opening it and pressing Enter on a
+    root toggles its enabled flag, persisted to config.disabled_roots (R7)."""
+    from pathlib import Path
+
+    import cc_usage.settings_screen as ss
+    from cc_usage.accounts import Root
+
+    fake_roots = [
+        Root("personal", Path("/x/.claude"), Path("/x/.claude/projects"), "auto"),
+        Root("rdqcc", Path("/x/.claude-rdqcc"), Path("/x/.claude-rdqcc/projects"), "config"),
+    ]
+    monkeypatch.setattr(ss, "discover_claude_roots", lambda cfg: fake_roots)
+
+    async def scenario():
+        app = _multi_account_app()
+        async with app.run_test() as pilot:
+            from textual.widgets import ListView
+
+            from cc_usage.settings_screen import AccountsScreen, SettingsScreen
+
+            await pilot.press("s")
+            await pilot.pause()
+            assert isinstance(app.screen, SettingsScreen)
+            values = [item.value for item in app.screen.query_one("#settings-list", ListView).children]
+            assert "accounts" in values  # the Accounts row is present
+
+            # Navigate to the Accounts row (last) and open it.
+            for _ in range(values.index("accounts")):
+                await pilot.press("down")
+            await pilot.press("enter")
+            await pilot.pause()
+            assert isinstance(app.screen, AccountsScreen)
+
+            # Enter on the highlighted (first) root toggles it off, persisted to config.
+            await pilot.press("enter")
+            await pilot.pause()
+            assert "/x/.claude" in app.config.disabled_roots
+
+    asyncio.run(scenario())
+
+
+def _two_real_roots(tmp_path):
+    """Two on-disk Claude roots with one record each; returns (r1, r2) config dirs."""
+    r1 = tmp_path / "personal-root"
+    r2 = tmp_path / "rdqcc-root"
+
+    def line(req: str, mid: str, inp: int) -> str:
+        return (
+            json.dumps(
+                {
+                    "type": "assistant",
+                    "requestId": req,
+                    "timestamp": "2026-06-01T00:00:00.000Z",
+                    "message": {
+                        "id": mid,
+                        "model": "claude-opus-4-8",
+                        "usage": {"input_tokens": inp, "output_tokens": 1},
+                    },
+                }
+            )
+            + "\n"
+        )
+
+    (r1 / "projects").mkdir(parents=True)
+    (r2 / "projects").mkdir(parents=True)
+    (r1 / "projects" / "s.jsonl").write_text(line("a", "a", 100))
+    (r2 / "projects" / "s.jsonl").write_text(line("b", "b", 200))
+    return r1, r2
+
+
+def _mock_two_root_discovery(tmp_path, monkeypatch):
+    """Point engine + settings discovery at two real tmp roots whose enabled state
+    follows config.disabled_roots (like the real discovery); keep everything else
+    (legacy PROJECTS_DIR fallback, Codex dirs) hermetic. Returns (r1, r2)."""
+    import cc_usage.engine as engine_module
+    import cc_usage.parser as parser_module
+    import cc_usage.settings_screen as ss
+    from cc_usage.accounts import Root
+
+    r1, r2 = _two_real_roots(tmp_path)
+
+    def fake_discover(cfg):
+        disabled = set(cfg.disabled_roots)
+        return [
+            Root("personal", r1, r1 / "projects", "auto", enabled=str(r1) not in disabled),
+            Root("rdqcc", r2, r2 / "projects", "config", enabled=str(r2) not in disabled),
+        ]
+
+    monkeypatch.setattr(engine_module, "discover_claude_roots", fake_discover)
+    monkeypatch.setattr(ss, "discover_claude_roots", fake_discover)
+    monkeypatch.setattr(parser_module, "PROJECTS_DIR", r1 / "projects")
+    monkeypatch.setattr(engine_module, "CODEX_SESSIONS_DIR", tmp_path / "no-codex")
+    monkeypatch.setattr(engine_module, "CODEX_ARCHIVED_SESSIONS_DIR", tmp_path / "no-codex2")
+    monkeypatch.setattr(engine_module, "LIMITS_CACHE_JSON", tmp_path / "limits.json")
+    return r1, r2
+
+
+def test_settings_close_after_root_toggle_rescans(tmp_config, tmp_path, monkeypatch):
+    """R7 wiring, end to end through the real keys: toggling a root in Settings →
+    Accounts and closing Settings must run _on_settings_closed → reload_roots → a
+    background rescan, after which the disabled root's records are gone."""
+    _r1, r2 = _mock_two_root_discovery(tmp_path, monkeypatch)
+    eng = Engine(Config(), cache_path=None)
+    monkeypatch.setattr(eng, "refresh_limits", lambda: None)
+    app = CCUsageApp(eng)
+
+    async def scenario():
+        async with app.run_test() as pilot:
+            from textual.widgets import ListView
+
+            from cc_usage.settings_screen import AccountsScreen, SettingsScreen
+
+            await app.workers.wait_for_complete()  # initial cold scan (both roots)
+            await pilot.pause()
+            assert {r.account for r in eng.parser.records} == {"personal", "rdqcc"}
+
+            await pilot.press("s")
+            await pilot.pause()
+            assert isinstance(app.screen, SettingsScreen)
+            values = [
+                item.value
+                for item in app.screen.query_one("#settings-list", ListView).children
+            ]
+            for _ in range(values.index("accounts")):
+                await pilot.press("down")
+            await pilot.press("enter")
+            await pilot.pause()
+            assert isinstance(app.screen, AccountsScreen)
+
+            await pilot.press("down")  # highlight rdqcc (row 1)
+            await pilot.press("enter")  # toggle it off (persisted to config)
+            await pilot.pause()
+            assert str(r2) in app.config.disabled_roots
+
+            await pilot.press("escape")  # Accounts -> Settings
+            await pilot.pause()
+            await pilot.press("escape")  # Settings closes -> _on_settings_closed
+            await pilot.pause()
+            for _ in range(600):  # let the rescan worker finish
+                await pilot.pause()
+                if eng.is_scanned and not app._scan_in_progress:
+                    break
+
+            assert eng.is_scanned is True
+            assert {r.account for r in eng.parser.records} == {"personal"}  # rdqcc gone
+
+    asyncio.run(scenario())
+
+
+def test_root_toggle_during_scan_relaunches_once_and_keeps_cache_sane(
+    tmp_config, tmp_path, monkeypatch
+):
+    """The toggle-during-scan race, at the app level: a root toggle landing while the
+    background scan is mid-flight must cancel the stale worker, relaunch exactly one
+    scan of the new root set, never persist an empty cache, and end with the panel
+    showing data (not a stuck status line)."""
+    import pickle
+    import threading
+
+    from cc_usage.parser import ScanCancelled
+
+    _r1, r2 = _mock_two_root_discovery(tmp_path, monkeypatch)
+    cache = tmp_path / "cache.pkl"
+    eng = Engine(Config(), cache_path=cache)
+    monkeypatch.setattr(eng, "refresh_limits", lambda: None)
+
+    scans_completed = []
+    orig_engine_scan = eng.scan
+
+    def counting_scan(*args, **kwargs):
+        orig_engine_scan(*args, **kwargs)
+        scans_completed.append(1)
+
+    monkeypatch.setattr(eng, "scan", counting_scan)
+
+    # Hold the FIRST parser scan open until released (the in-flight cold scan).
+    started = threading.Event()
+    release = threading.Event()
+    stale_parser = eng.parser
+    orig_parser_scan = stale_parser.scan
+
+    def blocking_scan(progress=None, cancelled=None):
+        started.set()
+        while not release.is_set():
+            if cancelled is not None and cancelled():
+                raise ScanCancelled("cancelled in test")
+            time.sleep(0.005)
+        return orig_parser_scan(progress=progress, cancelled=cancelled)
+
+    monkeypatch.setattr(stale_parser, "scan", blocking_scan)
+    app = CCUsageApp(eng)
+
+    async def scenario():
+        async with app.run_test() as pilot:
+            from rich.table import Table
+            from textual.widgets import Static
+
+            for _ in range(400):
+                if started.is_set():
+                    break
+                await pilot.pause()
+            assert started.is_set()  # the worker is inside the stale parser's scan
+
+            # The user toggles rdqcc off and closes Settings while the scan runs.
+            app.config.disabled_roots = [str(r2)]
+            app._on_settings_closed()
+            assert app._rescan_pending is True  # queued behind the in-flight worker
+            release.set()  # let the stale worker observe the cancellation
+
+            for _ in range(600):  # old worker dies -> relaunch -> rescan completes
+                await pilot.pause()
+                if eng.is_scanned and not app._scan_in_progress and not app._rescan_pending:
+                    break
+
+            assert eng.is_scanned is True
+            assert {r.account for r in eng.parser.records} == {"personal"}
+            assert len(scans_completed) == 1  # exactly one scan completed: the relaunch
+            # The panel ended non-empty: the spend widget holds a data table again,
+            # not a scanning/cancelled status line.
+            assert isinstance(app.query_one("#spend", Static).renderable, Table)
+            # No empty cache was persisted; the on-disk cache holds the new root's data.
+            assert cache.exists()
+            with open(cache, "rb") as fh:
+                data = pickle.load(fh)
+            assert data["records"], "an EMPTY record list was persisted"
+            assert data["files"], "an EMPTY file map was persisted"
+
+    asyncio.run(scenario())
+
+
+def test_date_range_gated_during_inflight_scan(tmp_config, tmp_path, monkeypatch):
+    """`d` while a scan is in flight must NOT open RangeScreen: the screen computes
+    synchronously through engine.ensure_scanned(), which would run a second scan of
+    the same parser on the UI thread, racing the worker. The scanning status stays
+    up instead, and `d` works normally once the scan completes."""
+    import threading
+
+    import cc_usage.parser as parser_module
+    from cc_usage.parser import ScanCancelled
+
+    proj = tmp_path / "projects"
+    proj.mkdir()
+    (proj / "s.jsonl").write_text(
+        json.dumps(
+            {
+                "type": "assistant",
+                "requestId": "r1",
+                "timestamp": "2026-06-01T00:00:00.000Z",
+                "message": {
+                    "id": "m1",
+                    "model": "claude-opus-4-8",
+                    "usage": {"input_tokens": 100, "output_tokens": 10},
+                },
+            }
+        )
+        + "\n"
+    )
+    monkeypatch.setattr(parser_module, "PROJECTS_DIR", proj)
+    eng = Engine(Config(), cache_path=None)
+    monkeypatch.setattr(eng, "refresh_limits", lambda: None)
+
+    # Scan-entry counter + a gate holding the first (worker) scan open.
+    scan_entries = []
+    started = threading.Event()
+    release = threading.Event()
+    parser = eng.parser
+    orig_scan = parser.scan
+
+    def blocking_scan(progress=None, cancelled=None):
+        scan_entries.append(threading.current_thread().name)
+        started.set()
+        while not release.is_set():
+            if cancelled is not None and cancelled():
+                raise ScanCancelled("cancelled in test")
+            time.sleep(0.005)
+        return orig_scan(progress=progress, cancelled=cancelled)
+
+    monkeypatch.setattr(parser, "scan", blocking_scan)
+    app = CCUsageApp(eng)
+
+    async def scenario():
+        async with app.run_test() as pilot:
+            from textual.widgets import Static
+
+            from cc_usage.range_screen import RangeScreen
+
+            for _ in range(400):
+                if started.is_set():
+                    break
+                await pilot.pause()
+            assert started.is_set()  # the worker is inside the parser's scan
+            assert len(scan_entries) == 1
+
+            await pilot.press("d")  # gated: nothing pushed, no second scan
+            await pilot.pause()
+            assert not isinstance(app.screen, RangeScreen)
+            assert [type(s).__name__ for s in app.screen_stack] == ["Screen"]
+            assert len(scan_entries) == 1  # no synchronous scan raced the worker
+            status = str(app.query_one("#spend", Static).renderable)
+            assert "c cancel" in status  # the scanning status still owns the panel
+
+            release.set()
+            for _ in range(600):
+                await pilot.pause()
+                if eng.is_scanned and not app._scan_in_progress:
+                    break
+            assert eng.is_scanned is True
+
+            await pilot.press("d")  # after the scan, the screen opens normally
+            await pilot.pause()
+            assert isinstance(app.screen, RangeScreen)
+
+    asyncio.run(scenario())
+
+
 def test_quit_is_clean(tmp_config):
     async def scenario():
         app = _app()

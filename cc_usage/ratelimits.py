@@ -84,6 +84,21 @@ def get_buckets(data: dict | None, provider: str | None = None) -> list[Bucket]:
     return sorted(found, key=sort_key)
 
 
-def provider_buckets(claude: dict | None, codex: dict | None) -> list[Bucket]:
-    """Return both providers' limits; never collapse one into the other."""
-    return get_buckets(claude, "Claude") + get_buckets(codex, "Codex")
+def account_buckets(
+    captures: dict[str, dict], claude_labels: list[str], *, multi: bool
+) -> list[Bucket]:
+    """Per-account limit buckets (T11 R5), Claude accounts first then Codex.
+
+    `captures` is keyed `claude:<label>` per account plus `codex`. With a single
+    Claude account the prefix stays `CLAUDE …`, byte-identical to before
+    multi-account; with several, each account's buckets are prefixed with the
+    account label (`PERSONAL 5-HOUR`, `RDQCC 5-HOUR`) so they never blur together.
+    Codex buckets always keep the `CODEX` prefix. One account's missing capture
+    simply contributes no rows — it never blocks the others.
+    """
+    out: list[Bucket] = []
+    for label in claude_labels:
+        prefix = label if multi else "Claude"
+        out += get_buckets(captures.get(f"claude:{label}"), prefix)
+    out += get_buckets(captures.get("codex"), "Codex")
+    return out

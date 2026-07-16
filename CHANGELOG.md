@@ -8,7 +8,29 @@ See [VERSIONING.md](VERSIONING.md) for the release policy.
 
 ## [Unreleased]
 
-_No unreleased changes yet._
+### Added
+
+- **Multiple Claude accounts.** ccusage now discovers more than one Claude transcript root
+  — always `~/.claude`, plus `$CLAUDE_CONFIG_DIR` and any roots declared under a new
+  `claude_roots` key in `config.json` — and treats each config-dir root as one account
+  (Claude transcripts carry no account identifier, so the root is the boundary). Roots are
+  deduplicated by resolved path, labelled (`~/.claude` → `personal`, others derived from the
+  directory name), and missing roots are skipped silently. Every usage record is tagged with
+  its account and the persistent parse cache round-trips the tag and pins the active root set.
+- **Account scope + by-account rollup.** Press `a` to cycle the panel scope `all` → each
+  account → `all`; the scope filters every view (rolling windows, heartbeat, by-model table,
+  and the date-range screen), and a specific account excludes Codex. In `all` scope a
+  **By account** block shows tokens, cost, and share-of-cost per account (plus a Codex row
+  when Codex usage is in-window). A plain single-`~/.claude` setup with no Codex data renders
+  byte-for-byte as before — no scope line, no block, `a` inert.
+- **Per-account subscription limits.** Each account's 5h/7d limits are fetched from its own
+  credentials and the bars are labelled per account (`PERSONAL 5-HOUR`, `RDQCC WEEKLY`).
+  One account's fetch failure keeps its last-good values without blocking the others, and the
+  reset-time expiry rule applies per account. Single-account limit rendering is unchanged.
+- **Settings → Accounts.** A keyboard-driven list of discovered roots (label, source, path)
+  with an enable/disable toggle per root, persisted to `config.json`; disabling a root
+  excludes its records after the next scan. Adding a new root remains a manual `config.json`
+  edit.
 
 ## [2.3.0] - 2026-07-13
 

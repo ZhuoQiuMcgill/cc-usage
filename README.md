@@ -201,6 +201,7 @@ key). No flag is required for anything.
 | **← / →** | Switch the **heartbeat window** — 5h / 24h / 7d (default 24h) |
 | **↑ / ↓** | Toggle the heartbeat **metric** — cost / tokens (`t` also works, as a shortcut) |
 | **s** or **Enter** | Open **Settings** (refresh interval, default table window, show-cost, theme) |
+| **a** | Cycle the **account scope** — all → each Claude account → all (only with more than one account; see [Multiple accounts](#multiple-accounts)) |
 | **↑ / ↓** | Move the selection inside Settings and its pickers; **Enter** confirms |
 | **Esc** | Back out of Settings / a picker |
 | **c** | Cancel a cold transcript scan; **r** resumes it from the last completed line |
@@ -254,6 +255,8 @@ Press **s** (or **Enter**) on the panel. Every value is chosen from a list — n
 - **Default table window** — all-time / 1h / 5h / 24h / **7d**
 - **Show cost column** — on / off
 - **Theme** — dark / light / high-contrast
+- **Accounts** — enable/disable discovered Claude account roots (shown only when you have
+  more than one; see [Multiple accounts](#multiple-accounts))
 
 Choices persist to `~/.config/cc-usage/config.json` and apply live.
 
@@ -278,6 +281,60 @@ and live fetching continue off the UI thread.
 There is no `ccstatusline`, `jq`, shell wrapper, or statusline configuration dependency.
 The hidden `ccusage --restore-statusline` command exists only to undo integrations
 installed by older ccusage versions.
+
+## Multiple accounts
+
+If you run more than one Claude account on a machine — a personal one under `~/.claude`
+and a company one under a separate config dir, for example — ccusage can show them side by
+side. Claude transcripts carry **no account identifier**, so the Claude **config-dir root**
+is the account boundary; each root is treated as one account.
+
+**How roots are discovered** (deduplicated by resolved path, all read-only):
+
+1. `~/.claude` — always (labelled `personal`).
+2. `$CLAUDE_CONFIG_DIR` — when set and different from `~/.claude`.
+3. `config.json` → `claude_roots` — a list of extra roots.
+
+The common setup is the isolated-config-dir alias:
+
+```bash
+alias claude-rdqcc='CLAUDE_CONFIG_DIR="$HOME/.claude-rdqcc" claude'
+```
+
+Run ccusage with that same `CLAUDE_CONFIG_DIR` exported and both accounts are discovered.
+To have ccusage *always* see the second account regardless of environment, declare it in
+`~/.config/cc-usage/config.json` instead (adding a root is a manual edit):
+
+```json
+{
+  "claude_roots": [
+    { "path": "~/.claude-rdqcc", "label": "rdqcc", "enabled": true }
+  ]
+}
+```
+
+`path` is `~`-expanded; `label` and `enabled` are optional. A missing root is skipped
+silently. **Labels** default to `personal` for `~/.claude` and, for any other root, the
+directory basename with a leading `.claude-` or `.` stripped (`~/.claude-rdqcc` → `rdqcc`);
+a `label` in config overrides, and colliding labels get a numeric suffix.
+
+**Once you have more than one account:**
+
+- **`a` cycles the account scope** — `all` → each account → `all`. The scope applies to
+  *every* view (rolling windows, the heartbeat, the by-model table, and the date-range
+  screen). A specific account excludes Codex; `all` includes everything. The active scope
+  is shown at the top of the panel.
+- **A By account block** appears under the model table in `all` scope: one row per account
+  (plus a `Codex` row when there's Codex usage in the window) with tokens, cost, and
+  share-of-cost.
+- **Subscription limits are fetched per account** from each root's own credentials and the
+  bars are labelled with the account (`PERSONAL 5-HOUR`, `RDQCC WEEKLY`). One account's
+  fetch failure keeps its last-good values without blocking the others.
+- **Settings → Accounts** lists every discovered root (label, source, path) and lets you
+  toggle each one on/off with **Enter**; the choice persists and the next scan reflects it.
+
+A plain single-`~/.claude` setup is unaffected: no scope line, no By account block, and `a`
+does nothing — the panel is byte-for-byte what it was before.
 
 ## Pricing (editable)
 

@@ -20,6 +20,7 @@ from __future__ import annotations
 import datetime
 from dataclasses import dataclass, field
 
+from .accounts import CODEX_ACCOUNT
 from .parser import UsageRecord
 
 # name -> window length in seconds (None = all-time). Order is display order.
@@ -116,6 +117,71 @@ def aggregate(records: list[UsageRecord], now: float) -> dict[str, WindowAgg]:
             if secs is None or age <= secs:
                 out[name]._add(r)
     return out
+
+
+# ── By-account rollup (T11 R4) ──────────────────────────────────────────────────
+_WINDOW_SECS = dict(WINDOWS)  # name -> seconds (None for all-time)
+
+
+@dataclass
+class AccountAgg:
+    """One account's tokens/cost within a rolling window (Claude label or Codex)."""
+
+    label: str
+    is_codex: bool = False
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cache_tokens: int = 0
+    cost: float = 0.0
+    unpriced_tokens: int = 0
+
+    @property
+    def total_tokens(self) -> int:
+        return self.input_tokens + self.output_tokens + self.cache_tokens
+
+    def _add(self, r: UsageRecord) -> None:
+        self.input_tokens += r.input_tokens
+        self.output_tokens += r.output_tokens
+        self.cache_tokens += r.cache_tokens
+        self.cost += r.cost
+        if not r.known:
+            self.unpriced_tokens += r.total_tokens
+
+
+def aggregate_accounts(
+    records: list[UsageRecord],
+    now: float,
+    window: str,
+    claude_labels: list[str],
+) -> list[AccountAgg]:
+    """Per-account rollup for one rolling `window` (T11 R4).
+
+    One row per Claude account in `claude_labels` — including accounts with no
+    in-window activity, so the block shows an idle account as a `0`/`$0.00` row —
+    plus a Codex row *only* when Codex records fall in the window. Rows are sorted
+    by cost desc then tokens desc. Records whose account is neither a listed Claude
+    label nor Codex (a disabled root, or the empty default) are ignored. `window`
+    is a WINDOWS name; anything unknown is treated as all-time.
+    """
+    secs = _WINDOW_SECS.get(window)
+    aggs = {label: AccountAgg(label=label) for label in claude_labels}
+    codex = AccountAgg(label=CODEX_ACCOUNT, is_codex=True)
+    codex_seen = False
+    for r in records:
+        if secs is not None and (now - r.ts) > secs:
+            continue
+        if r.account == CODEX_ACCOUNT:
+            codex._add(r)
+            codex_seen = True
+        else:
+            agg = aggs.get(r.account)
+            if agg is not None:
+                agg._add(r)
+    rows = list(aggs.values())
+    if codex_seen:
+        rows.append(codex)
+    rows.sort(key=lambda a: (a.cost, a.total_tokens), reverse=True)
+    return rows
 
 
 @dataclass

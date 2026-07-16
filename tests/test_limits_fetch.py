@@ -15,7 +15,7 @@ from cc_usage.limits_fetch import (
     normalize_codex_limits,
     save_limits_cache,
 )
-from cc_usage.ratelimits import provider_buckets
+from cc_usage.ratelimits import account_buckets
 
 
 CLAUDE_RESPONSE = {
@@ -70,7 +70,9 @@ CODEX_RESPONSE = {
 def test_normalize_both_providers_keeps_all_scoped_limits():
     claude = normalize_claude_limits(CLAUDE_RESPONSE, now=10)
     codex = normalize_codex_limits(CODEX_RESPONSE, now=20)
-    buckets = provider_buckets(claude, codex)
+    buckets = account_buckets(
+        {"claude:personal": claude, "codex": codex}, ["personal"], multi=False
+    )
 
     assert [bucket.label for bucket in buckets] == [
         "CLAUDE 5-HOUR",
@@ -118,7 +120,7 @@ def test_claude_fetch_uses_oauth_in_memory(tmp_path):
 def test_provider_cache_contains_results_not_credentials(tmp_path):
     path = tmp_path / "provider-limits.json"
     captures = {
-        "claude": normalize_claude_limits(CLAUDE_RESPONSE, now=10),
+        "claude:personal": normalize_claude_limits(CLAUDE_RESPONSE, now=10),
         "codex": normalize_codex_limits(CODEX_RESPONSE, now=20),
     }
     save_limits_cache(captures, path)
@@ -161,7 +163,7 @@ def test_expired_claude_token_is_refreshed_before_fetch(tmp_path, monkeypatch):
     monkeypatch.setattr(
         limits_fetch,
         "_refresh_claude_credentials",
-        lambda path, timeout: "fresh-token",
+        lambda path, timeout, config_dir=None: "fresh-token",
     )
 
     def opener(request, timeout):

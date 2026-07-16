@@ -7,7 +7,7 @@ falls back to the default (never a crash, Rulebook rule 4).
 from __future__ import annotations
 
 import json
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 
 from .paths import CONFIG_JSON, ensure_dirs
 
@@ -23,6 +23,25 @@ class Config:
     default_window: str = "all"
     show_cost: bool = True
     theme: str = "dark"
+    # T11 multi-account. `account_scope` is the last-selected panel scope ("all"
+    # or a Claude account label; validated against live accounts at runtime, not
+    # here). `claude_roots` are extra transcript roots the user declared by hand
+    # (list of {"path","label","enabled"} objects); `disabled_roots` are root
+    # paths toggled off in the settings screen.
+    account_scope: str = "all"
+    claude_roots: list = field(default_factory=list)
+    disabled_roots: list = field(default_factory=list)
+
+
+def _sanitize_claude_roots(value: object) -> list:
+    """Keep only well-formed {"path": str, ...} root objects (never crash)."""
+    if not isinstance(value, list):
+        return []
+    out: list = []
+    for entry in value:
+        if isinstance(entry, dict) and isinstance(entry.get("path"), str) and entry["path"]:
+            out.append(entry)
+    return out
 
 
 def _validate(cfg: Config) -> Config:
@@ -34,6 +53,12 @@ def _validate(cfg: Config) -> Config:
         cfg.show_cost = True
     if cfg.theme not in THEME_CHOICES:
         cfg.theme = "dark"
+    if not isinstance(cfg.account_scope, str) or not cfg.account_scope:
+        cfg.account_scope = "all"
+    cfg.claude_roots = _sanitize_claude_roots(cfg.claude_roots)
+    cfg.disabled_roots = [p for p in cfg.disabled_roots if isinstance(p, str)] if isinstance(
+        cfg.disabled_roots, list
+    ) else []
     return cfg
 
 
@@ -45,7 +70,15 @@ def load_config() -> Config:
     if not isinstance(raw, dict):
         return Config()
     cfg = Config()
-    for key in ("refresh_interval", "default_window", "show_cost", "theme"):
+    for key in (
+        "refresh_interval",
+        "default_window",
+        "show_cost",
+        "theme",
+        "account_scope",
+        "claude_roots",
+        "disabled_roots",
+    ):
         if key in raw:
             setattr(cfg, key, raw[key])
     return _validate(cfg)
