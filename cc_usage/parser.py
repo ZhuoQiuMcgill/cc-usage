@@ -722,7 +722,13 @@ class Parser:
         self._cache_unvalidated = False
 
     def _reconcile_cached_paths(self, current_paths: set[str]) -> bool:
-        """Accept Codex active→archive moves without invalidating the whole cache."""
+        """Accept Codex active→archive moves without invalidating the whole cache.
+
+        The active→archive match is by basename, which across two codex roots (T12)
+        could in principle be ambiguous — but rollout basenames embed a UUID, so a
+        clash between independent roots is practically impossible, and any ambiguity
+        (``len(candidates) != 1``) already bails to a full rebuild rather than a wrong
+        remap. Per-file state itself is always keyed by full path, never basename."""
         missing = [path for path in self._files if path not in current_paths]
         if not missing:
             return True

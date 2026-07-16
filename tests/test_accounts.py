@@ -1033,3 +1033,99 @@ def test_mid_scan_codex_root_toggle_discards_stale_scan_and_cache(tmp_path, monk
     assert {r.account for r in eng.parser.records} == {"codex"}
     eng.save_cache()
     assert cache.exists()
+
+
+# ── T12 follow-ups: CODEX_HOME divergence, codex rename, codex pricing ────────────
+def test_codex_home_missing_dir_does_not_divert_default_scan(tmp_path, monkeypatch):
+    """$CODEX_HOME is additive via discovery, so the single-default legacy scan path
+    (`CODEX_DIR`) must stay `~/.codex` even when `CODEX_HOME` is set to a MISSING dir —
+    otherwise Settings lists `~/.codex` while the panel scans the gone `$CODEX_HOME`,
+    and the default root's data disappears."""
+    import importlib
+
+    import cc_usage.paths as paths_module
+
+    home = tmp_path / "home"
+    default_sessions = home / ".codex" / "sessions"
+    default_sessions.mkdir(parents=True)
+    (default_sessions / "rollout-a.jsonl").write_text(_codex_lines(inp=100), "utf-8")
+    gone = tmp_path / "gone-codex-home"  # deliberately never created
+
+    monkeypatch.setenv("CODEX_HOME", str(gone))
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+    try:
+        importlib.reload(paths_module)
+        # CODEX_DIR ignores CODEX_HOME -> stays ~/.codex, not the missing env dir.
+        assert paths_module.CODEX_DIR == home / ".codex"
+        assert paths_module.CODEX_SESSIONS_DIR == default_sessions
+
+        # Discovery reports exactly that auto root (the missing env dir is skipped)...
+        roots = discover_codex_roots(Config(), home=home, environ={"CODEX_HOME": str(gone)})
+        assert [(r.label, r.source) for r in roots] == [("codex", "auto")]
+        assert roots[0].projects == paths_module.CODEX_SESSIONS_DIR  # listing == scanned dir
+
+        # ...and scanning that dir still finds the data (records not lost to /gone).
+        parser = Parser(
+            {"gpt-test": {"input": 2.0, "output": 8.0}},
+            roots=[(paths_module.CODEX_SESSIONS_DIR, "codex")],
+        )
+        parser.scan()
+        assert {r.account for r in parser.records} == {"codex"}
+        assert sum(r.input_tokens for r in parser.records) == 100
+    finally:
+        monkeypatch.undo()
+        importlib.reload(paths_module)  # restore real module-level paths for later tests
+
+
+def test_codex_label_rename_only_invalidates_cache(tmp_path):
+    """Same codex root path, changed label: cached records carry the OLD label, so the
+    roots fingerprint must treat the rename as a changed root set and rebuild (codex
+    labels are part of _roots_fingerprint, mirroring the Claude-side pin)."""
+    r1 = _mkcodex(tmp_path, ".codex")
+    (r1 / "sessions" / "rollout-a.jsonl").write_text(_codex_lines(inp=100), "utf-8")
+    cache = tmp_path / "cache.pkl"
+    pricing = {"gpt-test": {"input": 2.0, "output": 8.0}}
+
+    writer = Parser(pricing, cache_path=cache, roots=[(r1 / "sessions", "codex")])
+    writer.scan()
+    writer.save_cache()
+
+    renamed = Parser(pricing, cache_path=cache, roots=[(r1 / "sessions", "codex-win")])
+    renamed.scan()
+    assert renamed.stats.lines_read == 1  # full re-read, not served warm
+    assert {r.account for r in renamed.records} == {"codex-win"}  # new label applied
+
+
+def test_codex_non_default_root_record_is_priced_by_gpt_model_table(tmp_path):
+    """Pricing is model-keyed, not provider-keyed: a Codex record from a NON-default
+    (codex-win-style) root is priced by the bundled GPT rates just like any other, so a
+    future provider-aware pricing refactor can't silently zero it out."""
+    from cc_usage.cost import compute_cost, get_rates
+    from cc_usage.pricing import load_pricing
+
+    pricing, _ = load_pricing()
+    model = "gpt-5.5"  # a bundled GPT model id
+    assert get_rates(model, pricing) is not None
+
+    root = _mkcodex(tmp_path, ".codex-win")
+    (root / "sessions" / "rollout-a.jsonl").write_text(
+        _codex_lines(inp=1000, out=500, model=model), "utf-8"
+    )
+    parser = Parser(pricing, roots=[(root / "sessions", "codex-win")])
+    parser.scan()
+
+    assert len(parser.records) == 1
+    rec = parser.records[0]
+    assert rec.account == "codex-win" and rec.provider == CODEX_PROVIDER
+    assert rec.known is True
+    assert rec.cost > 0.0  # priced via the model table, not zeroed by provider
+    expected = compute_cost(
+        input_tokens=rec.input_tokens,
+        output_tokens=rec.output_tokens,
+        cache_read=rec.cache_read,
+        cache_creation_total=0,
+        ephemeral_5m=0,
+        ephemeral_1h=0,
+        rates=get_rates(model, pricing),
+    )
+    assert rec.cost == expected

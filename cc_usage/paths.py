@@ -17,8 +17,13 @@ SETTINGS_JSON = CLAUDE_DIR / "settings.json"
 STATUSLINE_SCRIPT = CLAUDE_DIR / "statusline-command.sh"
 CLAUDE_CREDENTIALS = CLAUDE_DIR / ".credentials.json"
 
-# Codex / ChatGPT app is always read-only.
-CODEX_DIR = Path(os.environ.get("CODEX_HOME") or (HOME / ".codex"))
+# Codex / ChatGPT app is always read-only. `$CODEX_HOME` is deliberately NOT read here:
+# since T12 it is an *additive* discovery root (see accounts.discover_codex_roots), so
+# this default dir — used by the single-default legacy scan path — must always be
+# ~/.codex. Baking the env in here would divert that scan to a directory discovery never
+# reports (e.g. a missing $CODEX_HOME), so the panel would scan /gone while Settings lists
+# ~/.codex.
+CODEX_DIR = HOME / ".codex"
 CODEX_SESSIONS_DIR = CODEX_DIR / "sessions"
 CODEX_ARCHIVED_SESSIONS_DIR = CODEX_DIR / "archived_sessions"
 
