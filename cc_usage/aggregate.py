@@ -20,7 +20,7 @@ from __future__ import annotations
 import datetime
 from dataclasses import dataclass, field
 
-from .accounts import CODEX_ACCOUNT
+from .accounts import CODEX_PROVIDER
 from .parser import UsageRecord
 
 # name -> window length in seconds (None = all-time). Order is display order.
@@ -153,33 +153,37 @@ def aggregate_accounts(
     now: float,
     window: str,
     claude_labels: list[str],
+    codex_labels: list[str] | None = None,
 ) -> list[AccountAgg]:
-    """Per-account rollup for one rolling `window` (T11 R4).
+    """Per-account rollup for one rolling `window` (T11 R4, generalised in T12).
 
     One row per Claude account in `claude_labels` — including accounts with no
     in-window activity, so the block shows an idle account as a `0`/`$0.00` row —
-    plus a Codex row *only* when Codex records fall in the window. Rows are sorted
-    by cost desc then tokens desc. Records whose account is neither a listed Claude
-    label nor Codex (a disabled root, or the empty default) are ignored. `window`
-    is a WINDOWS name; anything unknown is treated as all-time.
+    plus a row per Codex account in `codex_labels` that has records in the window.
+    Codex rows stay conditional on in-window data (a single idle `~/.codex` adds no
+    row, keeping the zero-noise single-account render byte-identical). Rows are
+    sorted by cost desc then tokens desc. Records whose account is not a listed
+    label (a disabled root, or the empty default) are ignored. `window` is a
+    WINDOWS name; anything unknown is treated as all-time.
     """
     secs = _WINDOW_SECS.get(window)
     aggs = {label: AccountAgg(label=label) for label in claude_labels}
-    codex = AccountAgg(label=CODEX_ACCOUNT, is_codex=True)
-    codex_seen = False
+    codex_aggs = {label: AccountAgg(label=label, is_codex=True) for label in (codex_labels or [])}
+    codex_seen: set[str] = set()
     for r in records:
         if secs is not None and (now - r.ts) > secs:
             continue
-        if r.account == CODEX_ACCOUNT:
-            codex._add(r)
-            codex_seen = True
+        if r.provider == CODEX_PROVIDER:
+            agg = codex_aggs.get(r.account)
+            if agg is not None:
+                agg._add(r)
+                codex_seen.add(r.account)
         else:
             agg = aggs.get(r.account)
             if agg is not None:
                 agg._add(r)
     rows = list(aggs.values())
-    if codex_seen:
-        rows.append(codex)
+    rows += [codex_aggs[label] for label in (codex_labels or []) if label in codex_seen]
     rows.sort(key=lambda a: (a.cost, a.total_tokens), reverse=True)
     return rows
 

@@ -8,11 +8,13 @@ the current `now` (cheap — ~11 ms on real data) plus the heartbeat series.
 Heartbeat window/metric live in the engine so the TUI can flip them from the keyboard
 and the next snapshot reflects the change immediately, without re-parsing transcripts.
 
-Multi-account (T11): the engine discovers Claude account roots, tags every view with the
-active account scope, rolls usage up per account, and fetches subscription limits per
-account. Discovery is honoured only when the user actually configured extra roots — a
-plain single `~/.claude` setup hands the parser no explicit roots, so it keeps its
-PROJECTS_DIR-driven behaviour and single-account output stays byte-identical.
+Multi-account (T11/T12): the engine discovers both Claude and Codex account roots, tags
+every view with the active account scope, and rolls usage up per account. Claude limits
+are fetched per account; Codex limits stay a single fetch (the usage/accounting model is
+what generalises, not the limits RPC). Discovery is honoured only when the user actually
+configured extra roots — a plain single `~/.claude` + `~/.codex` setup hands the parser no
+explicit roots, so it keeps its PROJECTS_DIR/CODEX_DIR-driven behaviour and single-account
+output stays byte-identical.
 """
 
 from __future__ import annotations
@@ -22,8 +24,9 @@ import time
 from pathlib import Path
 
 from .accounts import (
-    CODEX_ACCOUNT,
+    CODEX_PROVIDER,
     discover_claude_roots,
+    discover_codex_roots,
 )
 from .aggregate import (
     HEARTBEAT_METRICS,
@@ -42,8 +45,6 @@ from .limits_fetch import (
 )
 from .parser import CancelCheck, Parser, ProgressCallback, ScanCancelled, UsageRecord
 from .paths import (
-    CODEX_ARCHIVED_SESSIONS_DIR,
-    CODEX_SESSIONS_DIR,
     LIMITS_CACHE_JSON,
     PARSE_CACHE,
 )
@@ -57,9 +58,13 @@ class Engine:
         self.config = config
         pricing, warns = load_pricing()
         self.warnings: list[str] = list(warns)
-        # Discovered Claude account roots (T11) — drives scope, labels, the by-account
-        # rollup, per-account limits, and the settings root list.
+        # Discovered account roots — Claude (T11) and Codex (T12). Both drive scope,
+        # labels, the by-account rollup and the settings root list; Claude roots also
+        # drive per-account limits (Codex limits stay a single fetch, R4). Codex
+        # labels are reserved against the Claude labels so the two share one scope
+        # namespace.
         self.roots = discover_claude_roots(config)
+        self.codex_roots = discover_codex_roots(config, claude_roots=self.roots)
         # cache_path defaults to the real persistent cache for the app/CLI; tests pass
         # cache_path=None to stay fully in-memory and hermetic.
         self.parser = Parser(pricing, cache_path=cache_path, roots=self._parser_roots())
@@ -95,17 +100,23 @@ class Engine:
     def _parser_roots(self) -> list[tuple[Path, str]] | None:
         """Roots to hand the parser.
 
-        Returns None — keeping the parser's legacy PROJECTS_DIR-driven, hermetic
-        behaviour — when the only enabled root is the auto `~/.claude`. Otherwise
-        returns explicit Claude roots plus the Codex dirs so both providers are
-        scanned and each record is tagged with its account.
+        Returns None — keeping the parser's legacy PROJECTS_DIR/CODEX_DIR-driven,
+        hermetic behaviour (byte-identical to before) — when the machine is a plain
+        single default `~/.claude` *and* single default `~/.codex` with nothing
+        extra. Otherwise returns explicit roots: each enabled Claude root's projects
+        tree plus each enabled Codex root's active + archived session dirs, every
+        one tagged with its account label so records carry it.
         """
-        enabled = [r for r in self.roots if r.enabled]
-        if len(enabled) == 1 and enabled[0].source == "auto":
+        claude_enabled = [r for r in self.roots if r.enabled]
+        codex_enabled = [r for r in self.codex_roots if r.enabled]
+        single_default_claude = len(claude_enabled) == 1 and claude_enabled[0].source == "auto"
+        single_default_codex = len(codex_enabled) == 1 and codex_enabled[0].source == "auto"
+        if single_default_claude and single_default_codex:
             return None
-        roots: list[tuple[Path, str]] = [(r.projects, r.label) for r in enabled]
-        roots.append((CODEX_SESSIONS_DIR, CODEX_ACCOUNT))
-        roots.append((CODEX_ARCHIVED_SESSIONS_DIR, CODEX_ACCOUNT))
+        roots: list[tuple[Path, str]] = [(r.projects, r.label) for r in claude_enabled]
+        for r in codex_enabled:
+            roots.append((r.path / "sessions", r.label))
+            roots.append((r.path / "archived_sessions", r.label))
         return roots
 
     @property
@@ -114,17 +125,47 @@ class Engine:
         return [r.label for r in self.roots if r.enabled]
 
     @property
+    def codex_labels(self) -> list[str]:
+        """Enabled Codex account labels, in discovery order (T12)."""
+        return [r.label for r in self.codex_roots if r.enabled]
+
+    @property
     def multi_account(self) -> bool:
         return len(self.claude_labels) > 1
 
     @property
+    def multi_codex(self) -> bool:
+        return len(self.codex_labels) > 1
+
+    def _scope_accounts(self) -> list[str]:
+        """Isolatable account labels (the non-`all` scope options).
+
+        Claude accounts are always isolatable. Codex accounts join the cycle only
+        when there is more than one of them: a single `~/.codex` stays lumped into
+        `all` (as on the pre-T12 build), so a plain single-everything machine keeps
+        its exact `all -> personal -> all` cycle — the zero-noise guarantee — while
+        multiple codex roots each become their own scope."""
+        accounts = list(self.claude_labels)
+        if self.multi_codex:
+            accounts += self.codex_labels
+        return accounts
+
+    @property
     def account_ui_active(self) -> bool:
         """Whether the account scope UI (the `a` key + scope indicator) is meaningful:
-        more than one Claude account, or a single Claude account alongside Codex data."""
-        return self.multi_account or (bool(self.claude_labels) and self._codex_in_data)
+        more than one Claude account, more than one Codex account, or a single Claude
+        account alongside Codex data."""
+        return (
+            self.multi_account
+            or self.multi_codex
+            or (bool(self.claude_labels) and self._codex_in_data)
+        )
 
     def _valid_scope(self, scope: object) -> str:
-        if isinstance(scope, str) and (scope == "all" or scope in self.claude_labels):
+        """Coerce a scope to a currently-selectable one (`all` or an isolatable
+        account), so a persisted/stale scope can never strand the panel on an
+        account the `a` key no longer cycles through."""
+        if isinstance(scope, str) and (scope == "all" or scope in self._scope_accounts()):
             return scope
         return "all"
 
@@ -137,11 +178,12 @@ class Engine:
         return [r for r in self.parser.records if r.account == scope]
 
     def cycle_account_scope(self, step: int = 1) -> str:
-        """Cycle scope all -> each Claude account -> all. No-op (and unpersisted) when
-        the account UI isn't active (single Claude account, no Codex)."""
+        """Cycle scope all -> each isolatable account -> all (Claude accounts, plus
+        Codex accounts when there is more than one). No-op (and unpersisted) when the
+        account UI isn't active (single Claude account, no Codex)."""
         if not self.account_ui_active:
             return self.account_scope
-        options = ["all", *self.claude_labels]
+        options = ["all", *self._scope_accounts()]
         current = self._valid_scope(self.account_scope)
         self.account_scope = options[(options.index(current) + step) % len(options)]
         self.config.account_scope = self.account_scope
@@ -160,10 +202,14 @@ class Engine:
         stale/empty state, and the cache's root fingerprint invalidates old on-disk
         state — a disabled root's records drop after the rescan. (Change detection
         compares (label, enabled) pairs; a pure path change under an unchanged
-        label isn't reachable live — the settings screen only toggles `enabled`.)"""
-        before = [(r.label, r.enabled) for r in self.roots]
+        label isn't reachable live — the settings screen only toggles `enabled`.)
+
+        Covers both providers: a toggled Codex root re-discovers and rescans through
+        the same path (T12)."""
+        before = [(r.label, r.enabled) for r in (*self.roots, *self.codex_roots)]
         self.roots = discover_claude_roots(self.config)
-        if [(r.label, r.enabled) for r in self.roots] == before:
+        self.codex_roots = discover_codex_roots(self.config, claude_roots=self.roots)
+        if [(r.label, r.enabled) for r in (*self.roots, *self.codex_roots)] == before:
             return False
         with self._swap_lock:
             self.parser = Parser(
@@ -181,7 +227,7 @@ class Engine:
         return True
 
     def _refresh_account_flags(self) -> None:
-        self._codex_in_data = any(r.account == CODEX_ACCOUNT for r in self.parser.records)
+        self._codex_in_data = any(r.provider == CODEX_PROVIDER for r in self.parser.records)
 
     # ── data ───────────────────────────────────────────────────────────────
     @property
@@ -286,14 +332,15 @@ class Engine:
         records = self._scoped_records()
         windows = aggregate(records, now)
         labels = self.claude_labels
+        codex_labels = self.codex_labels
         buckets = account_buckets(self.limit_captures, labels, multi=self.multi_account)
         hb = series(records, now, self.hb_window, self.hb_metric)
         # By-account rollup (R4) only in "all" scope, and only when it adds information
-        # (>=2 rows: several Claude accounts, or Codex data alongside a Claude account).
+        # (>=2 rows: several accounts, or Codex data alongside a Claude account).
         accounts = []
         if self.account_scope == "all":
             rollup = aggregate_accounts(
-                self.parser.records, now, self.config.default_window, labels
+                self.parser.records, now, self.config.default_window, labels, codex_labels
             )
             if len(rollup) >= 2:
                 accounts = rollup
@@ -315,6 +362,8 @@ class Engine:
             heartbeat=hb,
             accounts=accounts,
             account_scope=self.account_scope,
-            account_names=labels,
+            # The scope-line "(…)" hint lists exactly the accounts `a` cycles through
+            # (Claude labels, plus Codex labels once there is more than one codex root).
+            account_names=self._scope_accounts(),
             account_ui=self.account_ui_active,
         )

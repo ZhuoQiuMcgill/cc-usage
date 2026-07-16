@@ -201,7 +201,7 @@ key). No flag is required for anything.
 | **← / →** | Switch the **heartbeat window** — 5h / 24h / 7d (default 24h) |
 | **↑ / ↓** | Toggle the heartbeat **metric** — cost / tokens (`t` also works, as a shortcut) |
 | **s** or **Enter** | Open **Settings** (refresh interval, default table window, show-cost, theme) |
-| **a** | Cycle the **account scope** — all → each Claude account → all (only with more than one account; see [Multiple accounts](#multiple-accounts)) |
+| **a** | Cycle the **account scope** — all → each account → all (only with more than one Claude or Codex account; see [Multiple accounts](#multiple-accounts)) |
 | **↑ / ↓** | Move the selection inside Settings and its pickers; **Enter** confirms |
 | **Esc** | Back out of Settings / a picker |
 | **c** | Cancel a cold transcript scan; **r** resumes it from the last completed line |
@@ -255,8 +255,8 @@ Press **s** (or **Enter**) on the panel. Every value is chosen from a list — n
 - **Default table window** — all-time / 1h / 5h / 24h / **7d**
 - **Show cost column** — on / off
 - **Theme** — dark / light / high-contrast
-- **Accounts** — enable/disable discovered Claude account roots (shown only when you have
-  more than one; see [Multiple accounts](#multiple-accounts))
+- **Accounts** — enable/disable discovered Claude and Codex account roots (shown only when
+  you have more than one root for either provider; see [Multiple accounts](#multiple-accounts))
 
 Choices persist to `~/.config/cc-usage/config.json` and apply live.
 
@@ -284,16 +284,27 @@ installed by older ccusage versions.
 
 ## Multiple accounts
 
-If you run more than one Claude account on a machine — a personal one under `~/.claude`
-and a company one under a separate config dir, for example — ccusage can show them side by
-side. Claude transcripts carry **no account identifier**, so the Claude **config-dir root**
-is the account boundary; each root is treated as one account.
+If you run more than one Claude or Codex account on a machine — a personal one under
+`~/.claude` and a company one under a separate config dir, or Codex on both WSL and the
+Windows side — ccusage can show them side by side. Neither Claude transcripts nor Codex
+rollouts carry an **account identifier**, so the provider **config-dir root** is the account
+boundary; each root is treated as one account. Provider stays a separate dimension: a Codex
+root is a Codex account (its limits and pricing are unchanged), it just gets its own label,
+scope, and rollup row like a Claude account.
 
-**How roots are discovered** (deduplicated by resolved path, all read-only):
+**How Claude roots are discovered** (deduplicated by resolved path, all read-only):
 
 1. `~/.claude` — always (labelled `personal`).
 2. `$CLAUDE_CONFIG_DIR` — when set and different from `~/.claude`.
 3. `config.json` → `claude_roots` — a list of extra roots.
+
+**Codex roots mirror this exactly**:
+
+1. `~/.codex` — always (labelled `codex`).
+2. `$CODEX_HOME` — when set and different from `~/.codex`. Note this now *adds* a root
+   (it used to replace `~/.codex`).
+3. `config.json` → `codex_roots` — a list of extra roots, same
+   `{ "path", "label", "enabled" }` shape as `claude_roots`.
 
 The common setup is the isolated-config-dir alias:
 
@@ -314,27 +325,48 @@ To have ccusage *always* see the second account regardless of environment, decla
 ```
 
 `path` is `~`-expanded; `label` and `enabled` are optional. A missing root is skipped
-silently. **Labels** default to `personal` for `~/.claude` and, for any other root, the
-directory basename with a leading `.claude-` or `.` stripped (`~/.claude-rdqcc` → `rdqcc`);
-a `label` in config overrides, and colliding labels get a numeric suffix.
+silently. **Labels** default to `personal` for `~/.claude` and `codex` for `~/.codex`; any
+other root derives from the directory basename with a leading `.claude-` / `.codex-` / `.`
+stripped (`~/.claude-rdqcc` → `rdqcc`, `~/.codex-work` → `work`). A `label` in config
+overrides, and Claude and Codex labels share one namespace, so colliding labels get a
+numeric suffix (a codex root can't shadow a Claude account, or vice versa).
 
-**Once you have more than one account:**
+**Codex on WSL:** if you run Codex on the Windows side but ccusage under WSL, point a
+`codex_roots` entry at the Windows directory so its usage shows up:
 
-- **`a` cycles the account scope** — `all` → each account → `all`. The scope applies to
-  *every* view (rolling windows, the heartbeat, the by-model table, and the date-range
-  screen). A specific account excludes Codex; `all` includes everything. The active scope
+```json
+{
+  "codex_roots": [
+    { "path": "/mnt/c/Users/<you>/.codex", "label": "codex-win" }
+  ]
+}
+```
+
+Windows-side roots under `/mnt/c` cross the WSL filesystem boundary, so the **first** scan
+of a large Codex history is slower than a native root; after that the warm cache reads only
+newly appended rollout bytes and the scan runs in the background without blocking the UI.
+
+**Once you have more than one account (Claude or Codex):**
+
+- **`a` cycles the account scope** — `all` → each isolatable account → `all`. The scope
+  applies to *every* view (rolling windows, the heartbeat, the by-model table, and the
+  date-range screen); selecting one account isolates it and excludes everything else.
+  Claude accounts are always in the cycle; Codex accounts join it once you have **more than
+  one** codex root (a single `~/.codex` stays lumped into `all`, as before). The active scope
   is shown at the top of the panel.
 - **A By account block** appears under the model table in `all` scope: one row per account
-  (plus a `Codex` row when there's Codex usage in the window) with tokens, cost, and
+  (Claude accounts plus a row per Codex account with in-window usage) with tokens, cost, and
   share-of-cost.
-- **Subscription limits are fetched per account** from each root's own credentials and the
-  bars are labelled with the account (`PERSONAL 5-HOUR`, `RDQCC WEEKLY`). One account's
-  fetch failure keeps its last-good values without blocking the others.
-- **Settings → Accounts** lists every discovered root (label, source, path) and lets you
-  toggle each one on/off with **Enter**; the choice persists and the next scan reflects it.
+- **Subscription limits are fetched per Claude account** from each root's own credentials and
+  the bars are labelled with the account (`PERSONAL 5-HOUR`, `RDQCC WEEKLY`); one account's
+  fetch failure keeps its last-good values without blocking the others. Codex limits stay a
+  single `CODEX` fetch (there is no per-root Codex limits RPC).
+- **Settings → Accounts** lists every discovered root (label, provider, source, path) and
+  lets you toggle each one on/off with **Enter**; the choice persists and the next scan
+  reflects it.
 
-A plain single-`~/.claude` setup is unaffected: no scope line, no By account block, and `a`
-does nothing — the panel is byte-for-byte what it was before.
+A plain single `~/.claude` + `~/.codex` setup is unaffected: no scope line, no By account
+block, and `a` does nothing — the panel is byte-for-byte what it was before.
 
 ## Pricing (editable)
 
