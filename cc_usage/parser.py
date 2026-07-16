@@ -29,7 +29,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 
-from .accounts import CODEX_ACCOUNT, DEFAULT_LABEL
+from .accounts import CLAUDE_PROVIDER, CODEX_ACCOUNT, CODEX_PROVIDER, DEFAULT_LABEL
 from .cost import compute_cost, get_rates, normalize_model
 from .paths import (
     CODEX_ARCHIVED_SESSIONS_DIR,
@@ -77,7 +77,10 @@ _READ_BUFFER_BYTES = 4 * 1024 * 1024
 # later model marker can reconcile them across incremental scans and warm starts.
 # v5: records carry their account label (T11 multi-account) and the cache pins the
 # active root set, so a changed root set rebuilds once instead of being mis-read.
-_CACHE_VERSION = 5
+# v6: records carry a provider (claude|codex) distinct from the account label, so
+# a second codex root can be its own account (T12) without the account string
+# doubling as the "is Codex" flag; an older v5 cache lacks the field and is dropped.
+_CACHE_VERSION = 6
 
 
 @dataclass(slots=True)
@@ -97,11 +100,16 @@ class UsageRecord:
     # fallback). Not part of the public token/cost surface.
     _eph_5m: int | None = None
     _eph_1h: int | None = None
-    # Account label the record belongs to (T11). A Claude root's label for Claude
-    # records, `CODEX_ACCOUNT` for Codex. Defaults empty so records built without a
-    # root (unit tests) round-trip harmlessly; the engine's scope filter and the
-    # by-account rollup key on it. Kept last so positional cache tuples stay stable.
+    # Account label the record belongs to (T11): its root's label, for either
+    # provider (a Claude root's label, or a codex root's — `codex`, `codex-win`, …).
+    # Defaults empty so records built without a root (unit tests) round-trip
+    # harmlessly; the engine's scope filter and the by-account rollup key on it.
     account: str = ""
+    # Provider the record came from (T12), independent of the account label so
+    # scope/rollup/limits can treat "is this Codex" as a first-class fact rather
+    # than inferring it from `account == "codex"` (which breaks with 2 codex roots).
+    # Kept last so positional cache tuples stay append-only across versions.
+    provider: str = CLAUDE_PROVIDER
 
     @property
     def cache_tokens(self) -> int:
@@ -519,12 +527,18 @@ class Parser:
         self.stats.lines_read += 1
         rec = self._extract_codex(obj, source) if is_codex else self._extract(obj)
         if rec is not None:
-            # Codex records are always the Codex account regardless of where the file
-            # sits; Claude records take their root's label (looked up from the path
-            # when the caller didn't supply one, e.g. ingest_file / a bare _read_new).
+            # Every record takes its root's label (T12): looked up from the file's
+            # path, falling back to the default label — or, for a codex file scanned
+            # outside any discovered root (ingest_file / a bare _read_new in tests),
+            # to `CODEX_ACCOUNT`, so a stray codex record never masquerades as the
+            # default Claude account. The provider is set from the line content and
+            # is what downstream code keys on to recognise Codex.
             if account_label is None:
-                account_label = self._account_by_path.get(source, self._default_label)
-            rec.account = CODEX_ACCOUNT if is_codex else account_label
+                account_label = self._account_by_path.get(source)
+            if account_label is None:
+                account_label = CODEX_ACCOUNT if is_codex else self._default_label
+            rec.account = account_label
+            rec.provider = CODEX_PROVIDER if is_codex else CLAUDE_PROVIDER
             self.records.append(rec)
             if is_codex and source not in self._file_models:
                 self._codex_pending.setdefault(source, []).append(rec)
@@ -539,7 +553,10 @@ class Parser:
         cancelled: CancelCheck | None = None,
     ) -> None:
         sp = str(path)
-        account = self._account_by_path.get(sp, self._default_label)
+        # None when the path wasn't tagged by discovery (a bare _read_new in tests);
+        # _ingest_line then applies a provider-aware default so a codex file still
+        # lands on the Codex account rather than the default Claude label.
+        account = self._account_by_path.get(sp)
         try:
             st = path.stat()
         except OSError:
@@ -858,6 +875,7 @@ class Parser:
                     r._eph_5m,
                     r._eph_1h,
                     r.account,
+                    r.provider,
                 )
                 for r in self.records
             ],

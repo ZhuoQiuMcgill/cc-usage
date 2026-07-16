@@ -23,17 +23,18 @@ class Config:
     default_window: str = "all"
     show_cost: bool = True
     theme: str = "dark"
-    # T11 multi-account. `account_scope` is the last-selected panel scope ("all"
-    # or a Claude account label; validated against live accounts at runtime, not
-    # here). `claude_roots` are extra transcript roots the user declared by hand
-    # (list of {"path","label","enabled"} objects); `disabled_roots` are root
-    # paths toggled off in the settings screen.
+    # T11/T12 multi-account. `account_scope` is the last-selected panel scope ("all"
+    # or an account label; validated against live accounts at runtime, not here).
+    # `claude_roots` / `codex_roots` are extra transcript roots the user declared by
+    # hand (each a list of {"path","label","enabled"} objects); `disabled_roots` are
+    # root paths (either provider) toggled off in the settings screen.
     account_scope: str = "all"
     claude_roots: list = field(default_factory=list)
+    codex_roots: list = field(default_factory=list)
     disabled_roots: list = field(default_factory=list)
 
 
-def _sanitize_claude_roots(value: object) -> list:
+def _sanitize_roots(value: object) -> list:
     """Keep only well-formed {"path": str, ...} root objects (never crash)."""
     if not isinstance(value, list):
         return []
@@ -55,7 +56,8 @@ def _validate(cfg: Config) -> Config:
         cfg.theme = "dark"
     if not isinstance(cfg.account_scope, str) or not cfg.account_scope:
         cfg.account_scope = "all"
-    cfg.claude_roots = _sanitize_claude_roots(cfg.claude_roots)
+    cfg.claude_roots = _sanitize_roots(cfg.claude_roots)
+    cfg.codex_roots = _sanitize_roots(cfg.codex_roots)
     cfg.disabled_roots = [p for p in cfg.disabled_roots if isinstance(p, str)] if isinstance(
         cfg.disabled_roots, list
     ) else []
@@ -77,6 +79,7 @@ def load_config() -> Config:
         "theme",
         "account_scope",
         "claude_roots",
+        "codex_roots",
         "disabled_roots",
     ):
         if key in raw:

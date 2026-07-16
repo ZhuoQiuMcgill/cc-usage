@@ -24,6 +24,7 @@ from rich.rule import Rule
 from rich.table import Table
 from rich.text import Text
 
+from .accounts import CODEX_ACCOUNT
 from .aggregate import AccountAgg, RangeAgg, Series, WindowAgg
 from .braille import chart_rows
 from .config import Config
@@ -393,7 +394,12 @@ def model_block(state: RenderState, theme: dict[str, str]):
 
 
 def _pretty_account(agg: AccountAgg) -> str:
-    return "Codex" if agg.is_codex else agg.label
+    # The default single `~/.codex` account renders as `Codex` (byte-identical to
+    # the pre-T12 single-codex row); any additional codex root shows its own label
+    # (e.g. `codex-win`) so several codex accounts read as distinct rows.
+    if agg.is_codex:
+        return "Codex" if agg.label == CODEX_ACCOUNT else agg.label
+    return agg.label
 
 
 def account_scope_line(state: RenderState, theme: dict[str, str]):

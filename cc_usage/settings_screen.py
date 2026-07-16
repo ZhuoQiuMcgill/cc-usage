@@ -17,7 +17,7 @@ from textual.containers import Center, Vertical, VerticalScroll
 from textual.screen import ModalScreen
 from textual.widgets import Button, Footer, Label, ListItem, ListView, Static
 
-from .accounts import discover_claude_roots
+from .accounts import CLAUDE_PROVIDER, CODEX_PROVIDER, discover_claude_roots, discover_codex_roots
 from .config import (
     REFRESH_CHOICES,
     THEME_CHOICES,
@@ -97,13 +97,24 @@ class ChoiceScreen(ModalScreen):
         self.dismiss(None)
 
 
-class AccountsScreen(ModalScreen):
-    """Read-only list of discovered Claude account roots with an enable toggle (T11 R7).
+def _discovered_roots(config):
+    """All discovered account roots (Claude then Codex, T12), each tagged with its
+    provider for display. Codex reuses the Claude labels for reservation so labels
+    stay unique across providers."""
+    claude = discover_claude_roots(config)
+    codex = discover_codex_roots(config, claude_roots=claude)
+    return [(CLAUDE_PROVIDER, r) for r in claude] + [(CODEX_PROVIDER, r) for r in codex]
 
-    Arrow keys move, Enter toggles the highlighted root's `enabled` flag (persisted to
-    `config.json`'s `disabled_roots`), Esc backs out. Adding a *new* root is a manual
-    `config.json` edit — surfaced in the hint. Toggling here changes what the next
-    rescan reads; the parent Settings screen's close handler triggers that rescan.
+
+class AccountsScreen(ModalScreen):
+    """Read-only list of discovered account roots with an enable toggle (T11 R7, T12).
+
+    Lists every Claude *and* Codex root (label, provider, source, path). Arrow keys
+    move, Enter toggles the highlighted root's `enabled` flag (persisted to
+    `config.json`'s `disabled_roots`, keyed by path so it works for either provider),
+    Esc backs out. Adding a *new* root is a manual `config.json` edit — surfaced in
+    the hint. Toggling here changes what the next rescan reads; the parent Settings
+    screen's close handler triggers that rescan.
     """
 
     BINDINGS = [
@@ -135,12 +146,12 @@ class AccountsScreen(ModalScreen):
             idx = 0
         await lv.clear()
         rows = []
-        for root in discover_claude_roots(self.config):
+        for provider, root in _discovered_roots(self.config):
             mark = "●" if root.enabled else "○"
             rows.append(
                 _ChoiceRow(
                     str(root.path),
-                    f"{mark} {root.label:<12}  {root.source:<6}  {root.path}",
+                    f"{mark} {root.label:<12}  {provider:<6}  {root.source:<6}  {root.path}",
                 )
             )
         await lv.extend(rows)
@@ -191,10 +202,15 @@ class SettingsScreen(ModalScreen):
         self.engine = engine
 
     def _extra_rows(self) -> list[tuple[str, str, str]]:
-        """The Accounts management row, shown only when >1 root is discovered."""
-        if self.engine is None or len(getattr(self.engine, "roots", [])) <= 1:
+        """The Accounts management row, shown only when either provider has more than
+        one root (so a plain single `~/.claude` + `~/.codex` machine never sees it)."""
+        if self.engine is None:
             return []
-        roots = discover_claude_roots(self.config)
+        claude = getattr(self.engine, "roots", [])
+        codex = getattr(self.engine, "codex_roots", [])
+        if len(claude) <= 1 and len(codex) <= 1:
+            return []
+        roots = [root for _provider, root in _discovered_roots(self.config)]
         enabled = sum(1 for r in roots if r.enabled)
         return [("accounts", "Accounts", f"{enabled}/{len(roots)} enabled")]
 

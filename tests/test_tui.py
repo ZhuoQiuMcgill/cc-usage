@@ -290,6 +290,7 @@ def _multi_account_app() -> CCUsageApp:
         Root("personal", Path("/x/.claude"), Path("/x/.claude/projects"), "auto"),
         Root("rdqcc", Path("/x/.claude-rdqcc"), Path("/x/.claude-rdqcc/projects"), "config"),
     ]
+    eng.codex_roots = []  # claude-only fixture; keep codex out of the scope cycle
     now = time.time()
 
     def rec(account: str, inp: int, cost: float):
@@ -338,6 +339,102 @@ def test_account_scope_key_is_noop_for_single_account(tmp_config):
             assert str(app.query_one("#scope", Static).renderable) == ""  # no scope line
 
     asyncio.run(scenario())
+
+
+def _codex_multi_app() -> CCUsageApp:
+    """One Claude account + two Codex accounts, so `a` cycles Codex too (T12)."""
+    from pathlib import Path
+
+    from cc_usage.accounts import CLAUDE_PROVIDER, CODEX_PROVIDER, Root
+
+    eng = Engine(Config(), cache_path=None)
+    eng.roots = [Root("personal", Path("/x/.claude"), Path("/x/.claude/projects"), "auto")]
+    eng.codex_roots = [
+        Root("codex", Path("/x/.codex"), Path("/x/.codex/sessions"), "auto"),
+        Root("codex-win", Path("/c/.codex"), Path("/c/.codex/sessions"), "config"),
+    ]
+    now = time.time()
+
+    def rec(account: str, provider: str, inp: int, cost: float):
+        return UsageRecord(
+            ts=now - 100, model_raw="m", model_norm="m", known=True,
+            input_tokens=inp, output_tokens=0, cache_read=0, cache_creation=0, cost=cost,
+            account=account, provider=provider,
+        )
+
+    eng.parser.records = [
+        rec("personal", CLAUDE_PROVIDER, 100, 2.0),
+        rec("codex", CODEX_PROVIDER, 50, 1.0),
+        rec("codex-win", CODEX_PROVIDER, 200, 3.0),
+    ]
+    eng._scanned = True
+    eng._refresh_account_flags()
+    return CCUsageApp(eng)
+
+
+def test_codex_account_scope_cycles_with_a_key(tmp_config):
+    """With more than one Codex root, `a` cycles all -> personal -> codex -> codex-win
+    -> all and the scope line names the isolated codex account."""
+
+    async def scenario():
+        app = _codex_multi_app()
+        async with app.run_test() as pilot:
+            from textual.widgets import Static
+
+            assert app.engine.account_scope == "all"
+            await pilot.press("a")
+            assert app.engine.account_scope == "personal"
+            await pilot.press("a")
+            assert app.engine.account_scope == "codex"
+            await pilot.press("a")
+            assert app.engine.account_scope == "codex-win"
+            scope_text = str(app.query_one("#scope", Static).renderable)
+            assert "account" in scope_text and "codex-win" in scope_text
+            await pilot.press("a")
+            assert app.engine.account_scope == "all"
+
+    asyncio.run(scenario())
+
+
+def test_settings_accounts_row_shows_for_multi_codex(monkeypatch):
+    """The Accounts row appears when *either* provider has more than one root, and it
+    lists Claude and Codex roots together (T12 R6)."""
+    from pathlib import Path
+
+    import cc_usage.settings_screen as ss
+    from cc_usage.accounts import Root
+    from cc_usage.settings_screen import SettingsScreen
+
+    claude = [Root("personal", Path("/x/.claude"), Path("/x/.claude/projects"), "auto")]
+    codex = [
+        Root("codex", Path("/x/.codex"), Path("/x/.codex/sessions"), "auto"),
+        Root("codex-win", Path("/c/.codex"), Path("/c/.codex/sessions"), "config"),
+    ]
+    monkeypatch.setattr(ss, "discover_claude_roots", lambda cfg: claude)
+    monkeypatch.setattr(ss, "discover_codex_roots", lambda *a, **k: codex)
+
+    class _Eng:
+        roots = claude
+        codex_roots = codex
+
+    rows = SettingsScreen(Config(), _Eng())._extra_rows()
+    assert rows and rows[0][0] == "accounts"
+    assert "3/3 enabled" in rows[0][2]  # personal + codex + codex-win, all enabled
+    assert [p for p, _root in ss._discovered_roots(Config())] == ["claude", "codex", "codex"]
+
+
+def test_settings_accounts_row_hidden_for_single_everything():
+    """A plain single ~/.claude + single ~/.codex machine shows no Accounts row."""
+    from pathlib import Path
+
+    from cc_usage.accounts import Root
+    from cc_usage.settings_screen import SettingsScreen
+
+    class _Eng:
+        roots = [Root("personal", Path("/x/.claude"), Path("/x/.claude/projects"), "auto")]
+        codex_roots = [Root("codex", Path("/x/.codex"), Path("/x/.codex/sessions"), "auto")]
+
+    assert SettingsScreen(Config(), _Eng())._extra_rows() == []
 
 
 def test_settings_accounts_row_and_toggle(tmp_config, monkeypatch):
@@ -432,8 +529,10 @@ def _mock_two_root_discovery(tmp_path, monkeypatch):
     monkeypatch.setattr(engine_module, "discover_claude_roots", fake_discover)
     monkeypatch.setattr(ss, "discover_claude_roots", fake_discover)
     monkeypatch.setattr(parser_module, "PROJECTS_DIR", r1 / "projects")
-    monkeypatch.setattr(engine_module, "CODEX_SESSIONS_DIR", tmp_path / "no-codex")
-    monkeypatch.setattr(engine_module, "CODEX_ARCHIVED_SESSIONS_DIR", tmp_path / "no-codex2")
+    # No Codex roots -> keep discovery hermetic (T12: codex dirs come from discovery,
+    # not module constants) on both the engine and the settings screen.
+    monkeypatch.setattr(engine_module, "discover_codex_roots", lambda *a, **k: [])
+    monkeypatch.setattr(ss, "discover_codex_roots", lambda *a, **k: [])
     monkeypatch.setattr(engine_module, "LIMITS_CACHE_JSON", tmp_path / "limits.json")
     return r1, r2
 

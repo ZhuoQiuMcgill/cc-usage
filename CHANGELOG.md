@@ -10,6 +10,15 @@ See [VERSIONING.md](VERSIONING.md) for the release policy.
 
 ### Added
 
+- **Multiple Codex accounts.** Codex transcript discovery now mirrors the Claude model:
+  ccusage reads more than one Codex root — always `~/.codex`, plus `$CODEX_HOME` and any
+  roots declared under a new `codex_roots` key in `config.json` (`{"path","label","enabled"}`,
+  same shape and rules as `claude_roots`) — and treats each root as its own account. Records
+  carry a provider (Claude/Codex) distinct from the account label, so a second codex root is
+  a first-class account: it gets a scope in the `a` cycle (once there is more than one codex
+  root), its own **By account** row, its own settings toggle, and its own per-root parse
+  cache/fingerprint. A plain single `~/.codex` machine is byte-for-byte unchanged. This makes
+  Windows-side Codex usage visible from WSL: point `codex_roots` at `/mnt/c/Users/<you>/.codex`.
 - **Multiple Claude accounts.** ccusage now discovers more than one Claude transcript root
   — always `~/.claude`, plus `$CLAUDE_CONFIG_DIR` and any roots declared under a new
   `claude_roots` key in `config.json` — and treats each config-dir root as one account
@@ -27,10 +36,19 @@ See [VERSIONING.md](VERSIONING.md) for the release policy.
   credentials and the bars are labelled per account (`PERSONAL 5-HOUR`, `RDQCC WEEKLY`).
   One account's fetch failure keeps its last-good values without blocking the others, and the
   reset-time expiry rule applies per account. Single-account limit rendering is unchanged.
-- **Settings → Accounts.** A keyboard-driven list of discovered roots (label, source, path)
-  with an enable/disable toggle per root, persisted to `config.json`; disabling a root
-  excludes its records after the next scan. Adding a new root remains a manual `config.json`
-  edit.
+- **Settings → Accounts.** A keyboard-driven list of discovered roots (label, provider,
+  source, path) with an enable/disable toggle per root, persisted to `config.json`; disabling
+  a root excludes its records after the next scan. Adding a new root remains a manual
+  `config.json` edit.
+
+### Changed
+
+- **`$CODEX_HOME` now *adds* a Codex root instead of replacing `~/.codex`.** Previously
+  setting `CODEX_HOME` made ccusage read only that directory; it is now an additional root
+  alongside the always-present `~/.codex` (matching how `$CLAUDE_CONFIG_DIR` behaves for
+  Claude). If you relied on `CODEX_HOME` to point ccusage at a single non-default directory,
+  both that directory and `~/.codex` are now discovered — disable the one you don't want in
+  Settings → Accounts.
 
 ## [2.3.0] - 2026-07-13
 

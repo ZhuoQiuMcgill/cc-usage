@@ -1,18 +1,29 @@
-"""Multi-account Claude transcript roots (T11).
+"""Multi-root account discovery for Claude and Codex (T11, T12).
 
-Claude transcripts carry no account identifier (verified on real data), so the
-Claude **config-dir root** is the only reliable account boundary. This module
-discovers those roots — always `~/.claude`, plus a `$CLAUDE_CONFIG_DIR` override
-and any `config.json`-declared extra roots — derives a short label per root, and
-records which are enabled. Every root is read-only; nothing here writes under one.
+Neither Claude transcripts nor Codex rollouts carry an account identifier
+(verified on real data), so the provider **config-dir root** is the only reliable
+account boundary. This module discovers those roots — always `~/.claude` /
+`~/.codex`, plus an environment override and any `config.json`-declared extra
+roots — derives a short label per root, and records which are enabled. Every root
+is read-only; nothing here writes under one.
 
-Precedence (deduplicated by resolved path):
+Claude precedence (deduplicated by resolved path):
   1. `~/.claude`            — always (label ``personal``).
   2. `$CLAUDE_CONFIG_DIR`   — when set and distinct.
-  3. ``config.json`` key ``claude_roots`` — a list of
-     ``{"path": ..., "label": ..., "enabled": ...}`` objects.
+  3. ``config.json`` key ``claude_roots``.
 
-Missing/unreadable non-default roots are skipped silently (never fatal).
+Codex mirrors it (T12):
+  1. `~/.codex`             — always (label ``codex``).
+  2. `$CODEX_HOME`          — when set and distinct. NOTE: this *adds* a root; it
+     used to replace the default (pre-2.3.x behaviour).
+  3. ``config.json`` key ``codex_roots``.
+
+Each root object is ``{"path": ..., "label": ..., "enabled": ...}``. Missing or
+unreadable non-default roots are skipped silently (never fatal). Claude and Codex
+labels share one namespace so ``a``-key scoping and the by-account rollup can tell
+every account apart: Claude reserves the Codex default label and ``all``; Codex
+reserves ``all`` plus the live Claude labels, so a codex root never shadows a
+Claude account.
 """
 
 from __future__ import annotations
@@ -21,29 +32,37 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
-# Sentinel account tag for Codex records. Codex is a provider, never a Claude
-# account, but tagging its records with a distinct account string lets scope
-# filtering and the by-account rollup treat it as one row without threading a
-# separate provider field through every record. Reserved so no Claude label can
-# collide with it (see `_dedupe_label`).
+# Provider dimension carried on every UsageRecord. Kept separate from the account
+# *label* so a codex root can have any label (``codex``, ``codex-win``, …) while
+# scope filtering, the by-account rollup, and the "is any Codex data present" flag
+# still recognise it as Codex. (Pre-T12 this rode on ``account == CODEX_ACCOUNT``,
+# which broke the moment a second codex root existed.)
+CLAUDE_PROVIDER = "claude"
+CODEX_PROVIDER = "codex"
+
+# The always-present default labels: ``~/.claude`` -> ``personal``,
+# ``~/.codex`` -> ``codex``. ``CODEX_ACCOUNT`` doubles as the default codex label
+# and the string a plain single-codex machine renders as ``Codex`` (zero-noise).
+DEFAULT_LABEL = "personal"
 CODEX_ACCOUNT = "codex"
 
-# The always-present default root's label (``~/.claude``).
-DEFAULT_LABEL = "personal"
-
-# Labels no Claude root may claim: the Codex account tag and the ``all`` scope
-# sentinel (a root literally labelled "all" could never be isolated — cycling to
-# it would read as the all-accounts scope). Colliding roots get a numeric suffix.
-_RESERVED_LABELS = frozenset({CODEX_ACCOUNT, "all"})
+# The ``all`` scope sentinel: a root literally labelled "all" could never be
+# isolated (cycling to it would read as the all-accounts scope), so it is always
+# reserved. Claude additionally reserves the Codex default label so the two
+# provider label spaces stay disjoint.
+_ALL_SCOPE = "all"
+_CLAUDE_RESERVED = frozenset({CODEX_ACCOUNT, _ALL_SCOPE})
 
 
 @dataclass(frozen=True)
 class Root:
-    """One discovered Claude account root.
+    """One discovered account root (Claude or Codex).
 
-    ``path`` is the config dir (``…/.claude``); ``projects`` is where its
-    transcripts live. ``source`` is ``auto`` (``~/.claude``), ``env``
-    (``$CLAUDE_CONFIG_DIR``) or ``config`` (a ``claude_roots`` entry).
+    ``path`` is the config dir (``…/.claude`` or ``…/.codex``); ``projects`` is
+    where its transcripts live — ``<path>/projects`` for Claude, ``<path>/sessions``
+    for Codex (the archived sibling is derived from ``path`` by the engine).
+    ``source`` is ``auto`` (the default root), ``env`` (the environment override)
+    or ``config`` (a declared roots entry).
     """
 
     label: str
@@ -53,15 +72,16 @@ class Root:
     enabled: bool = True
 
 
-def _derive_label(path: Path) -> str:
-    """Basename with a leading ``.claude-`` or ``.`` stripped.
+def _derive_label(path: Path, strip_prefix: str) -> str:
+    """Basename with a leading provider prefix or a bare ``.`` stripped.
 
-    ``.claude-rdqcc`` -> ``rdqcc``; ``.claude`` -> ``claude``; a plain dir keeps
-    its name. Never returns an empty string.
+    ``.claude-rdqcc`` (prefix ``.claude-``) -> ``rdqcc``; ``.codex-win`` (prefix
+    ``.codex-``) -> ``win``; ``.codex`` -> ``codex``; a plain dir keeps its name.
+    Never returns an empty string.
     """
     name = path.name
-    if name.startswith(".claude-"):
-        name = name[len(".claude-") :]
+    if strip_prefix and name.startswith(strip_prefix):
+        name = name[len(strip_prefix) :]
     elif name.startswith("."):
         name = name[1:]
     return name or path.name or "account"
@@ -70,8 +90,8 @@ def _derive_label(path: Path) -> str:
 def _dedupe_label(label: str, used: set[str]) -> str:
     """Return ``label`` or a numeric-suffixed variant if it is already taken.
 
-    ``used`` is seeded with ``_RESERVED_LABELS`` by the caller so no Claude root
-    can claim the Codex tag or the ``all`` scope sentinel.
+    ``used`` is seeded with the caller's reserved labels so no root can claim the
+    ``all`` scope sentinel (or, cross-provider, another account's label).
     """
     if label not in used:
         used.add(label)
@@ -97,29 +117,38 @@ def _disabled_identities(config) -> set[str]:
     return out
 
 
-def discover_claude_roots(config, *, home: Path | None = None, environ=None) -> list[Root]:
-    """Discover Claude account roots in precedence order (see module docstring).
+def _discover_roots(
+    config,
+    *,
+    default_path: Path,
+    default_label: str,
+    env_var: str,
+    config_key: str,
+    projects_subdir: str,
+    strip_prefix: str,
+    reserved,
+    home: Path,
+    environ,
+) -> list[Root]:
+    """Shared discovery for one provider's roots (Claude and Codex share it all).
 
-    Deduplicated by resolved path. ``~/.claude`` is always present (even if it
-    does not exist yet); every other candidate is skipped when its directory is
-    missing. A root is enabled unless a ``config.json`` object sets
-    ``enabled: false`` or the user toggled it off (``disabled_roots``).
-
-    ``home``/``environ`` are injectable so discovery is unit-testable without
-    touching the real ``$HOME`` or process environment.
+    Precedence: the always-present default root, then a distinct ``$env_var``
+    override, then each ``config.json`` ``config_key`` entry. Deduplicated by
+    resolved path; the default root is always listed (even if its dir does not
+    exist yet), every other candidate is skipped when missing. A root is enabled
+    unless a config object sets ``enabled: false`` or the user toggled it off.
+    ``reserved`` seeds the label space (``all`` plus any cross-provider labels).
     """
-    home = Path.home() if home is None else home
-    environ = os.environ if environ is None else environ
     disabled = _disabled_identities(config)
 
     # (path, source, label_override, config_enabled)
     candidates: list[tuple[Path, str, str | None, bool | None]] = [
-        (home / ".claude", "auto", DEFAULT_LABEL, None),
+        (default_path, "auto", default_label, None),
     ]
-    env_dir = environ.get("CLAUDE_CONFIG_DIR")
+    env_dir = environ.get(env_var)
     if env_dir:
         candidates.append((Path(env_dir).expanduser(), "env", None, None))
-    for entry in getattr(config, "claude_roots", None) or []:
+    for entry in getattr(config, config_key, None) or []:
         if not isinstance(entry, dict):
             continue
         raw = entry.get("path")
@@ -132,7 +161,7 @@ def discover_claude_roots(config, *, home: Path | None = None, environ=None) -> 
         candidates.append((Path(raw).expanduser(), "config", label_override, cfg_enabled))
 
     seen: set[str] = set()
-    used_labels: set[str] = set(_RESERVED_LABELS)
+    used_labels: set[str] = set(reserved)
     roots: list[Root] = []
     for path, source, label_override, cfg_enabled in candidates:
         try:
@@ -141,7 +170,7 @@ def discover_claude_roots(config, *, home: Path | None = None, environ=None) -> 
             resolved = str(path)
         if resolved in seen:
             continue
-        # ~/.claude is always listed; every other root must actually exist.
+        # The default root is always listed; every other root must actually exist.
         if source != "auto" and not path.is_dir():
             continue
         seen.add(resolved)
@@ -149,13 +178,66 @@ def discover_claude_roots(config, *, home: Path | None = None, environ=None) -> 
         if label_override:
             label = label_override
         elif source == "auto":
-            label = DEFAULT_LABEL
+            label = default_label
         else:
-            label = _derive_label(path)
+            label = _derive_label(path, strip_prefix)
         label = _dedupe_label(label, used_labels)
 
         enabled = cfg_enabled is not False and str(path) not in disabled
         roots.append(
-            Root(label=label, path=path, projects=path / "projects", source=source, enabled=enabled)
+            Root(label=label, path=path, projects=path / projects_subdir, source=source, enabled=enabled)
         )
     return roots
+
+
+def discover_claude_roots(config, *, home: Path | None = None, environ=None) -> list[Root]:
+    """Discover Claude account roots in precedence order (see module docstring).
+
+    ``~/.claude`` is always present; ``$CLAUDE_CONFIG_DIR`` and ``claude_roots``
+    add more. ``home``/``environ`` are injectable so discovery is unit-testable
+    without touching the real ``$HOME`` or process environment.
+    """
+    home = Path.home() if home is None else home
+    environ = os.environ if environ is None else environ
+    return _discover_roots(
+        config,
+        default_path=home / ".claude",
+        default_label=DEFAULT_LABEL,
+        env_var="CLAUDE_CONFIG_DIR",
+        config_key="claude_roots",
+        projects_subdir="projects",
+        strip_prefix=".claude-",
+        reserved=_CLAUDE_RESERVED,
+        home=home,
+        environ=environ,
+    )
+
+
+def discover_codex_roots(
+    config, *, claude_roots: list[Root] | None = None, home: Path | None = None, environ=None
+) -> list[Root]:
+    """Discover Codex account roots, mirroring the Claude model (T12).
+
+    ``~/.codex`` is always present; ``$CODEX_HOME`` (now *additive*, not a
+    replacement) and ``codex_roots`` add more. Codex labels are reserved against
+    the live Claude labels plus ``all`` so the two providers share one
+    unambiguous scope namespace — pass ``claude_roots`` to reuse an
+    already-computed set (else it is re-discovered).
+    """
+    home = Path.home() if home is None else home
+    environ = os.environ if environ is None else environ
+    if claude_roots is None:
+        claude_roots = discover_claude_roots(config, home=home, environ=environ)
+    reserved = frozenset({_ALL_SCOPE, *(r.label for r in claude_roots)})
+    return _discover_roots(
+        config,
+        default_path=home / ".codex",
+        default_label=CODEX_ACCOUNT,
+        env_var="CODEX_HOME",
+        config_key="codex_roots",
+        projects_subdir="sessions",
+        strip_prefix=".codex-",
+        reserved=reserved,
+        home=home,
+        environ=environ,
+    )

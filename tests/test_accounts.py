@@ -15,9 +15,12 @@ from rich.console import Console
 import cc_usage.engine as engine_module
 import cc_usage.limits_fetch as limits_fetch
 from cc_usage.accounts import (
+    CLAUDE_PROVIDER,
     CODEX_ACCOUNT,
+    CODEX_PROVIDER,
     Root,
     discover_claude_roots,
+    discover_codex_roots,
 )
 from cc_usage.aggregate import aggregate_accounts
 from cc_usage.config import Config
@@ -74,6 +77,45 @@ def _claude_line(req: str, mid: str, inp: int, out: int = 0) -> str:
         )
         + "\n"
     )
+
+
+def _mkcodex(base: Path, name: str) -> Path:
+    """Create a Codex config-dir root with a sessions tree and return the config dir."""
+    root = base / name
+    (root / "sessions").mkdir(parents=True)
+    return root
+
+
+def _codex_lines(inp: int = 100, out: int = 10, ts: str = "2026-07-12T12:00:00Z", model: str = "gpt-test") -> str:
+    """A minimal Codex rollout: a turn_context (model) + one token_count event."""
+    ctx = json.dumps({"timestamp": ts, "type": "turn_context", "payload": {"model": model}}) + "\n"
+    tok = (
+        json.dumps(
+            {
+                "timestamp": ts,
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "total_token_usage": {
+                            "input_tokens": inp,
+                            "cached_input_tokens": 0,
+                            "output_tokens": out,
+                            "total_tokens": inp + out,
+                        },
+                        "last_token_usage": {
+                            "input_tokens": inp,
+                            "cached_input_tokens": 0,
+                            "output_tokens": out,
+                            "total_tokens": inp + out,
+                        },
+                    },
+                },
+            }
+        )
+        + "\n"
+    )
+    return ctx + tok
 
 
 # ── R1: root discovery ──────────────────────────────────────────────────────────
@@ -253,7 +295,19 @@ def test_label_rename_only_invalidates_cache(tmp_path):
 
 
 # ── R3/R4 engine helpers ────────────────────────────────────────────────────────
-def _rec(account: str, age: float = 100.0, *, cost: float, inp: int, model="claude-opus-4-8"):
+def _rec(
+    account: str,
+    age: float = 100.0,
+    *,
+    cost: float,
+    inp: int,
+    model="claude-opus-4-8",
+    provider: str | None = None,
+):
+    # Codex records default to the Codex provider (the synthetic `codex` account),
+    # so existing single-codex tests keep working; multi-codex tests pass it in.
+    if provider is None:
+        provider = CODEX_PROVIDER if account == CODEX_ACCOUNT else CLAUDE_PROVIDER
     return UsageRecord(
         ts=NOW - age,
         model_raw=model,
@@ -265,15 +319,31 @@ def _rec(account: str, age: float = 100.0, *, cost: float, inp: int, model="clau
         cache_creation=0,
         cost=cost,
         account=account,
+        provider=provider,
     )
 
 
-def _engine_with(records, labels):
+def _codex_roots_for(records, codex_labels):
+    """Synthetic codex Root objects for an engine under test — either the given
+    labels or, when None, the distinct codex accounts present in `records`."""
+    if codex_labels is None:
+        codex_labels = []
+        for r in records:
+            if r.provider == CODEX_PROVIDER and r.account not in codex_labels:
+                codex_labels.append(r.account)
+    return [
+        Root(lbl, Path(f"/c/{lbl}"), Path(f"/c/{lbl}/sessions"), "auto" if i == 0 else "config")
+        for i, lbl in enumerate(codex_labels)
+    ]
+
+
+def _engine_with(records, labels, codex_labels=None):
     eng = Engine(Config(), cache_path=None)
     eng.roots = [
         Root(label, Path(f"/x/{label}"), Path(f"/x/{label}/projects"), "auto" if i == 0 else "config")
         for i, label in enumerate(labels)
     ]
+    eng.codex_roots = _codex_roots_for(records, codex_labels)
     eng.parser.records = records
     eng._scanned = True
     eng._refresh_account_flags()
@@ -538,8 +608,9 @@ def test_engine_reload_roots_rescans_on_toggle(tmp_path, monkeypatch):
     import cc_usage.parser as parser_module
 
     monkeypatch.setattr(parser_module, "PROJECTS_DIR", r1 / "projects")
-    monkeypatch.setattr(engine_module, "CODEX_SESSIONS_DIR", tmp_path / "no-codex")
-    monkeypatch.setattr(engine_module, "CODEX_ARCHIVED_SESSIONS_DIR", tmp_path / "no-codex2")
+    # No Codex roots -> keep discovery hermetic (T12: codex dirs come from discovery,
+    # not module constants).
+    monkeypatch.setattr(engine_module, "discover_codex_roots", lambda *a, **k: [])
 
     eng = Engine(Config(), cache_path=None)
     eng.scan()
@@ -607,8 +678,9 @@ def test_mid_scan_root_toggle_discards_stale_scan_and_cache(tmp_path, monkeypatc
     current = {"roots": both}
     monkeypatch.setattr(engine_module, "discover_claude_roots", lambda cfg: current["roots"])
     monkeypatch.setattr(parser_module, "PROJECTS_DIR", r1 / "projects")
-    monkeypatch.setattr(engine_module, "CODEX_SESSIONS_DIR", tmp_path / "no-codex")
-    monkeypatch.setattr(engine_module, "CODEX_ARCHIVED_SESSIONS_DIR", tmp_path / "no-codex2")
+    # No Codex roots -> keep discovery hermetic (T12: codex dirs come from discovery,
+    # not module constants).
+    monkeypatch.setattr(engine_module, "discover_codex_roots", lambda *a, **k: [])
     monkeypatch.setattr(engine_module, "LIMITS_CACHE_JSON", tmp_path / "limits.json")
     cache = tmp_path / "cache.pkl"
 
@@ -644,3 +716,320 @@ def test_mid_scan_root_toggle_discards_stale_scan_and_cache(tmp_path, monkeypatc
     eng2.scan()
     assert eng2.parser.stats.lines_read == 0  # served warm, no re-read
     assert {r.account for r in eng2.parser.records} == {"personal"}
+
+
+# ── T12: Codex multi-root discovery ──────────────────────────────────────────────
+def test_codex_discovery_default_only(tmp_path):
+    home = tmp_path / "home"
+    (home / ".codex" / "sessions").mkdir(parents=True)
+    roots = discover_codex_roots(Config(), home=home, environ={})
+    assert [(r.label, r.source, r.enabled) for r in roots] == [("codex", "auto", True)]
+    assert roots[0].projects == home / ".codex" / "sessions"
+
+
+def test_codex_discovery_env_is_additive(tmp_path):
+    """CODEX_HOME now ADDS a root instead of replacing ~/.codex (v2.3.0 behaviour
+    change): both the auto ~/.codex and the env root are discovered."""
+    home = tmp_path / "home"
+    (home / ".codex").mkdir(parents=True)
+    win = _mkcodex(tmp_path, ".codex-win")
+    roots = discover_codex_roots(Config(), home=home, environ={"CODEX_HOME": str(win)})
+    assert [r.label for r in roots] == ["codex", "win"]
+    assert [r.source for r in roots] == ["auto", "env"]
+    assert roots[1].projects == win / "sessions"
+
+
+def test_codex_discovery_env_equal_to_default_is_deduped(tmp_path):
+    home = tmp_path / "home"
+    (home / ".codex").mkdir(parents=True)
+    roots = discover_codex_roots(
+        Config(), home=home, environ={"CODEX_HOME": str(home / ".codex")}
+    )
+    assert len(roots) == 1 and roots[0].source == "auto"
+
+
+def test_codex_discovery_config_roots_and_missing_skipped(tmp_path):
+    home = tmp_path / "home"
+    (home / ".codex").mkdir(parents=True)
+    extra = _mkcodex(tmp_path, "extra-codex")
+    cfg = Config(
+        codex_roots=[
+            {"path": str(extra), "label": "work"},
+            {"path": str(tmp_path / "ghost")},  # missing dir -> skipped silently
+        ]
+    )
+    roots = discover_codex_roots(cfg, home=home, environ={})
+    assert [r.label for r in roots] == ["codex", "work"]
+
+
+def test_codex_labels_reserved_against_claude_and_all(tmp_path):
+    """Codex labels share one namespace with Claude: a codex root deriving a label a
+    Claude account already holds (or the `all` sentinel) is suffixed, so scoping can
+    tell every account apart across providers."""
+    home = tmp_path / "home"
+    _mkroot(home, ".claude")
+    (home / ".codex").mkdir(parents=True)
+    claude_work = _mkroot(tmp_path / "cl", ".claude-work")  # claude "work"
+    codex_work = _mkcodex(tmp_path / "cx", ".codex-work")   # would derive "work"
+    codex_all = _mkcodex(tmp_path / "cy", ".codex-all")     # would derive "all"
+    cfg = Config(
+        claude_roots=[{"path": str(claude_work)}],
+        codex_roots=[{"path": str(codex_work)}, {"path": str(codex_all)}],
+    )
+    claude = discover_claude_roots(cfg, home=home, environ={})
+    codex = discover_codex_roots(cfg, claude_roots=claude, home=home, environ={})
+    assert [r.label for r in claude] == ["personal", "work"]
+    assert [r.label for r in codex] == ["codex", "work-2", "all-2"]
+
+
+def test_codex_discovery_enabled_false_and_disabled_roots(tmp_path):
+    home = tmp_path / "home"
+    (home / ".codex").mkdir(parents=True)
+    e = _mkcodex(tmp_path, "ce")
+    f = _mkcodex(tmp_path, "cf")
+    cfg = Config(
+        codex_roots=[
+            {"path": str(e), "label": "ce", "enabled": False},  # config hard-disable
+            {"path": str(f), "label": "cf"},
+        ],
+        disabled_roots=[str(f)],  # UI toggle-off
+    )
+    by = {r.label: r for r in discover_codex_roots(cfg, home=home, environ={})}
+    assert by["codex"].enabled is True
+    assert by["ce"].enabled is False
+    assert by["cf"].enabled is False
+
+
+# ── T12: Codex account tagging + rollout-state keying ────────────────────────────
+def test_records_tagged_by_codex_root(tmp_path):
+    """Records from two codex roots carry each root's label + the Codex provider."""
+    r1 = _mkcodex(tmp_path, ".codex")
+    r2 = _mkcodex(tmp_path, ".codex-win")
+    (r1 / "sessions" / "rollout-a.jsonl").write_text(_codex_lines(inp=100), "utf-8")
+    (r2 / "sessions" / "rollout-b.jsonl").write_text(_codex_lines(inp=200), "utf-8")
+    parser = Parser(
+        {"gpt-test": {"input": 2.0, "output": 8.0}},
+        roots=[(r1 / "sessions", "codex"), (r2 / "sessions", "codex-win")],
+    )
+    parser.scan()
+    assert {r.account: r.input_tokens for r in parser.records} == {"codex": 100, "codex-win": 200}
+    assert all(r.provider == CODEX_PROVIDER for r in parser.records)
+
+
+def test_same_named_rollout_in_two_codex_roots_do_not_collide(tmp_path):
+    """Two roots holding a same-basename rollout must not share per-file state
+    (offset/model/totals are keyed by the full resolved path, not the basename)."""
+    r1 = tmp_path / "a" / ".codex" / "sessions"
+    r2 = tmp_path / "b" / ".codex" / "sessions"
+    r1.mkdir(parents=True)
+    r2.mkdir(parents=True)
+    (r1 / "rollout-x.jsonl").write_text(_codex_lines(inp=100, ts="2026-07-12T12:00:00Z"), "utf-8")
+    (r2 / "rollout-x.jsonl").write_text(_codex_lines(inp=200, ts="2026-07-12T13:00:00Z"), "utf-8")
+    parser = Parser(
+        {"gpt-test": {"input": 2.0, "output": 8.0}},
+        roots=[(r1, "codex"), (r2, "codex-win")],
+    )
+    parser.scan()
+    assert {r.account: r.input_tokens for r in parser.records} == {"codex": 100, "codex-win": 200}
+    assert len(parser._codex_totals) == 2  # distinct per-file token state, no collision
+    assert len(parser._file_models) == 2
+
+
+# ── T12: Codex cache round-trip + invalidation ───────────────────────────────────
+def test_codex_cache_round_trips_two_roots(tmp_path):
+    r1 = _mkcodex(tmp_path, ".codex")
+    r2 = _mkcodex(tmp_path, ".codex-win")
+    (r1 / "sessions" / "rollout-a.jsonl").write_text(_codex_lines(inp=100), "utf-8")
+    (r2 / "sessions" / "rollout-b.jsonl").write_text(_codex_lines(inp=200), "utf-8")
+    cache = tmp_path / "cache.pkl"
+    both = [(r1 / "sessions", "codex"), (r2 / "sessions", "codex-win")]
+    pricing = {"gpt-test": {"input": 2.0, "output": 8.0}}
+
+    writer = Parser(pricing, cache_path=cache, roots=both)
+    writer.scan()
+    writer.save_cache()
+
+    warm = Parser(pricing, cache_path=cache, roots=both)
+    warm.scan()
+    assert warm.stats.lines_read == 0  # warm start read nothing new
+    assert {r.account for r in warm.records} == {"codex", "codex-win"}
+    assert all(r.provider == CODEX_PROVIDER for r in warm.records)  # provider round-trips
+
+
+def test_codex_root_toggle_invalidates_cache_and_drops_records(tmp_path):
+    r1 = _mkcodex(tmp_path, ".codex")
+    r2 = _mkcodex(tmp_path, ".codex-win")
+    (r1 / "sessions" / "rollout-a.jsonl").write_text(_codex_lines(inp=100), "utf-8")
+    (r2 / "sessions" / "rollout-b.jsonl").write_text(_codex_lines(inp=200), "utf-8")
+    cache = tmp_path / "cache.pkl"
+    both = [(r1 / "sessions", "codex"), (r2 / "sessions", "codex-win")]
+    one = [(r1 / "sessions", "codex")]
+    pricing = {"gpt-test": {"input": 2.0, "output": 8.0}}
+
+    first = Parser(pricing, cache_path=cache, roots=both)
+    first.scan()
+    first.save_cache()
+    assert {r.account for r in first.records} == {"codex", "codex-win"}
+
+    # "disable codex-win": fewer roots -> roots fingerprint mismatch -> full rebuild.
+    disabled = Parser(pricing, cache_path=cache, roots=one)
+    disabled.scan()
+    assert {r.account for r in disabled.records} == {"codex"}
+    assert disabled.stats.lines_read > 0  # rescanned, not served from stale cache
+
+
+def test_old_cache_version_discarded_once(tmp_path):
+    """A v5 (pre-provider) cache is dropped and rebuilt exactly once on the next scan."""
+    import pickle
+
+    import cc_usage.parser as parser_module
+
+    r1 = _mkcodex(tmp_path, ".codex")
+    (r1 / "sessions" / "rollout-a.jsonl").write_text(_codex_lines(inp=100), "utf-8")
+    cache = tmp_path / "cache.pkl"
+    roots = [(r1 / "sessions", "codex")]
+    pricing = {"gpt-test": {"input": 2.0, "output": 8.0}}
+
+    warm = Parser(pricing, cache_path=cache, roots=roots)
+    warm.scan()
+    warm.save_cache()
+    data = pickle.loads(cache.read_bytes())
+    assert data["version"] == parser_module._CACHE_VERSION  # current version written
+
+    # Rewrite the on-disk cache pretending it is the previous format version.
+    data["version"] = parser_module._CACHE_VERSION - 1
+    cache.write_bytes(pickle.dumps(data))
+
+    reader = Parser(pricing, cache_path=cache, roots=roots)
+    reader.scan()
+    assert reader.stats.lines_read > 0  # stale-version cache ignored -> full re-read
+    assert {r.account for r in reader.records} == {"codex"}
+
+
+# ── T12: Codex account scope + by-account rollup ─────────────────────────────────
+def test_scope_isolates_a_codex_account():
+    records = [
+        _rec("personal", cost=2.0, inp=100),
+        _rec("codex", cost=1.0, inp=50, provider=CODEX_PROVIDER, model="gpt-test"),
+        _rec("codex-win", cost=3.0, inp=200, provider=CODEX_PROVIDER, model="gpt-test"),
+    ]
+    eng = _engine_with(records, ["personal"], codex_labels=["codex", "codex-win"])
+    assert eng.multi_codex is True
+    # With >1 codex root, codex accounts join the scope cycle.
+    assert eng._scope_accounts() == ["personal", "codex", "codex-win"]
+
+    eng.account_scope = "codex-win"  # isolates that codex root; excludes claude + other codex
+    s = eng.snapshot(NOW)
+    assert s.windows["all"].input_tokens == 200
+    assert eng.range_metrics(NOW - 200, NOW + 200).input_tokens == 200
+
+
+def test_by_account_rollup_has_a_row_per_codex_account():
+    records = [
+        _rec("personal", cost=2.0, inp=100),
+        _rec("codex", cost=1.0, inp=50, provider=CODEX_PROVIDER, model="gpt-test"),
+        _rec("codex-win", cost=3.0, inp=200, provider=CODEX_PROVIDER, model="gpt-test"),
+    ]
+    eng = _engine_with(records, ["personal"], codex_labels=["codex", "codex-win"])
+    s = eng.snapshot(NOW)
+    assert {a.label for a in s.accounts} == {"personal", "codex", "codex-win"}
+    out = _plain(by_account_block(s, THEME))
+    assert "Codex" in out       # the default ~/.codex account renders as "Codex"
+    assert "codex-win" in out   # a second codex root shows its own distinct label
+
+
+def test_single_codex_root_not_isolatable_zero_noise():
+    """A single ~/.codex stays lumped into `all` (not a separate scope), so a plain
+    one-claude + one-codex machine keeps its exact `all -> personal -> all` cycle."""
+    eng = _engine_with(
+        [_rec("personal", cost=2.0, inp=100), _rec(CODEX_ACCOUNT, cost=1.0, inp=50)],
+        ["personal"],
+    )
+    assert eng.multi_codex is False
+    assert eng._scope_accounts() == ["personal"]  # codex NOT a scope option
+    assert eng._valid_scope(CODEX_ACCOUNT) == "all"  # a stale codex scope resets to all
+
+
+# ── T12: Codex engine reload + mid-scan race guard (R6) ──────────────────────────
+def test_engine_reload_roots_rescans_on_codex_toggle(tmp_path, monkeypatch):
+    """Toggling a codex root re-discovers + rescans through the same engine path as a
+    Claude toggle: the disabled root's records drop, re-enabling restores them."""
+    c1 = tmp_path / ".codex" / "sessions"
+    c2 = tmp_path / ".codex-win" / "sessions"
+    c1.mkdir(parents=True)
+    c2.mkdir(parents=True)
+    (c1 / "rollout-a.jsonl").write_text(_codex_lines(inp=100), "utf-8")
+    (c2 / "rollout-b.jsonl").write_text(_codex_lines(inp=200), "utf-8")
+    both = [
+        Root("codex", tmp_path / ".codex", c1, "auto"),
+        Root("codex-win", tmp_path / ".codex-win", c2, "config"),
+    ]
+    toggled = [both[0], Root("codex-win", tmp_path / ".codex-win", c2, "config", enabled=False)]
+    # No Claude roots keeps the fixture hermetic and off the single-default None path.
+    monkeypatch.setattr(engine_module, "discover_claude_roots", lambda cfg: [])
+    state = {"codex": both}
+    monkeypatch.setattr(engine_module, "discover_codex_roots", lambda *a, **k: state["codex"])
+
+    eng = Engine(Config(), cache_path=None)
+    eng.scan()
+    assert {r.account for r in eng.parser.records} == {"codex", "codex-win"}
+
+    state["codex"] = toggled
+    assert eng.reload_roots() is True
+    eng.scan()
+    assert {r.account for r in eng.parser.records} == {"codex"}  # codex-win excluded
+
+    state["codex"] = both
+    assert eng.reload_roots() is True
+    eng.scan()
+    assert {r.account for r in eng.parser.records} == {"codex", "codex-win"}  # restored
+
+    assert eng.reload_roots() is False  # no change -> no needless rescan
+
+
+def test_mid_scan_codex_root_toggle_discards_stale_scan_and_cache(tmp_path, monkeypatch):
+    """R6/T12: the toggle-during-scan race guard covers codex roots — a codex toggle
+    mid-scan swaps the parser, the stale scan discards itself (ScanCancelled), the
+    empty swap-in is never persisted, and the relaunch produces a warm-startable cache."""
+    c1 = tmp_path / ".codex" / "sessions"
+    c2 = tmp_path / ".codex-win" / "sessions"
+    c1.mkdir(parents=True)
+    c2.mkdir(parents=True)
+    (c1 / "rollout-a.jsonl").write_text(_codex_lines(inp=100), "utf-8")
+    (c2 / "rollout-b.jsonl").write_text(_codex_lines(inp=200), "utf-8")
+    both = [
+        Root("codex", tmp_path / ".codex", c1, "auto"),
+        Root("codex-win", tmp_path / ".codex-win", c2, "config"),
+    ]
+    toggled = [both[0], Root("codex-win", tmp_path / ".codex-win", c2, "config", enabled=False)]
+    monkeypatch.setattr(engine_module, "discover_claude_roots", lambda cfg: [])
+    state = {"codex": both}
+    monkeypatch.setattr(engine_module, "discover_codex_roots", lambda *a, **k: state["codex"])
+    monkeypatch.setattr(engine_module, "LIMITS_CACHE_JSON", tmp_path / "limits.json")
+    cache = tmp_path / "cache.pkl"
+
+    eng = Engine(Config(), cache_path=cache)
+    stale_parser = eng.parser
+    orig_scan = stale_parser.scan
+
+    def scan_with_midflight_toggle(progress=None, cancelled=None):
+        result = orig_scan(progress=progress, cancelled=cancelled)
+        state["codex"] = toggled  # user toggles a codex root while the scan is in flight
+        assert eng.reload_roots() is True
+        return result
+
+    monkeypatch.setattr(stale_parser, "scan", scan_with_midflight_toggle)
+
+    with pytest.raises(ScanCancelled):
+        eng.scan()  # stale scan detects the generation bump and discards itself
+    assert eng.is_scanned is False
+    assert len(stale_parser.records) == 2  # the stale parser read both roots...
+    assert eng.parser.records == []  # ...but the live parser is the fresh swap-in
+
+    eng.save_cache()  # the stale worker's save after the swap must be a no-op
+    assert not cache.exists(), "an EMPTY cache was persisted after the codex root swap"
+
+    eng.scan()  # the relaunch reads exactly the new codex root set
+    assert {r.account for r in eng.parser.records} == {"codex"}
+    eng.save_cache()
+    assert cache.exists()
