@@ -8,6 +8,10 @@ See [VERSIONING.md](VERSIONING.md) for the release policy.
 
 ## [Unreleased]
 
+_No unreleased changes yet._
+
+## [2.4.1] - 2026-07-16
+
 ### Fixed
 
 - **Codex subscription limits now read from the rollouts, per account.** The Codex limit
@@ -327,7 +331,8 @@ formal, pip-installable tool.
   a GitHub Release on each `v*` tag, with PyPI publishing gated on a
   `PYPI_API_TOKEN` secret.
 
-[Unreleased]: https://github.com/ZhuoQiuMcgill/cc-usage/compare/v2.4.0...HEAD
+[Unreleased]: https://github.com/ZhuoQiuMcgill/cc-usage/compare/v2.4.1...HEAD
+[2.4.1]: https://github.com/ZhuoQiuMcgill/cc-usage/compare/v2.4.0...v2.4.1
 [2.4.0]: https://github.com/ZhuoQiuMcgill/cc-usage/compare/v2.3.0...v2.4.0
 [2.3.0]: https://github.com/ZhuoQiuMcgill/cc-usage/compare/v2.2.2...v2.3.0
 [2.2.2]: https://github.com/ZhuoQiuMcgill/cc-usage/compare/v2.2.1...v2.2.2
