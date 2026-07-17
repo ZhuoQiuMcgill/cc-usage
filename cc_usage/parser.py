@@ -415,9 +415,11 @@ class Parser:
         if not buckets:
             return
         # Newest snapshot wins per root. The event timestamp orders them; a snapshot
-        # whose timestamp was unparseable falls back to scan/file order via
-        # captured_at=0.0 — a later such snapshot still replaces an earlier one, and
-        # any real timestamp always outranks a timestamp-less one.
+        # whose timestamp is missing/unparseable falls back to scan/file order via
+        # captured_at=0.0 — a later such snapshot still replaces an earlier one, and any
+        # real timestamp always outranks a timestamp-less one (so a degraded snapshot
+        # never displaces a dated one). Defensive only: real token_count events always
+        # carry a timestamp; this just keeps a malformed one from dropping usable limits.
         captured_at = float(ts) if ts is not None else 0.0
         current = self.latest_rate_limits_by_account.get(account_label)
         current_ts = (current or {}).get("captured_at")

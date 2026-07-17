@@ -369,7 +369,77 @@ def test_snapshot_five_hour_window_label(tmp_path):
     assert _account_buckets(parser)[0].label == "5-HOUR"  # 300 minutes
 
 
-def test_stale_cache_version_is_ignored(tmp_path, monkeypatch):
+def test_snapshot_captured_when_timestamp_absent(tmp_path):
+    path = tmp_path / "rollout.jsonl"
+    path.write_text(
+        _line(
+            {  # no "timestamp" key at all
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "rate_limits": {"primary": _win(28.0, 10080, 1_784_825_747), "secondary": None},
+                },
+            }
+        ),
+        "utf-8",
+    )
+    parser = Parser({})
+    parser.ingest_file(path)
+    # Guards the capture-before-timestamp-guard placement: limits survive a missing ts.
+    assert _account_buckets(parser)[0].used_percentage == 28.0
+
+
+def test_snapshot_captured_when_timestamp_unparseable(tmp_path):
+    path = tmp_path / "rollout.jsonl"
+    path.write_text(
+        _line(
+            {
+                "timestamp": "not-a-real-date",
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "rate_limits": {"primary": _win(28.0, 10080, 1_784_825_747), "secondary": None},
+                },
+            }
+        ),
+        "utf-8",
+    )
+    parser = Parser({})
+    parser.ingest_file(path)
+    assert _account_buckets(parser)[0].used_percentage == 28.0
+
+
+def test_snapshot_survives_active_to_archive_move(tmp_path):
+    """Spec R1: an active->archive rollout move must not lose the snapshot. It is keyed by
+    account label (not path), and the cache's basename remap keeps per-file state, so the
+    warm scan after the move still reports the same limits."""
+    active = tmp_path / "sessions"
+    archived = tmp_path / "archived_sessions"
+    active.mkdir()
+    archived.mkdir()
+    name = "rollout-2026-07-16T10-00-00-019f6cfe-144f-7001-b878-487df6d4efc6.jsonl"
+    (active / name).write_text(
+        _rate_line("2026-07-16T10:00:00Z", primary=_win(28.0, 10080, 222)), "utf-8"
+    )
+    cache = tmp_path / "parse-cache.pkl"
+    roots = [(active, "codex"), (archived, "codex")]
+
+    cold = Parser({}, cache_path=cache, roots=roots)
+    cold.scan()
+    cold.save_cache()
+    assert _account_buckets(cold, "codex")[0].used_percentage == 28.0
+
+    (active / name).rename(archived / name)  # active -> archive, same basename
+    warm = Parser({}, cache_path=cache, roots=roots)
+    warm.scan()
+    assert _account_buckets(warm, "codex")[0].used_percentage == 28.0  # snapshot retained
+
+
+def test_v6_shaped_cache_is_discarded_and_rebuilt(tmp_path, monkeypatch):
+    """A real pre-T13 (v6) parse cache carries the old single `latest_rate_limits` key. It
+    must be discarded on load — not mis-read — and rebuilt once from disk."""
+    import pickle
+
     import cc_usage.parser as parser_module
 
     rollout = tmp_path / "rollout.jsonl"
@@ -378,14 +448,33 @@ def test_stale_cache_version_is_ignored(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(parser_module, "PROJECTS_DIR", tmp_path)
     cache = tmp_path / "parse-cache.pkl"
-    cold = Parser({}, cache_path=cache)
-    cold.scan()
-    cold.save_cache()
 
-    # Simulate a format upgrade: the on-disk cache now predates the running version.
-    monkeypatch.setattr(parser_module, "_CACHE_VERSION", parser_module._CACHE_VERSION + 1)
+    fp = Parser({}, cache_path=cache)  # to compute matching fingerprints for the fake cache
+    stale = {
+        "version": 6,
+        "pricing_fp": fp._pricing_fingerprint(),
+        "roots_fp": fp._roots_fingerprint(),
+        "files": {},
+        "records": [],
+        "keys": [],
+        "codex": {
+            "file_models": {},
+            "pending": {},
+            "totals": {},
+            # The old single-snapshot key with a bogus 99% that must never surface.
+            "latest_rate_limits": {
+                "captured_at": 1.0,
+                "source": "codex",
+                "rate_limits": {"codex_primary": {"used_percentage": 99.0, "resets_at": 1.0}},
+            },
+        },
+    }
+    with cache.open("wb") as fh:
+        pickle.dump(stale, fh)
+
     warm = Parser({}, cache_path=cache)
-    assert warm.prime_cache() is False  # stale version rejected, not primed
-    warm.scan()  # rebuilds straight from disk
+    assert warm.prime_cache() is False  # v6 rejected on version mismatch
+    assert warm.latest_rate_limits_by_account == {}  # the stale 99% was not adopted
+    warm.scan()  # rebuild straight from the rollout
     capture = next(iter(warm.latest_rate_limits_by_account.values()))
-    assert get_buckets(capture)[0].used_percentage == 28.0
+    assert get_buckets(capture)[0].used_percentage == 28.0  # real value, not the stale 99%

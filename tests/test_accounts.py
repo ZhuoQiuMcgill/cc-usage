@@ -734,6 +734,51 @@ def test_codex_expired_snapshot_zeroes_honestly():
     assert "0%" in line and "reset" in line  # expired snapshot renders 0% + reset ago, honestly
 
 
+def test_sync_codex_limits_rebinds_rather_than_mutating():
+    """The sync must rebind `limit_captures` to a fresh dict, never mutate the live one
+    in place: a concurrent reader (snapshot()'s rl_present scan / the limits-cache save on
+    the refresh worker) would otherwise hit `dict changed size during iteration`. This
+    fails deterministically if anyone regresses to an in-place write."""
+    eng = _engine_with([_rec("codex", cost=1.0, inp=10)], [], ["codex"])
+    eng.parser.latest_rate_limits_by_account = {"codex": _codex_snap(28.0, NOW + 3600, NOW)}
+    before = eng.limit_captures
+    eng._sync_codex_limits()
+    assert eng.limit_captures is not before  # rebound to a new object
+    assert "codex:codex" not in before  # the previously-published dict was NOT mutated
+    assert _codex_pct(eng, "codex") == 28.0
+
+
+def test_disabled_codex_root_capture_is_pruned_on_sync():
+    eng = _engine_with([_rec("codex", cost=1.0, inp=10)], [], ["codex"])
+    # A stale capture from a codex root that is no longer enabled, alongside the live one.
+    eng.limit_captures = {"codex:codex-gone": _codex_snap(50.0, NOW + 3600, NOW)}
+    eng.parser.latest_rate_limits_by_account = {"codex": _codex_snap(28.0, NOW + 3600, NOW)}
+    eng._sync_codex_limits()
+    assert "codex:codex-gone" not in eng.limit_captures  # pruned: its root is not enabled
+    assert _codex_pct(eng, "codex") == 28.0  # the enabled root is synced
+
+
+def test_disabled_codex_key_does_not_pollute_rl_present():
+    # No enabled codex roots, but a stale codex key lingers from a previous config.
+    eng = _engine_with([_rec("personal", cost=1.0, inp=10)], ["personal"], [])
+    eng.limit_captures = {"codex:codex-gone": _codex_snap(50.0, NOW + 3600, NOW)}
+    eng._sync_codex_limits()
+    assert eng.limit_captures == {}  # stale key pruned, nothing left
+    # rl_present must reflect only renderable enabled captures — the stale key can't flip it.
+    assert eng.snapshot(NOW).rl_present is False
+
+
+def test_codex_last_good_survives_when_snapshot_gone():
+    """Engine-level R1 survival: if a codex root's rollout is deleted so the parser holds
+    no live snapshot, the persisted last-good capture is retained (not dropped)."""
+    eng = _engine_with([_rec("codex", cost=1.0, inp=10)], [], ["codex"])
+    last_good = _codex_snap(28.0, NOW + 3600, NOW - 100)
+    eng.limit_captures = {"codex:codex": last_good}
+    eng.parser.latest_rate_limits_by_account = {}  # source rollout gone -> no live snapshot
+    eng._sync_codex_limits()
+    assert eng.limit_captures["codex:codex"] is last_good  # last-good retained
+
+
 # ── R7: engine root reload ──────────────────────────────────────────────────────
 def test_engine_reload_roots_rescans_on_toggle(tmp_path, monkeypatch):
     r1 = _mkroot(tmp_path, "personal")
