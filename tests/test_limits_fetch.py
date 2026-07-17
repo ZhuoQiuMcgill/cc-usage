@@ -71,7 +71,11 @@ def test_normalize_both_providers_keeps_all_scoped_limits():
     claude = normalize_claude_limits(CLAUDE_RESPONSE, now=10)
     codex = normalize_codex_limits(CODEX_RESPONSE, now=20)
     buckets = account_buckets(
-        {"claude:personal": claude, "codex": codex}, ["personal"], multi=False
+        {"claude:personal": claude, "codex:codex": codex},
+        ["personal"],
+        ["codex"],
+        multi_claude=False,
+        multi_codex=False,
     )
 
     assert [bucket.label for bucket in buckets] == [
@@ -121,7 +125,7 @@ def test_provider_cache_contains_results_not_credentials(tmp_path):
     path = tmp_path / "provider-limits.json"
     captures = {
         "claude:personal": normalize_claude_limits(CLAUDE_RESPONSE, now=10),
-        "codex": normalize_codex_limits(CODEX_RESPONSE, now=20),
+        "codex:codex": normalize_codex_limits(CODEX_RESPONSE, now=20),
     }
     save_limits_cache(captures, path)
     assert load_limits_cache(path) == captures

@@ -8,7 +8,21 @@ See [VERSIONING.md](VERSIONING.md) for the release policy.
 
 ## [Unreleased]
 
-_No unreleased changes yet._
+### Fixed
+
+- **Codex subscription limits now read from the rollouts, per account.** The Codex limit
+  rows previously depended on the Codex app-server RPC, which fails on recent codex-cli
+  builds and — even when it works — only ever reflects the account the local codex CLI is
+  logged into. Symptom: the CODEX rows sat at `0% · reset Nd ago · refresh pending` while a
+  second, active Codex root (e.g. a Windows `codex_roots` account read from WSL) went
+  unrepresented. ccusage now captures the rate-limit snapshot that Codex already embeds in
+  each `token_count` rollout event and renders each Codex account's limits from its own
+  newest snapshot — labelled `CODEX 5-HOUR`/`CODEX WEEKLY` for a single root, per-account
+  (`CODEX-WIN WEEKLY`) once there are several. The snapshot persists in the parse cache and
+  survives warm starts. The app-server RPC is still consulted for the default root, where the
+  fresher of {RPC, snapshot} wins; its failure is no longer reported as a warning once a
+  snapshot covers that account. Limits appear straight after a scan with no network fetch.
+  No new network, credentials, or dependencies.
 
 ## [2.4.0] - 2026-07-16
 

@@ -3,6 +3,7 @@
 import json
 import math
 
+from cc_usage.accounts import CODEX_ACCOUNT
 from cc_usage.parser import Parser
 from cc_usage.ratelimits import account_buckets, get_buckets
 
@@ -50,6 +51,25 @@ def _tokens(ts, total, last, *, pct=25, minutes=10080, reset=2_000_000_000):
                     },
                     "secondary": None,
                 },
+            },
+        }
+    )
+
+
+def _win(pct, minutes, reset):
+    return {"used_percent": pct, "window_minutes": minutes, "resets_at": reset}
+
+
+def _rate_line(ts, primary=None, secondary=None):
+    """A token_count event carrying only a rate-limit snapshot (no token info), so it
+    exercises the snapshot capture in isolation without also producing a usage record."""
+    return _line(
+        {
+            "timestamp": ts,
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "rate_limits": {"primary": primary, "secondary": secondary},
             },
         }
     )
@@ -152,8 +172,8 @@ def test_codex_rate_limits_are_available_without_statusline(tmp_path):
     parser = Parser({})
     parser.ingest_file(path)
 
-    capture = parser.latest_rate_limits
-    assert capture is not None
+    # No discovered root -> the snapshot lands under the default codex account label.
+    capture = parser.latest_rate_limits_by_account[CODEX_ACCOUNT]
     assert capture["source"] == "codex"
     buckets = get_buckets(capture)
     assert len(buckets) == 1
@@ -178,7 +198,11 @@ def test_provider_limits_are_combined_not_selected():
         }
     }
     buckets = account_buckets(
-        {"claude:personal": claude, "codex": codex}, ["personal"], multi=False
+        {"claude:personal": claude, "codex:codex": codex},
+        ["personal"],
+        ["codex"],
+        multi_claude=False,
+        multi_codex=False,
     )
     assert [bucket.label for bucket in buckets] == ["CLAUDE 5-HOUR", "CODEX WEEKLY"]
 
@@ -200,5 +224,168 @@ def test_codex_limits_survive_warm_cache(tmp_path, monkeypatch):
     warm.scan()
 
     assert len(warm.records) == 1
-    assert warm.latest_rate_limits == cold.latest_rate_limits
-    assert get_buckets(warm.latest_rate_limits)[0].label == "WEEKLY"
+    assert warm.latest_rate_limits_by_account == cold.latest_rate_limits_by_account
+    capture = next(iter(warm.latest_rate_limits_by_account.values()))
+    assert get_buckets(capture)[0].label == "WEEKLY"
+
+
+# ── T13: rate-limit snapshots captured from rollouts, per codex root ─────────────
+def _account_buckets(parser, label=CODEX_ACCOUNT):
+    return get_buckets(parser.latest_rate_limits_by_account[label])
+
+
+def test_snapshot_primary_only(tmp_path):
+    path = tmp_path / "rollout.jsonl"
+    path.write_text(
+        _rate_line("2026-07-16T10:00:00Z", primary=_win(28.0, 10080, 1_784_825_747)),
+        "utf-8",
+    )
+    parser = Parser({})
+    parser.ingest_file(path)
+    buckets = _account_buckets(parser)
+    assert [(b.label, b.used_percentage, b.resets_at) for b in buckets] == [
+        ("WEEKLY", 28.0, 1_784_825_747)
+    ]
+
+
+def test_snapshot_primary_and_secondary(tmp_path):
+    path = tmp_path / "rollout.jsonl"
+    path.write_text(
+        _rate_line(
+            "2026-07-16T11:00:00Z",
+            primary=_win(28.0, 10080, 1_784_825_747),
+            secondary=_win(5.0, 300, 1_700_000_300),
+        ),
+        "utf-8",
+    )
+    parser = Parser({})
+    parser.ingest_file(path)
+    # codex_primary sorts before codex_secondary: weekly window then 5h window.
+    assert [b.label for b in _account_buckets(parser)] == ["WEEKLY", "5-HOUR"]
+
+
+def test_snapshot_null_primary_and_secondary_skipped(tmp_path):
+    path = tmp_path / "rollout.jsonl"
+    path.write_text(_rate_line("2026-05-01T10:00:00Z", None, None), "utf-8")
+    parser = Parser({})
+    parser.ingest_file(path)
+    assert parser.latest_rate_limits_by_account == {}  # May-era null snapshot: nothing captured
+
+
+def test_snapshot_malformed_window_skipped_not_fatal(tmp_path):
+    path = tmp_path / "rollout.jsonl"
+    path.write_text(
+        _rate_line(
+            "2026-07-16T10:00:00Z",
+            primary={"window_minutes": 10080, "resets_at": 1_784_825_747},  # used_percent missing
+            secondary=_win(5.0, 300, 1_700_000_300),
+        ),
+        "utf-8",
+    )
+    parser = Parser({})
+    parser.ingest_file(path)
+    assert [b.label for b in _account_buckets(parser)] == ["5-HOUR"]  # only the well-formed window
+
+
+def test_snapshot_newest_wins_within_file(tmp_path):
+    path = tmp_path / "rollout.jsonl"
+    path.write_text(
+        _rate_line("2026-07-16T10:00:00Z", primary=_win(10.0, 10080, 111))
+        + _rate_line("2026-07-16T12:00:00Z", primary=_win(28.0, 10080, 222))
+        + _rate_line("2026-07-16T11:00:00Z", primary=_win(19.0, 10080, 333)),  # older ts, later line
+        "utf-8",
+    )
+    parser = Parser({})
+    parser.ingest_file(path)
+    b = _account_buckets(parser)[0]
+    assert (b.used_percentage, b.resets_at) == (28.0, 222)  # newest by event timestamp
+
+
+def test_snapshot_newest_wins_across_files_and_incremental_scans(tmp_path, monkeypatch):
+    import cc_usage.parser as parser_module
+
+    monkeypatch.setattr(parser_module, "PROJECTS_DIR", tmp_path)
+    # Earlier-sorted file carries the newer timestamp -> it wins by ts, not file order.
+    (tmp_path / "a.jsonl").write_text(
+        _rate_line("2026-07-16T12:00:00Z", primary=_win(28.0, 10080, 222)), "utf-8"
+    )
+    later = tmp_path / "b.jsonl"
+    later.write_text(_rate_line("2026-07-16T09:00:00Z", primary=_win(10.0, 10080, 111)), "utf-8")
+
+    parser = Parser({})
+    parser.scan()
+    capture = next(iter(parser.latest_rate_limits_by_account.values()))
+    assert get_buckets(capture)[0].used_percentage == 28.0
+
+    # A newer snapshot appended on a later incremental scan replaces the current one.
+    with later.open("a", encoding="utf-8") as fh:
+        fh.write(_rate_line("2026-07-16T15:00:00Z", primary=_win(42.0, 10080, 444)))
+    parser.scan()
+    capture = next(iter(parser.latest_rate_limits_by_account.values()))
+    assert get_buckets(capture)[0].used_percentage == 42.0
+
+
+def test_snapshot_captured_per_codex_root(tmp_path):
+    root_a, root_b = tmp_path / "a", tmp_path / "b"
+    root_a.mkdir()
+    root_b.mkdir()
+    (root_a / "r.jsonl").write_text(
+        _rate_line("2026-07-16T10:00:00Z", primary=_win(28.0, 10080, 111)), "utf-8"
+    )
+    (root_b / "r.jsonl").write_text(
+        _rate_line("2026-07-16T10:00:00Z", primary=_win(4.0, 300, 222)), "utf-8"
+    )
+    parser = Parser({}, roots=[(root_a, "codex"), (root_b, "codex-win")])
+    parser.scan()
+    a = _account_buckets(parser, "codex")[0]
+    b = _account_buckets(parser, "codex-win")[0]
+    assert (a.label, a.used_percentage) == ("WEEKLY", 28.0)
+    assert (b.label, b.used_percentage) == ("5-HOUR", 4.0)  # each root keeps its own limits
+
+
+def test_snapshot_window_labels_and_value_passthrough(tmp_path):
+    path = tmp_path / "rollout.jsonl"
+    path.write_text(
+        _rate_line(
+            "2026-07-16T10:00:00Z",
+            primary=_win(28.5, 10080, 1_784_825_747),  # weekly
+            secondary=_win(50.0, 4320, 999),  # 3 days -> humanized, non-standard window
+        ),
+        "utf-8",
+    )
+    parser = Parser({})
+    parser.ingest_file(path)
+    labels = {b.label: b for b in _account_buckets(parser)}
+    assert set(labels) == {"WEEKLY", "3-DAY"}  # 10080->WEEKLY, 4320->3-DAY
+    assert labels["WEEKLY"].used_percentage == 28.5  # float used_percent preserved
+    assert labels["WEEKLY"].resets_at == 1_784_825_747  # resets_at passthrough
+
+
+def test_snapshot_five_hour_window_label(tmp_path):
+    path = tmp_path / "rollout.jsonl"
+    path.write_text(_rate_line("2026-07-16T10:00:00Z", primary=_win(4.0, 300, 555)), "utf-8")
+    parser = Parser({})
+    parser.ingest_file(path)
+    assert _account_buckets(parser)[0].label == "5-HOUR"  # 300 minutes
+
+
+def test_stale_cache_version_is_ignored(tmp_path, monkeypatch):
+    import cc_usage.parser as parser_module
+
+    rollout = tmp_path / "rollout.jsonl"
+    rollout.write_text(
+        _rate_line("2026-07-16T10:00:00Z", primary=_win(28.0, 10080, 222)), "utf-8"
+    )
+    monkeypatch.setattr(parser_module, "PROJECTS_DIR", tmp_path)
+    cache = tmp_path / "parse-cache.pkl"
+    cold = Parser({}, cache_path=cache)
+    cold.scan()
+    cold.save_cache()
+
+    # Simulate a format upgrade: the on-disk cache now predates the running version.
+    monkeypatch.setattr(parser_module, "_CACHE_VERSION", parser_module._CACHE_VERSION + 1)
+    warm = Parser({}, cache_path=cache)
+    assert warm.prime_cache() is False  # stale version rejected, not primed
+    warm.scan()  # rebuilds straight from disk
+    capture = next(iter(warm.latest_rate_limits_by_account.values()))
+    assert get_buckets(capture)[0].used_percentage == 28.0

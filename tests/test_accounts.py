@@ -492,14 +492,18 @@ def test_account_buckets_labeled_per_account_when_multi():
         "claude:personal": normalize_claude_limits(_CLAUDE_RESPONSE, now=1),
         "claude:rdqcc": normalize_claude_limits(_CLAUDE_RESPONSE, now=1),
     }
-    buckets = account_buckets(captures, ["personal", "rdqcc"], multi=True)
+    buckets = account_buckets(
+        captures, ["personal", "rdqcc"], [], multi_claude=True, multi_codex=False
+    )
     labels = [b.label for b in buckets]
     assert labels == ["PERSONAL 5-HOUR", "RDQCC 5-HOUR"]
 
 
 def test_account_buckets_single_account_prefix_is_unchanged():
     captures = {"claude:personal": normalize_claude_limits(_CLAUDE_RESPONSE, now=1)}
-    buckets = account_buckets(captures, ["personal"], multi=False)
+    buckets = account_buckets(
+        captures, ["personal"], [], multi_claude=False, multi_codex=False
+    )
     assert [b.label for b in buckets] == ["CLAUDE 5-HOUR"]  # byte-identical to pre-T11
 
 
@@ -516,22 +520,21 @@ def test_fetch_account_limits_isolates_failures(monkeypatch):
             raise LimitFetchError("rdqcc temporarily unavailable")
         return good
 
-    def boom():
-        raise LimitFetchError("no codex")
-
     monkeypatch.setattr(limits_fetch, "fetch_claude_limits", fake_claude)
-    monkeypatch.setattr(limits_fetch, "fetch_codex_limits", boom)
 
+    # Codex limits are assembled by the engine from snapshots (T13), not here.
     captures, warnings = fetch_account_limits(roots, {"claude:rdqcc": last_good})
     assert captures["claude:personal"] is good  # the healthy account refreshed
     assert captures["claude:rdqcc"] is last_good  # the failed account kept its last-good
     assert any("rdqcc" in w for w in warnings)
 
 
-def test_legacy_bare_claude_limits_cache_key_is_pruned(tmp_path):
-    """A pre-multi-account provider-limits.json holds a bare `claude` key that the
-    per-account renderer can't show. It must be dropped on load (so the panel never
-    claims usable-but-unrenderable data) and never re-saved as cruft."""
+def test_legacy_bare_provider_limits_cache_keys_are_pruned(tmp_path):
+    """A pre-multi-account provider-limits.json holds bare `claude`/`codex` keys the
+    per-account renderer can't attribute to a root. Both must be dropped on load (so the
+    panel never claims usable-but-unrenderable data) and never re-saved as cruft — the
+    codex prune mirrors the T11 bare-`claude` handling now that Codex is per-account
+    (`codex:<label>`, T13)."""
     path = tmp_path / "provider-limits.json"
     legacy = normalize_claude_limits(_CLAUDE_RESPONSE, now=1)
     codex_capture = {
@@ -540,17 +543,26 @@ def test_legacy_bare_claude_limits_cache_key_is_pruned(tmp_path):
         "rate_limits": {"codex_primary": {"used_percentage": 10.0, "resets_at": 999.0}},
     }
     path.write_text(
-        json.dumps({"providers": {"claude": legacy, "codex": codex_capture}}), "utf-8"
+        json.dumps(
+            {
+                "providers": {
+                    "claude": legacy,
+                    "codex": codex_capture,
+                    "codex:codex": codex_capture,
+                }
+            }
+        ),
+        "utf-8",
     )
 
     loaded = load_limits_cache(path)
-    assert set(loaded) == {"codex"}  # bare legacy key pruned, codex kept
+    assert set(loaded) == {"codex:codex"}  # both bare legacy keys pruned, per-account kept
 
     save_limits_cache(loaded, path)  # a later save must not resurrect the cruft
-    assert set(json.loads(path.read_text("utf-8"))["providers"]) == {"codex"}
+    assert set(json.loads(path.read_text("utf-8"))["providers"]) == {"codex:codex"}
 
     # Per-account keys round-trip untouched.
-    per_account = {"claude:personal": legacy}
+    per_account = {"claude:personal": legacy, "codex:win": codex_capture}
     save_limits_cache(per_account, path)
     assert load_limits_cache(path) == per_account
 
@@ -577,7 +589,9 @@ def test_t10_expiry_applies_per_account():
         }
 
     captures = {"claude:personal": cap(NOW - 10, 80.0), "claude:rdqcc": cap(NOW + 3600, 40.0)}
-    buckets = account_buckets(captures, ["personal", "rdqcc"], multi=True)
+    buckets = account_buckets(
+        captures, ["personal", "rdqcc"], [], multi_claude=True, multi_codex=False
+    )
     state = RenderState(windows={}, buckets=buckets, now=NOW, config=Config(), interval=5)
     out = _plain(limits_block(state, THEME))
     lines = [ln for ln in out.splitlines() if ln.strip()]
@@ -585,6 +599,139 @@ def test_t10_expiry_applies_per_account():
     rdqcc = next(ln for ln in lines if "RDQCC" in ln)
     assert "0%" in personal and "reset" in personal  # expired -> zeroed, per account
     assert "40%" in rdqcc and "resets in" in rdqcc  # the other account untouched
+
+
+# ── T13: codex limits from rollout snapshots (per account, RPC precedence) ───────
+def _codex_snap(pct: float, resets: float, captured: float, minutes: int = 10080) -> dict:
+    return {
+        "captured_at": captured,
+        "source": "codex",
+        "rate_limits": {
+            "codex_primary": {
+                "used_percentage": pct,
+                "resets_at": resets,
+                "window_minutes": float(minutes),
+            }
+        },
+    }
+
+
+def _codex_pct(eng: Engine, label: str) -> float:
+    return eng.limit_captures[f"codex:{label}"]["rate_limits"]["codex_primary"]["used_percentage"]
+
+
+def test_codex_default_root_snapshot_beats_older_rpc(monkeypatch):
+    eng = _engine_with([_rec("codex", cost=1.0, inp=10)], [], ["codex"])
+    eng.parser.latest_rate_limits_by_account = {"codex": _codex_snap(28.0, NOW + 3600, NOW)}
+    monkeypatch.setattr(
+        engine_module, "fetch_codex_limits", lambda: _codex_snap(5.0, NOW + 100, NOW - 3600)
+    )
+    eng.refresh_limits()
+    assert _codex_pct(eng, "codex") == 28.0  # fresher transcript snapshot wins over the RPC
+
+
+def test_codex_default_root_rpc_beats_older_snapshot(monkeypatch):
+    eng = _engine_with([_rec("codex", cost=1.0, inp=10)], [], ["codex"])
+    eng.parser.latest_rate_limits_by_account = {"codex": _codex_snap(28.0, NOW + 3600, NOW - 7200)}
+    monkeypatch.setattr(
+        engine_module, "fetch_codex_limits", lambda: _codex_snap(5.0, NOW + 100, NOW)
+    )
+    eng.refresh_limits()
+    assert _codex_pct(eng, "codex") == 5.0  # fresher RPC wins for the default (login) root
+
+
+def test_codex_nondefault_root_ignores_rpc(monkeypatch):
+    eng = _engine_with(
+        [
+            _rec("codex", cost=1.0, inp=10),
+            _rec("codex-win", cost=1.0, inp=10, provider=CODEX_PROVIDER),
+        ],
+        [],
+        ["codex", "codex-win"],
+    )
+    eng.parser.latest_rate_limits_by_account = {
+        "codex": _codex_snap(10.0, NOW + 3600, NOW),
+        "codex-win": _codex_snap(28.0, NOW + 3600, NOW - 99999),  # a stale snapshot...
+    }
+    # ...and a very fresh RPC that must NOT bleed into the non-default (unattributable) root.
+    monkeypatch.setattr(
+        engine_module, "fetch_codex_limits", lambda: _codex_snap(99.0, NOW + 100, NOW + 10_000)
+    )
+    eng.refresh_limits()
+    assert _codex_pct(eng, "codex") == 99.0  # default root takes the fresher RPC
+    assert _codex_pct(eng, "codex-win") == 28.0  # non-default root uses its snapshot alone
+
+
+def test_codex_rpc_warning_suppressed_when_snapshot_covers_default(monkeypatch):
+    eng = _engine_with([_rec("codex", cost=1.0, inp=10)], [], ["codex"])
+    eng.parser.latest_rate_limits_by_account = {"codex": _codex_snap(28.0, NOW + 3600, NOW)}
+
+    def boom():
+        raise LimitFetchError("Codex app-server closed before returning rate limits")
+
+    monkeypatch.setattr(engine_module, "fetch_codex_limits", boom)
+    eng.refresh_limits()
+    assert _codex_pct(eng, "codex") == 28.0  # limits still render from the rollout
+    assert not any("app-server" in w for w in eng.limit_warnings)  # RPC noise suppressed
+
+
+def test_codex_rpc_warning_surfaces_when_nothing_covers_default(monkeypatch):
+    eng = _engine_with([_rec("codex", cost=1.0, inp=10)], [], ["codex"])
+    eng.parser.latest_rate_limits_by_account = {}  # no snapshot at all
+
+    def boom():
+        raise LimitFetchError("Codex app-server closed before returning rate limits")
+
+    monkeypatch.setattr(engine_module, "fetch_codex_limits", boom)
+    eng.refresh_limits()
+    assert "codex:codex" not in eng.limit_captures
+    assert any("app-server" in w for w in eng.limit_warnings)  # surfaced when we have nothing
+
+
+def test_single_codex_snapshot_renders_zero_noise_labels():
+    eng = _engine_with([_rec("codex", cost=1.0, inp=10)], [], ["codex"])
+    eng.parser.latest_rate_limits_by_account = {
+        "codex": {
+            "captured_at": NOW,
+            "source": "codex",
+            "rate_limits": {
+                "codex_primary": {"used_percentage": 28.0, "resets_at": NOW + 3600, "window_minutes": 10080.0},
+                "codex_secondary": {"used_percentage": 4.0, "resets_at": NOW + 300, "window_minutes": 300.0},
+            },
+        }
+    }
+    eng._sync_codex_limits()  # no network: snapshots fold into the limits cache after a scan
+    labels = [b.label for b in eng.snapshot(NOW).buckets]
+    assert labels == ["CODEX WEEKLY", "CODEX 5-HOUR"]  # byte-identical to the RPC-era single-codex rows
+
+
+def test_multi_codex_snapshots_get_per_account_labels():
+    eng = _engine_with(
+        [
+            _rec("codex", cost=1.0, inp=10),
+            _rec("codex-win", cost=1.0, inp=10, provider=CODEX_PROVIDER),
+        ],
+        [],
+        ["codex", "codex-win"],
+    )
+    eng.parser.latest_rate_limits_by_account = {
+        "codex": _codex_snap(10.0, NOW + 3600, NOW),
+        "codex-win": _codex_snap(28.0, NOW + 3600, NOW),
+    }
+    eng._sync_codex_limits()
+    labels = [b.label for b in eng.snapshot(NOW).buckets]
+    assert labels == ["CODEX WEEKLY", "CODEX-WIN WEEKLY"]  # per-account when several codex roots
+
+
+def test_codex_expired_snapshot_zeroes_honestly():
+    eng = _engine_with([_rec("codex", cost=1.0, inp=10)], [], ["codex"])
+    eng.parser.latest_rate_limits_by_account = {
+        "codex": _codex_snap(28.0, NOW - 100, NOW - 3600)  # reset already passed (T10)
+    }
+    eng._sync_codex_limits()
+    out = _plain(limits_block(eng.snapshot(NOW), THEME))
+    line = next(ln for ln in out.splitlines() if "CODEX" in ln)
+    assert "0%" in line and "reset" in line  # expired snapshot renders 0% + reset ago, honestly
 
 
 # ── R7: engine root reload ──────────────────────────────────────────────────────

@@ -44,6 +44,13 @@ def _epoch(value: object) -> float | None:
         return None
 
 
+def captured_at(capture: object) -> float:
+    """The capture's `captured_at`, or -inf when absent — a total order for
+    freshest-wins precedence between an RPC capture and a transcript snapshot (T13)."""
+    value = capture.get("captured_at") if isinstance(capture, dict) else None
+    return float(value) if isinstance(value, (int, float)) else float("-inf")
+
+
 def _capture(provider: str, buckets: dict[str, dict], now: float | None = None) -> dict:
     return {
         "captured_at": float(time.time() if now is None else now),
@@ -331,15 +338,16 @@ def load_limits_cache(path: Path = LIMITS_CACHE_JSON) -> dict[str, dict]:
         return {}
     if not isinstance(providers, dict):
         return {}
-    # Accept the per-account keys (`claude:<label>`, T11) plus `codex`. A bare legacy
-    # `claude` key from a pre-multi-account cache is pruned here — the per-account
-    # renderer can't show it, so keeping it would make the panel claim usable provider
-    # data it cannot render, and it would be re-persisted as cruft on every save.
+    # Accept the per-account keys only (`claude:<label>` from T11, `codex:<label>` from
+    # T13). A bare legacy `claude` or `codex` key from a pre-multi-account cache is
+    # pruned here — the per-account renderer can't attribute it to a root, so keeping it
+    # would make the panel claim usable provider data it cannot render, and it would be
+    # re-persisted as cruft on every save (mirrors the T11 bare-`claude` pruning).
     return {
         name: capture
         for name, capture in providers.items()
         if isinstance(capture, dict)
-        and (name == "codex" or name.startswith("claude:"))
+        and (name.startswith("codex:") or name.startswith("claude:"))
     }
 
 
@@ -375,16 +383,18 @@ def fetch_provider_limits(
 def fetch_account_limits(
     roots, existing: dict[str, dict] | None = None
 ) -> tuple[dict[str, dict], list[str]]:
-    """Fetch each enabled Claude account's + Codex limits (T11 R5).
+    """Fetch each enabled Claude account's limits (T11 R5).
 
     `roots` are the enabled Claude `Root`s. Each account is fetched from its own
     `<root>/.credentials.json` — the access token held only in memory, the default
     account inheriting the env and any other pointed at its config dir for a
     credential refresh. Accounts are isolated: one account's failure keeps its
     last-good capture (carried in `existing`) and appends a warning without
-    blocking the others. Returns captures keyed `claude:<label>` per account plus
-    `codex`, and the collected warnings. Reuses the single-provider fetchers — no
-    forked fetch path.
+    blocking the others. Returns captures keyed `claude:<label>` per account and the
+    collected warnings. Reuses the single-provider fetcher — no forked fetch path.
+
+    Codex limits are assembled separately by the engine from rollout snapshots
+    (T13) — off both the network and render paths — so they are not fetched here.
     """
     captures = dict(existing or {})
     warnings: list[str] = []
@@ -396,8 +406,4 @@ def fetch_account_limits(
             )
         except LimitFetchError as exc:
             warnings.append(f"{root.label}: {exc}")
-    try:
-        captures["codex"] = fetch_codex_limits()
-    except LimitFetchError as exc:
-        warnings.append(str(exc))
     return captures, warnings
