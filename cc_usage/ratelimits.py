@@ -85,20 +85,27 @@ def get_buckets(data: dict | None, provider: str | None = None) -> list[Bucket]:
 
 
 def account_buckets(
-    captures: dict[str, dict], claude_labels: list[str], *, multi: bool
+    captures: dict[str, dict],
+    claude_labels: list[str],
+    codex_labels: list[str],
+    *,
+    multi_claude: bool,
+    multi_codex: bool,
 ) -> list[Bucket]:
-    """Per-account limit buckets (T11 R5), Claude accounts first then Codex.
+    """Per-account limit buckets (T11 R5 / T13), Claude accounts first then Codex.
 
-    `captures` is keyed `claude:<label>` per account plus `codex`. With a single
-    Claude account the prefix stays `CLAUDE …`, byte-identical to before
-    multi-account; with several, each account's buckets are prefixed with the
-    account label (`PERSONAL 5-HOUR`, `RDQCC 5-HOUR`) so they never blur together.
-    Codex buckets always keep the `CODEX` prefix. One account's missing capture
-    simply contributes no rows — it never blocks the others.
+    `captures` is keyed `claude:<label>` and `codex:<label>` per account. With a
+    single account of a provider its prefix stays the provider name (`CLAUDE …`,
+    `CODEX …`), byte-identical to before multi-account; with several, each account's
+    buckets are prefixed with the account label (`PERSONAL 5-HOUR`, `CODEX-WIN
+    WEEKLY`) so they never blur together. One account's missing capture simply
+    contributes no rows — it never blocks the others.
     """
     out: list[Bucket] = []
     for label in claude_labels:
-        prefix = label if multi else "Claude"
+        prefix = label if multi_claude else "Claude"
         out += get_buckets(captures.get(f"claude:{label}"), prefix)
-    out += get_buckets(captures.get("codex"), "Codex")
+    for label in codex_labels:
+        prefix = label if multi_codex else "Codex"
+        out += get_buckets(captures.get(f"codex:{label}"), prefix)
     return out

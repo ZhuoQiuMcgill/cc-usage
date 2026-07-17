@@ -80,7 +80,10 @@ _READ_BUFFER_BYTES = 4 * 1024 * 1024
 # v6: records carry a provider (claude|codex) distinct from the account label, so
 # a second codex root can be its own account (T12) without the account string
 # doubling as the "is Codex" flag; an older v5 cache lacks the field and is dropped.
-_CACHE_VERSION = 6
+# v7: the codex rate-limit snapshot is captured *per codex root* (T13) — the cache
+# stores `latest_rate_limits_by_account` keyed by account label instead of a single
+# `latest_rate_limits`; a v6 cache carries the old key and is dropped (rebuilt once).
+_CACHE_VERSION = 7
 
 
 @dataclass(slots=True)
@@ -266,8 +269,12 @@ class Parser:
         # those records instead of permanently inventing a literal `codex` model.
         self._codex_pending: dict[str, list[UsageRecord]] = {}
         self._codex_totals: dict[str, tuple[int, int, int]] = {}
-        # Canonical local rate-limit capture, newest event across all Codex files.
-        self.latest_rate_limits: dict | None = None
+        # Newest local rate-limit snapshot per codex account label (T13): the account's
+        # freshest `token_count` rate_limits payload, keyed by root label so a second
+        # codex root (`codex-win`) renders its own live limits and never shares the
+        # default account's. Persisted in the parse cache; newest-wins is idempotent
+        # across incremental scans, cancellation/resume, and active->archive moves.
+        self.latest_rate_limits_by_account: dict[str, dict] = {}
 
 
     # ── extraction ────────────────────────────────────────────────────────
@@ -378,11 +385,17 @@ class Parser:
     def _codex_int(value: object) -> int:
         return value if isinstance(value, int) and value >= 0 else 0
 
-    def _capture_codex_limits(self, payload: dict, ts: float) -> None:
+    def _capture_codex_limits(
+        self, payload: dict, ts: float | None, account_label: str
+    ) -> None:
         limits = payload.get("rate_limits")
         if not isinstance(limits, dict):
             return
         buckets: dict[str, dict[str, float]] = {}
+        # One bucket per present window; a null/absent window is simply skipped (May-era
+        # snapshots carry primary/secondary null and contribute nothing) rather than
+        # assumed. `codex_<slot>` keys mirror the RPC normalizer so a single codex root
+        # renders byte-identically whether limits came from the RPC or a rollout.
         for name in ("primary", "secondary"):
             value = limits.get(name)
             if not isinstance(value, dict):
@@ -401,10 +414,21 @@ class Parser:
             buckets[f"codex_{name}"] = bucket
         if not buckets:
             return
-        capture = {"captured_at": ts, "source": "codex", "rate_limits": buckets}
-        current_ts = (self.latest_rate_limits or {}).get("captured_at", float("-inf"))
-        if not isinstance(current_ts, (int, float)) or ts >= current_ts:
-            self.latest_rate_limits = capture
+        # Newest snapshot wins per root. The event timestamp orders them; a snapshot
+        # whose timestamp is missing/unparseable falls back to scan/file order via
+        # captured_at=0.0 — a later such snapshot still replaces an earlier one, and any
+        # real timestamp always outranks a timestamp-less one (so a degraded snapshot
+        # never displaces a dated one). Defensive only: real token_count events always
+        # carry a timestamp; this just keeps a malformed one from dropping usable limits.
+        captured_at = float(ts) if ts is not None else 0.0
+        current = self.latest_rate_limits_by_account.get(account_label)
+        current_ts = (current or {}).get("captured_at")
+        if not isinstance(current_ts, (int, float)) or captured_at >= current_ts:
+            self.latest_rate_limits_by_account[account_label] = {
+                "captured_at": captured_at,
+                "source": "codex",
+                "rate_limits": buckets,
+            }
 
     def _reconcile_codex_model(self, source: str, model: str) -> None:
         """Make a turn_context authoritative for pre-context records in one rollout."""
@@ -437,14 +461,19 @@ class Parser:
             if not record.known and record.model_norm
         }
 
-    def _extract_codex(self, obj: dict, source: str) -> UsageRecord | None:
+    def _extract_codex(
+        self, obj: dict, source: str, account_label: str
+    ) -> UsageRecord | None:
         payload = obj.get("payload")
         if not isinstance(payload, dict) or payload.get("type") != "token_count":
             return None
         ts = parse_timestamp(obj.get("timestamp"))
+        # Capture the rate-limit snapshot before the timestamp guard: a token_count
+        # event carries usable limits even when its token delta is empty (or its own
+        # timestamp is unparseable), so the limits must not be lost with the record.
+        self._capture_codex_limits(payload, ts, account_label)
         if ts is None:
             return None
-        self._capture_codex_limits(payload, ts)
         info = payload.get("info")
         if not isinstance(info, dict):
             return None
@@ -525,18 +554,24 @@ class Parser:
                 self._reconcile_codex_model(source, model)
             return
         self.stats.lines_read += 1
-        rec = self._extract_codex(obj, source) if is_codex else self._extract(obj)
+        # Resolve the account label up front (T12/T13): looked up from the file's path,
+        # falling back to the default label — or, for a codex file scanned outside any
+        # discovered root (ingest_file / a bare _read_new in tests), to `CODEX_ACCOUNT`,
+        # so a stray codex record never masquerades as the default Claude account. It is
+        # needed before extraction because a codex line's rate-limit snapshot is captured
+        # per root even when the line yields no usage record.
+        if account_label is None:
+            account_label = self._account_by_path.get(source)
+        if account_label is None:
+            account_label = CODEX_ACCOUNT if is_codex else self._default_label
+        rec = (
+            self._extract_codex(obj, source, account_label)
+            if is_codex
+            else self._extract(obj)
+        )
         if rec is not None:
-            # Every record takes its root's label (T12): looked up from the file's
-            # path, falling back to the default label — or, for a codex file scanned
-            # outside any discovered root (ingest_file / a bare _read_new in tests),
-            # to `CODEX_ACCOUNT`, so a stray codex record never masquerades as the
-            # default Claude account. The provider is set from the line content and
-            # is what downstream code keys on to recognise Codex.
-            if account_label is None:
-                account_label = self._account_by_path.get(source)
-            if account_label is None:
-                account_label = CODEX_ACCOUNT if is_codex else self._default_label
+            # The provider is set from the line content and is what downstream code keys
+            # on to recognise Codex.
             rec.account = account_label
             rec.provider = CODEX_PROVIDER if is_codex else CLAUDE_PROVIDER
             self.records.append(rec)
@@ -718,7 +753,7 @@ class Parser:
         self._file_models = {}
         self._codex_pending = {}
         self._codex_totals = {}
-        self.latest_rate_limits = None
+        self.latest_rate_limits_by_account = {}
         self._cache_unvalidated = False
 
     def _reconcile_cached_paths(self, current_paths: set[str]) -> bool:
@@ -820,7 +855,7 @@ class Parser:
             file_models = codex.get("file_models", {})
             pending = codex.get("pending", {})
             totals = codex.get("totals", {})
-            latest = codex.get("latest_rate_limits")
+            latest_by_account = codex.get("latest_rate_limits_by_account")
             if (
                 not isinstance(file_models, dict)
                 or not isinstance(pending, dict)
@@ -833,7 +868,15 @@ class Parser:
                 for source, indices in pending.items()
             }
             self._codex_totals = {str(key): tuple(value) for key, value in totals.items()}
-            self.latest_rate_limits = latest if isinstance(latest, dict) else None
+            self.latest_rate_limits_by_account = (
+                {
+                    str(label): capture
+                    for label, capture in latest_by_account.items()
+                    if isinstance(capture, dict)
+                }
+                if isinstance(latest_by_account, dict)
+                else {}
+            )
         except (IndexError, KeyError, OverflowError, TypeError, ValueError):
             self._clear_cache_state()
             return False
@@ -893,7 +936,7 @@ class Parser:
                     for source, records in self._codex_pending.items()
                 },
                 "totals": self._codex_totals,
-                "latest_rate_limits": self.latest_rate_limits,
+                "latest_rate_limits_by_account": self.latest_rate_limits_by_account,
             },
         }
         try:

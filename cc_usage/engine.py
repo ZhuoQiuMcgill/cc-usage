@@ -39,7 +39,10 @@ from .aggregate import (
 )
 from .config import Config, save_config
 from .limits_fetch import (
+    LimitFetchError,
+    captured_at,
     fetch_account_limits,
+    fetch_codex_limits,
     load_limits_cache,
     save_limits_cache,
 )
@@ -83,6 +86,11 @@ class Engine:
             if self.limits_cache_path is not None
             else {}
         )
+        # Guards the copy-and-rebind of `limit_captures` so the UI-thread scan and the
+        # limit-refresh worker serialize their writes instead of racing (T13). Readers
+        # (snapshot()/save) never take it — every writer rebinds a fresh dict, so a
+        # reader only ever iterates a fully-built one. Never held across a network call.
+        self._limits_lock = threading.Lock()
         self.limit_warnings: list[str] = []
         self.last_scan_at: float | None = None
         self.last_scan_seconds: float | None = None
@@ -261,6 +269,7 @@ class Engine:
             self.last_scan_at = time.time()
             self._scanned = True
             self._refresh_account_flags()
+            self._sync_codex_limits()
 
     def prime_cache(self) -> bool:
         """Expose cached aggregates immediately while reconciliation runs later."""
@@ -268,6 +277,7 @@ class Engine:
             return False
         self._scanned = True
         self._refresh_account_flags()
+        self._sync_codex_limits()
         return True
 
     def save_cache(self) -> None:
@@ -289,17 +299,80 @@ class Engine:
 
     # ── heartbeat controls ───────────────────────────────────────────────────
     def refresh_limits(self) -> None:
-        """Fetch each enabled Claude account's + Codex limits; retain last good values
-        on errors (per account, isolated). Single-account behaviour is unchanged."""
-        enabled = [r for r in self.roots if r.enabled]
-        captures, warnings = fetch_account_limits(enabled, self.limit_captures)
-        if "codex" not in captures and self.parser.latest_rate_limits is not None:
-            captures["codex"] = self.parser.latest_rate_limits
-            warnings.append("Codex limits are last-observed local values")
-        self.limit_captures = captures
+        """Refresh each enabled Claude account's limits (network) and reconcile each
+        Codex account's from its rollout snapshots (T13).
+
+        Codex limits render straight from the parsed rollouts (see `_sync_codex_limits`,
+        run after every scan); here we additionally weigh the app-server RPC, which can
+        only speak for the *default* codex root's account — its login. The RPC-failure
+        warning is suppressed once a snapshot already covers that account (it is noise
+        when limits render from files) and surfaces only when we have nothing at all.
+        Per-account isolation: one account's failure keeps its last-good capture."""
+        enabled_claude = [r for r in self.roots if r.enabled]
+        captures, warnings = fetch_account_limits(enabled_claude, self.limit_captures)
+        default_codex = next(
+            (r for r in self.codex_roots if r.enabled and r.source == "auto"), None
+        )
+        rpc_capture: dict | None = None
+        rpc_error: str | None = None
+        if default_codex is not None:
+            try:
+                rpc_capture = fetch_codex_limits()
+            except LimitFetchError as exc:
+                rpc_error = str(exc)
+        # Fold Codex snapshots + RPC onto the freshly-fetched Claude captures and rebind
+        # `limit_captures` once, atomically — never a separate in-place write a concurrent
+        # reader could catch mid-mutation.
+        self._sync_codex_limits(rpc_capture=rpc_capture, base=captures)
+        if rpc_error is not None and f"codex:{default_codex.label}" not in self.limit_captures:
+            warnings.append(rpc_error)
         self.limit_warnings = warnings
         if self.limits_cache_path is not None:
             save_limits_cache(self.limit_captures, self.limits_cache_path)
+
+    def _sync_codex_limits(
+        self, rpc_capture: dict | None = None, base: dict[str, dict] | None = None
+    ) -> None:
+        """Reconcile the Codex limit captures from the parser's per-root snapshots and
+        rebind `self.limit_captures` to a fresh dict (T13). No network.
+
+        Runs after every scan/warm prime so codex limits render from the rollouts with no
+        fetch; `refresh_limits` passes the just-fetched Claude captures as `base` plus the
+        app-server RPC. Precedence per account: the freshest of {live snapshot, last-good
+        capture, and — for the default root only — the RPC} wins; a non-default root can't
+        be attributed to the local RPC. A codex capture for a root no longer enabled is
+        pruned so it neither lingers in the persisted file nor skews `rl_present`.
+
+        The dict is copied, updated, and rebound in one locked step rather than mutated in
+        place: readers on other threads (`snapshot()`'s rl_present scan, the limits-cache
+        save) only ever iterate a fully-built dict, and concurrent writers (a UI-thread
+        scan vs. the limit-refresh worker) serialize instead of losing updates. The lock
+        never spans a network call."""
+        labels = self.codex_labels
+        enabled_keys = {f"codex:{label}" for label in labels}
+        default_label = next(
+            (r.label for r in self.codex_roots if r.enabled and r.source == "auto"), None
+        )
+        snapshots = self.parser.latest_rate_limits_by_account
+        with self._limits_lock:
+            captures = dict(self.limit_captures if base is None else base)
+            for name in [
+                n for n in captures if n.startswith("codex:") and n not in enabled_keys
+            ]:
+                del captures[name]
+            for label in labels:
+                candidates: list[dict] = []
+                snapshot = snapshots.get(label)
+                if snapshot is not None:
+                    candidates.append(snapshot)
+                prior = captures.get(f"codex:{label}")
+                if prior is not None:
+                    candidates.append(prior)
+                if rpc_capture is not None and label == default_label:
+                    candidates.append(rpc_capture)
+                if candidates:
+                    captures[f"codex:{label}"] = max(candidates, key=captured_at)
+            self.limit_captures = captures
 
     def cycle_hb_window(self, step: int = 1) -> str:
         names = list(HEARTBEAT_WINDOW_SECS.keys())
@@ -333,7 +406,13 @@ class Engine:
         windows = aggregate(records, now)
         labels = self.claude_labels
         codex_labels = self.codex_labels
-        buckets = account_buckets(self.limit_captures, labels, multi=self.multi_account)
+        buckets = account_buckets(
+            self.limit_captures,
+            labels,
+            codex_labels,
+            multi_claude=self.multi_account,
+            multi_codex=self.multi_codex,
+        )
         hb = series(records, now, self.hb_window, self.hb_metric)
         # By-account rollup (R4) only in "all" scope, and only when it adds information
         # (>=2 rows: several accounts, or Codex data alongside a Claude account).
@@ -350,11 +429,11 @@ class Engine:
             now=now,
             config=self.config,
             interval=self.config.refresh_interval,
-            # Only account-keyed Claude captures (`claude:<label>`) and `codex` are
-            # renderable by account_buckets; a stray legacy bare `claude` key must not
-            # make the panel claim usable provider data it cannot show.
+            # Only per-account captures (`claude:<label>`, `codex:<label>`) are
+            # renderable by account_buckets; a stray legacy bare `claude`/`codex` key
+            # must not make the panel claim usable provider data it cannot show.
             rl_present=any(
-                capture and (name == "codex" or name.startswith("claude:"))
+                capture and (name.startswith("codex:") or name.startswith("claude:"))
                 for name, capture in self.limit_captures.items()
             ),
             unknown_models=set(self.parser.stats.unknown_models),
