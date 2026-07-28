@@ -41,6 +41,21 @@ def test_bundled_pricing_prices_sonnet_5():
     assert get_rates("claude-sonnet-5[1m]", models) == Rates(3.0, 15.0)
 
 
+def test_bundled_pricing_prices_opus_5():
+    """Claude Opus 5 (claude-opus-5) ships in the pricing table at $5/$25 and
+    resolves through the tolerant matcher, including the [1m] variant Claude Code
+    writes for the 1M-context configuration."""
+    import json
+    from importlib.resources import files
+
+    models = json.loads((files("cc_usage") / "data" / "pricing.json").read_text())["models"]
+    assert models["claude-opus-5"] == {"input": 5.0, "output": 25.0}
+    assert get_rates("claude-opus-5", models) == Rates(5.0, 25.0)
+    assert get_rates("claude-opus-5[1m]", models) == Rates(5.0, 25.0)
+    # Must not collide with the 4-x aliases that share the same tier.
+    assert get_rates("claude-opus-4-8", models) == Rates(5.0, 25.0)
+
+
 def test_bundled_openai_pricing_uses_official_standard_rates():
     import json
     from importlib.resources import files
