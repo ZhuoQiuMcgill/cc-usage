@@ -8,7 +8,13 @@ See [VERSIONING.md](VERSIONING.md) for the release policy.
 
 ## [Unreleased]
 
-_No unreleased changes yet._
+### Added
+
+- **Claude Opus 5 pricing.** `claude-opus-5` is now in the bundled pricing table
+  ($5 input / $25 output per 1M tokens — the same tier as Opus 4.8), so its usage is
+  costed instead of counted as unpriced. Cache read/write costs derive from the input
+  rate as usual, and the id is matched tolerantly, including the `[1m]` variant Claude
+  Code writes for the 1M-context configuration.
 
 ## [2.4.1] - 2026-07-16
 

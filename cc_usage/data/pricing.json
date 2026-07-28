@@ -2,6 +2,7 @@
   "_comment": "Standard API-equivalent USD per 1,000,000 tokens. OpenAI rates sourced from https://developers.openai.com/api/docs/pricing on 2026-07-13. Edit freely; keys are matched tolerantly. Unknown models keep their tokens and are shown as unpriced.",
   "models": {
     "claude-fable-5":    { "input": 10.00, "output": 50.00 },
+    "claude-opus-5":     { "input":  5.00, "output": 25.00 },
     "claude-opus-4-8":   { "input":  5.00, "output": 25.00 },
     "claude-opus-4-7":   { "input":  5.00, "output": 25.00 },
     "claude-opus-4-6":   { "input":  5.00, "output": 25.00 },
