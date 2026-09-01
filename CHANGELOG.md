@@ -8,6 +8,10 @@ See [VERSIONING.md](VERSIONING.md) for the release policy.
 
 ## [Unreleased]
 
+_No unreleased changes yet._
+
+## [2.4.3] - 2026-09-01
+
 ### Fixed
 
 - **A failing Codex app-server can no longer crash the panel.** On a codex CLI that does
@@ -358,7 +362,8 @@ formal, pip-installable tool.
   a GitHub Release on each `v*` tag, with PyPI publishing gated on a
   `PYPI_API_TOKEN` secret.
 
-[Unreleased]: https://github.com/ZhuoQiuMcgill/cc-usage/compare/v2.4.2...HEAD
+[Unreleased]: https://github.com/ZhuoQiuMcgill/cc-usage/compare/v2.4.3...HEAD
+[2.4.3]: https://github.com/ZhuoQiuMcgill/cc-usage/compare/v2.4.2...v2.4.3
 [2.4.2]: https://github.com/ZhuoQiuMcgill/cc-usage/compare/v2.4.1...v2.4.2
 [2.4.1]: https://github.com/ZhuoQiuMcgill/cc-usage/compare/v2.4.0...v2.4.1
 [2.4.0]: https://github.com/ZhuoQiuMcgill/cc-usage/compare/v2.3.0...v2.4.0
