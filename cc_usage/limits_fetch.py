@@ -8,6 +8,7 @@ persisted by ccusage; only normalized percentages and reset timestamps are cache
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import queue
@@ -31,6 +32,16 @@ _CLAUDE_OAUTH_BETA = "oauth-2025-04-20"
 
 class LimitFetchError(RuntimeError):
     """A provider could not return current limits."""
+
+
+class CodexAppServerUnavailable(LimitFetchError):
+    """The local `codex` CLI cannot serve the app-server RPC at all.
+
+    Raised when the executable is missing, cannot start, or the child dies without ever
+    answering `initialize` — an installed CLI without `app-server` exits instantly, so
+    retrying it inside one session only respawns a doomed process. The engine latches on
+    this and stops asking (T14 R4); every other failure stays retryable.
+    """
 
 
 def _epoch(value: object) -> float | None:
@@ -210,7 +221,7 @@ def _codex_executable() -> str:
         found = shutil.which(name)
         if found:
             return found
-    raise LimitFetchError("Codex executable was not found")
+    raise CodexAppServerUnavailable("Codex executable was not found")
 
 
 def _run_codex_rpc(timeout: float = 20) -> dict:
@@ -221,10 +232,16 @@ def _run_codex_rpc(timeout: float = 20) -> dict:
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             text=True,
+            errors="replace",  # a stray non-UTF-8 byte must not raise in the reader thread
             bufsize=1,
         )
     except OSError as exc:
-        raise LimitFetchError(f"Codex app-server could not start: {exc}") from exc
+        # Only "the executable is gone" is permanent. ENOMEM/EAGAIN (fork under memory
+        # pressure) and ETXTBSY (the user is upgrading the CLI in another terminal) are
+        # transient — one unlucky spawn must not disable the RPC for the whole session.
+        fatal = exc.errno == errno.ENOENT
+        error = CodexAppServerUnavailable if fatal else LimitFetchError
+        raise error(f"Codex app-server could not start: {exc}") from exc
     responses: queue.Queue[str | None] = queue.Queue()
 
     def read_stdout() -> None:
@@ -243,6 +260,9 @@ def _run_codex_rpc(timeout: float = 20) -> dict:
         process.stdin.write(json.dumps(message, separators=(",", ":")) + "\n")
         process.stdin.flush()
 
+    # Hoisted out of the `try` because the handler below classifies on it: an app-server
+    # that answered `initialize` has proved it works, so its later death is not permanent.
+    initialized = False
     deadline = time.monotonic() + timeout
     try:
         send(
@@ -258,7 +278,6 @@ def _run_codex_rpc(timeout: float = 20) -> dict:
                 },
             }
         )
-        initialized = False
         while time.monotonic() < deadline:
             try:
                 line = responses.get(timeout=max(0.01, deadline - time.monotonic()))
@@ -270,10 +289,15 @@ def _run_codex_rpc(timeout: float = 20) -> dict:
                 message = json.loads(line)
             except ValueError:
                 continue
+            if not isinstance(message, dict):
+                continue  # the protocol frames objects; a bare scalar/array is not ours
             if message.get("id") == 1 and not initialized:
+                # Set BEFORE the follow-up writes: the flag means "this app-server answered
+                # `initialize`" — what separates a working install that later dies from one
+                # that never spoke at all — and these writes are exactly where it dies.
+                initialized = True
                 send({"method": "initialized", "params": {}})
                 send({"method": "account/rateLimits/read", "id": 2, "params": {}})
-                initialized = True
             elif message.get("id") == 2:
                 error = message.get("error")
                 if error:
@@ -283,8 +307,37 @@ def _run_codex_rpc(timeout: float = 20) -> dict:
                 if not isinstance(result, dict):
                     raise LimitFetchError("Codex returned an invalid rate-limit response")
                 return result
-        raise LimitFetchError("Codex app-server closed before returning rate limits")
+        # The child hung up. Never having answered `initialize` means this CLI cannot
+        # serve app-server at all; hanging up *after* a handshake may well be transient.
+        hangup = LimitFetchError if initialized else CodexAppServerUnavailable
+        raise hangup("Codex app-server closed before returning rate limits")
+    except (OSError, subprocess.SubprocessError, ValueError) as exc:
+        # A child that has already exited leaves us writing into a pipe whose read end is
+        # closed: `stdin.write` raises BrokenPipeError — an OSError, not a LimitFetchError,
+        # so before T14 it escaped this module and killed the TUI. Every failure of talking
+        # to the process is normalized here; LimitFetchError (a RuntimeError) passes through.
+        status = process.poll()
+        if status is not None and not initialized:
+            raise CodexAppServerUnavailable(
+                f"Codex app-server exited before accepting the request (status {status}); "
+                "the installed codex CLI may not support 'app-server'"
+            ) from exc
+        if status is not None:
+            # It DID answer `initialize`, so this CLI supports app-server and just died
+            # mid-request (OOM kill, crash, pkill). Retryable: latching on the exit status
+            # alone would disable a working install for the rest of the session.
+            raise LimitFetchError(
+                f"Codex app-server exited mid-request (status {status})"
+            ) from exc
+        raise LimitFetchError(f"Codex app-server connection failed: {exc}") from exc
     finally:
+        # Close stdin ourselves: left to the interpreter, flushing the dead pipe at GC
+        # prints "Exception ignored while finalizing file … BrokenPipeError" over the TUI.
+        if process.stdin is not None:
+            try:
+                process.stdin.close()
+            except OSError:
+                pass
         try:
             process.terminate()
             process.wait(timeout=3)

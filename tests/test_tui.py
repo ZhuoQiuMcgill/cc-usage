@@ -1059,3 +1059,235 @@ def test_date_range_preset_keeps_literal_calendar_span(tmp_config):
             assert app.screen._compute_range().n_days == 30
 
     asyncio.run(scenario())
+
+
+# ── T14: a background worker must never terminate the app ───────────────────────
+def test_limit_refresh_error_never_kills_the_app(tmp_config, monkeypatch):
+    """The regression guard for the reported crash. Textual's `run_worker` defaults to
+    `exit_on_error=True`, so the BrokenPipeError that escaped the Codex RPC tore down a
+    panel that had been up 22 hours. The worker must absorb it into a visible warning and
+    leave the app running — this fails (app dead) on the pre-fix worker."""
+    app = _app()
+
+    def boom():
+        raise BrokenPipeError(32, "Broken pipe")
+
+    monkeypatch.setattr(app.engine, "refresh_limits", boom)
+
+    async def scenario():
+        async with app.run_test() as pilot:
+            from rich.console import Group
+            from textual.widgets import Static
+
+            app._refresh_limits()  # what the 300 s timer fires
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+
+            assert app.is_running  # the panel SURVIVED the worker failure
+            assert any("BrokenPipeError" in w for w in app.engine.worker_warnings)
+            # …and the failure is on-screen, not swallowed: the panel re-rendered with
+            # the warning in the same footnote surface a Claude login failure uses.
+            notes = app.query_one("#notes", Static).renderable
+            assert isinstance(notes, Group)
+            assert any("BrokenPipeError" in text.plain for text in notes.renderables)
+
+    asyncio.run(scenario())
+
+
+def test_scan_failure_leaves_the_panel_up_with_a_warning(tmp_config, monkeypatch):
+    """Same invariant on the other worker: a scan blowing up used to reach Textual and
+    kill the app. It must leave the app running with the reason on the status line."""
+    from rich.text import Text
+    from textual.widgets import Static
+
+    eng = Engine(Config(), cache_path=None)  # not scanned -> on_mount runs the scan worker
+    monkeypatch.setattr(eng, "prime_cache", lambda: False)
+
+    def boom(progress=None, cancelled=None):
+        raise RuntimeError("transcript cache is corrupt")
+
+    monkeypatch.setattr(eng, "scan", boom)
+    app = CCUsageApp(eng)
+
+    async def scenario():
+        async with app.run_test() as pilot:
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+
+            assert app.is_running  # the panel SURVIVED the failed scan
+            assert app._scan_in_progress is False  # bookkeeping reset -> `r` can retry
+            status = app.query_one("#spend", Static).renderable
+            assert isinstance(status, Text)
+            assert "scan failed" in status.plain and "corrupt" in status.plain
+
+    asyncio.run(scenario())
+
+
+def test_scan_failure_does_not_kill_the_panel_on_the_next_tick(tmp_config, monkeypatch):
+    """The failure the worker guard alone does NOT cover: after a failed scan the panel is
+    still hot, `_on_scan_failed` restarts the cadence, and the refresh timer re-runs the
+    same failing `engine.scan()` on the UI thread — where Textual routes a callback
+    exception to `_handle_exception`, which always exits. Unguarded, this turns an
+    immediate crash into a delayed one a tick later. `r` takes the identical path."""
+    app = _app()  # engine already scanned -> a hot panel, timers running
+    app.config.refresh_interval = 1  # so the data tick lands inside the test
+    calls = []
+
+    def boom(progress=None, cancelled=None):
+        calls.append(1)
+        raise RuntimeError("transcript cache is corrupt")
+
+    monkeypatch.setattr(app.engine, "scan", boom)
+
+    async def scenario():
+        async with app.run_test() as pilot:
+            app._start_background_scan(show_progress=False)  # fails -> _on_scan_failed
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            assert app.is_running
+            assert app._scan_in_progress is False
+
+            ticks = len(calls)
+            for _ in range(80):  # let the restarted 1 s data timer fire at least once
+                await asyncio.sleep(0.05)
+                if len(calls) > ticks:
+                    break
+            assert len(calls) > ticks, "the data timer never re-ran the failing scan"
+            assert app.is_running  # …and the tick did NOT take the app down
+
+            ticks = len(calls)
+            await pilot.press("r")  # action_refresh_now -> _refresh_data, same path
+            await pilot.pause()
+            assert len(calls) > ticks
+            assert app.is_running
+            assert any("scan failed" in w for w in app.engine.worker_warnings)
+
+    asyncio.run(scenario())
+
+
+def test_cache_save_failure_survives_the_limits_refresh(tmp_config, monkeypatch):
+    """Two worker steps produce warnings in the same pass: the cache-save failure is
+    recorded and `refresh_limits` runs immediately after, replacing `limit_warnings`
+    wholesale. The two producers must compose — otherwise the pickle failure is
+    deterministically swallowed before the panel ever renders it."""
+    app = _app()
+    monkeypatch.setattr(app.engine, "scan", lambda progress=None, cancelled=None: None)
+
+    def bad_save():
+        raise RuntimeError("pickle write failed")
+
+    def refresh():
+        app.engine.limit_warnings = ["personal: Claude OAuth access token is unavailable"]
+
+    monkeypatch.setattr(app.engine, "save_cache", bad_save)
+    monkeypatch.setattr(app.engine, "refresh_limits", refresh)
+
+    async def scenario():
+        async with app.run_test() as pilot:
+            from textual.widgets import Static
+
+            app._start_background_scan(show_progress=False)
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+
+            assert app.is_running
+            notes = [t.plain for t in app.query_one("#notes", Static).renderable.renderables]
+            assert any("pickle write failed" in t for t in notes)  # survived the refresh…
+            assert any("OAuth access token" in t for t in notes)  # …next to the engine's own
+
+    asyncio.run(scenario())
+
+
+def test_worker_warning_clears_once_the_step_succeeds(tmp_config, monkeypatch):
+    """A warning that outlives the failure it describes is its own bug: a recovered step
+    must drop its line, while the engine's own limit warnings keep rendering."""
+    app = _app()
+    failing = {"now": True}
+
+    def refresh():
+        if failing["now"]:
+            raise BrokenPipeError(32, "Broken pipe")
+        app.engine.limit_warnings = ["personal: Claude OAuth access token is unavailable"]
+
+    monkeypatch.setattr(app.engine, "refresh_limits", refresh)
+
+    async def scenario():
+        async with app.run_test() as pilot:
+            from textual.widgets import Static
+
+            app._refresh_limits()
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            assert any("BrokenPipeError" in w for w in app.engine.worker_warnings)
+
+            failing["now"] = False
+            app._refresh_limits()  # the next tick succeeds
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+
+            assert app.engine.worker_warnings == []  # cleared, not stuck on a healthy panel
+            notes = [t.plain for t in app.query_one("#notes", Static).renderable.renderables]
+            assert any("OAuth access token" in t for t in notes)  # the other producer intact
+
+    asyncio.run(scenario())
+
+
+def test_worker_guards_never_catch_base_exception(tmp_config, monkeypatch):
+    """Ctrl-C and SystemExit must still reach the interpreter: widening these guards to
+    `except BaseException` would make the app unquittable during a scan, and every other
+    test in this file would still pass."""
+    app = _app()
+
+    def ctrl_c():
+        raise KeyboardInterrupt
+
+    with pytest.raises(KeyboardInterrupt):
+        app._guarded("limit refresh failed", ctrl_c)
+
+    def exiting(progress=None, cancelled=None):
+        raise SystemExit(1)
+
+    monkeypatch.setattr(app.engine, "scan", exiting)
+    with pytest.raises(SystemExit):
+        app._background_scan()
+
+
+def test_worker_warnings_are_rebound_not_mutated(tmp_config):
+    """The worker surface is read by `snapshot()` on another thread while workers write it,
+    so every write must copy-and-rebind. Mutating in place would hand a reader a dict that
+    changes size mid-iteration — the exact bug already found and fixed for limit_captures."""
+    app = _app()
+    before = app.engine._worker_warnings
+    app._note_worker("limit refresh failed", BrokenPipeError(32, "Broken pipe"))
+
+    assert app.engine._worker_warnings is not before  # rebound to a fresh dict
+    assert before == {}  # the previously published map was NOT touched
+    assert any("BrokenPipeError" in w for w in app.engine.worker_warnings)
+
+    published = app.engine._worker_warnings
+    app._note_worker("limit refresh failed", None)  # clearing rebinds as well
+    assert app.engine._worker_warnings is not published
+    assert "limit refresh failed" in published
+
+
+def test_guards_absorb_their_own_bookkeeping_failures(tmp_config, monkeypatch):
+    """`_guarded` promises that nothing escapes — which has to include its own bookkeeping.
+    Recording interpolates the exception, and handing work to the UI thread raises once the
+    app stops running (a quit mid-scan); a guard that re-raised either would be exactly the
+    worker crash it exists to prevent."""
+    app = _app()
+
+    def bad_record(label, message):
+        raise RuntimeError("recorder exploded")
+
+    def work():
+        raise ValueError("the real failure")
+
+    monkeypatch.setattr(app.engine, "record_worker_warning", bad_record)
+    assert app._guarded("limit refresh failed", work) is False  # reported failure, no raise
+
+    def app_is_gone(*_args, **_kwargs):
+        raise RuntimeError("the 'call_from_thread' method requires that the app is running")
+
+    monkeypatch.setattr(app, "call_from_thread", app_is_gone)
+    app._call_ui(app.render_panel)  # teardown must not surface as a worker crash

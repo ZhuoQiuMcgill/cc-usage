@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import threading
 import time
+from collections.abc import Callable
 
 from rich.console import Group
 from rich.text import Text
@@ -69,6 +70,13 @@ ListView { background: $panel; }
 ListView > ListItem { padding: 0 1; }
 ListView > ListItem.--highlight { background: $accent; color: $text; }
 """
+
+
+def _one_line(value: object, limit: int = 120) -> str:
+    """Collapse a failure detail to one bounded line: an exception's `str()` can be
+    multi-line or enormous, and the panel gives a warning exactly one row."""
+    line = " ".join(str(value).split())
+    return line if len(line) <= limit else line[: limit - 1] + "…"
 
 
 class CCUsageApp(App):
@@ -210,16 +218,65 @@ class CCUsageApp(App):
             if update.phase == "parsing" and now - self._progress_last_emit < 0.1:
                 return
             self._progress_last_emit = now
-            self.call_from_thread(self._render_scan_progress, update)
+            self._call_ui(self._render_scan_progress, update)
 
         try:
             self.engine.scan(progress=report, cancelled=self._scan_cancel.is_set)
         except ScanCancelled:
-            self.call_from_thread(self._on_scan_cancelled)
+            self._call_ui(self._on_scan_cancelled)
             return
-        self.engine.save_cache()
-        self.engine.refresh_limits()
-        self.call_from_thread(self._on_initial_scan_done)
+        except Exception as exc:  # a broken scan must leave the panel up, not kill it
+            self._call_ui(self._on_scan_failed, exc)
+            return
+        self._note_worker("scan failed", None)  # recovered: drop any earlier scan warning
+        self._guarded("cache save failed", self.engine.save_cache)
+        self._guarded("limit refresh failed", self.engine.refresh_limits)
+        self._call_ui(self._on_initial_scan_done)
+
+    def _guarded(self, label: str, work: Callable[[], None]) -> bool:
+        """Run one worker/timer step so nothing can escape it. Returns whether it worked.
+
+        `run_worker` defaults to `exit_on_error=True`, and a *timer* callback's exception
+        goes to `_handle_exception`, which always exits: on either thread an unguarded step
+        tears the whole app down — how a BrokenPipeError from the Codex limits RPC killed a
+        panel that had been up 22 hours (T14). Failures degrade to a visible warning; a
+        later success clears it. `BaseException` is deliberately NOT caught, so
+        KeyboardInterrupt / SystemExit still quit."""
+        try:
+            work()
+        except Exception as exc:
+            self._note_worker(label, exc)
+            return False
+        self._note_worker(label, None)
+        return True
+
+    def _note_worker(self, label: str, exc: BaseException | None) -> None:
+        """Record a step's failure under `label` — or, with `exc=None`, note that it
+        succeeded and drop the warning it left behind.
+
+        The warning goes to the engine's worker surface, which renders in the same footnote
+        as a Claude login failure but is NOT the list `refresh_limits` replaces wholesale
+        (that would silently destroy a warning another step recorded a moment earlier).
+        Never raises: a guard that can itself throw is the very bug it exists to prevent."""
+        try:
+            message = None if exc is None else f"{label}: {type(exc).__name__}: {_one_line(exc)}"
+            self.engine.record_worker_warning(label, message)
+        except Exception:
+            return
+
+    def _call_ui(self, callback: Callable[..., object], *args: object) -> None:
+        """Hand work to the UI thread without letting it surface as a worker crash.
+
+        `call_from_thread` raises once the app stops running (a quit mid-scan) and re-raises
+        whatever the callback raised — either would reach Textual's worker and, on a still
+        living app, kill it. A failure here means the panel is going away, so it is recorded
+        rather than propagated."""
+        try:
+            self.call_from_thread(callback, *args)
+        except Exception as exc:
+            self._note_worker("panel update failed", exc)
+        else:
+            self._note_worker("panel update failed", None)
 
     def _consume_pending_rescan(self) -> bool:
         """Relaunch the queued root-toggle rescan once the previous worker is dead."""
@@ -229,6 +286,21 @@ class CCUsageApp(App):
         self._render_scanning()
         self._start_background_scan(show_progress=True)
         return True
+
+    def _on_scan_failed(self, exc: BaseException) -> None:
+        """A scan blew up: keep the app alive and say why (T14 R3). Mirrors
+        `_on_scan_cancelled`'s bookkeeping — same recovery, different message — so `r`
+        can retry and a queued root-toggle rescan still runs."""
+        self._scan_in_progress = False
+        self._note_worker("scan failed", exc)
+        if self._consume_pending_rescan():
+            return
+        if self.engine.is_scanned:
+            self.render_panel()
+            self._start_timers()
+        else:
+            detail = _one_line(exc, 60)  # the status line is one row, shared with the hints
+            self._update_scan_status(f"scan failed: {detail}  ·  r retry  ·  q quit")
 
     def _on_scan_cancelled(self) -> None:
         self._scan_in_progress = False
@@ -266,15 +338,22 @@ class CCUsageApp(App):
             # a second concurrent scan of the same parser is not safe. The worker's
             # completion callback repaints and restarts the cadence.
             return
-        self.engine.scan()
+        # Guarded like the workers: this runs from the refresh timer (and from `r` via
+        # action_refresh_now) on the UI thread, where Textual routes a callback exception to
+        # `_handle_exception` — which always exits the app. Unguarded, one failing scan would
+        # take the panel down on the very next tick instead (T14 R3). Same label as the
+        # worker's scan, so either path recovering clears the one warning.
+        self._guarded("scan failed", self.engine.scan)
         self.render_panel()
 
     def _refresh_limits(self) -> None:
         self.run_worker(self._background_limit_refresh, thread=True, exclusive=True)
 
     def _background_limit_refresh(self) -> None:
-        self.engine.refresh_limits()
-        self.call_from_thread(self.render_panel)
+        # Guarded, then rendered either way: a failed refresh still repaints the panel so
+        # the warning it produced (and the last-good limits) reach the screen (T14 R3).
+        self._guarded("limit refresh failed", self.engine.refresh_limits)
+        self._call_ui(self.render_panel)
 
     def render_panel(self) -> None:
         # The panel widgets live on the base (main) screen. Query *that* screen, not the
