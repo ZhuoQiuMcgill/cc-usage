@@ -18,10 +18,13 @@ See [VERSIONING.md](VERSIONING.md) for the release policy.
   engine, and finally Textual's worker, tearing the whole TUI down with a traceback (reported
   after ~22 hours of uptime). Every failure of talking to the app-server is now normalized to
   a `LimitFetchError` that names the child's exit status, both provider paths in the limits
-  refresh degrade to a warning instead of propagating, and neither background worker (limits
-  refresh or transcript scan) can terminate the app any more: a failure becomes a visible
-  panel warning and the panel keeps running. An app-server that can never work in this
-  session is asked once rather than respawned on every 300 s tick, and the stray
+  refresh degrade to a warning instead of propagating, and no background step — the limits
+  refresh, the transcript scan, or the periodic refresh the panel runs on its own timer (also
+  reached by `r`) — can terminate the app any more: a failure becomes a visible panel warning,
+  the panel keeps running, and the warning clears once that step succeeds again. An
+  app-server that can never work in this session (a missing executable, or a CLI that never
+  answers `initialize`) is asked once rather than respawned on every 300 s tick, while a
+  working install that merely dies mid-request stays retryable. The stray
   `Exception ignored while finalizing file … BrokenPipeError` noise at teardown is gone.
 
 ## [2.4.2] - 2026-07-17

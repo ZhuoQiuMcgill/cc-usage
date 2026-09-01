@@ -8,6 +8,7 @@ persisted by ccusage; only normalized percentages and reset timestamps are cache
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import queue
@@ -231,10 +232,16 @@ def _run_codex_rpc(timeout: float = 20) -> dict:
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             text=True,
+            errors="replace",  # a stray non-UTF-8 byte must not raise in the reader thread
             bufsize=1,
         )
     except OSError as exc:
-        raise CodexAppServerUnavailable(f"Codex app-server could not start: {exc}") from exc
+        # Only "the executable is gone" is permanent. ENOMEM/EAGAIN (fork under memory
+        # pressure) and ETXTBSY (the user is upgrading the CLI in another terminal) are
+        # transient — one unlucky spawn must not disable the RPC for the whole session.
+        fatal = exc.errno == errno.ENOENT
+        error = CodexAppServerUnavailable if fatal else LimitFetchError
+        raise error(f"Codex app-server could not start: {exc}") from exc
     responses: queue.Queue[str | None] = queue.Queue()
 
     def read_stdout() -> None:
@@ -253,6 +260,9 @@ def _run_codex_rpc(timeout: float = 20) -> dict:
         process.stdin.write(json.dumps(message, separators=(",", ":")) + "\n")
         process.stdin.flush()
 
+    # Hoisted out of the `try` because the handler below classifies on it: an app-server
+    # that answered `initialize` has proved it works, so its later death is not permanent.
+    initialized = False
     deadline = time.monotonic() + timeout
     try:
         send(
@@ -268,7 +278,6 @@ def _run_codex_rpc(timeout: float = 20) -> dict:
                 },
             }
         )
-        initialized = False
         while time.monotonic() < deadline:
             try:
                 line = responses.get(timeout=max(0.01, deadline - time.monotonic()))
@@ -280,10 +289,15 @@ def _run_codex_rpc(timeout: float = 20) -> dict:
                 message = json.loads(line)
             except ValueError:
                 continue
+            if not isinstance(message, dict):
+                continue  # the protocol frames objects; a bare scalar/array is not ours
             if message.get("id") == 1 and not initialized:
+                # Set BEFORE the follow-up writes: the flag means "this app-server answered
+                # `initialize`" — what separates a working install that later dies from one
+                # that never spoke at all — and these writes are exactly where it dies.
+                initialized = True
                 send({"method": "initialized", "params": {}})
                 send({"method": "account/rateLimits/read", "id": 2, "params": {}})
-                initialized = True
             elif message.get("id") == 2:
                 error = message.get("error")
                 if error:
@@ -303,10 +317,17 @@ def _run_codex_rpc(timeout: float = 20) -> dict:
         # so before T14 it escaped this module and killed the TUI. Every failure of talking
         # to the process is normalized here; LimitFetchError (a RuntimeError) passes through.
         status = process.poll()
-        if status is not None:
+        if status is not None and not initialized:
             raise CodexAppServerUnavailable(
                 f"Codex app-server exited before accepting the request (status {status}); "
                 "the installed codex CLI may not support 'app-server'"
+            ) from exc
+        if status is not None:
+            # It DID answer `initialize`, so this CLI supports app-server and just died
+            # mid-request (OOM kill, crash, pkill). Retryable: latching on the exit status
+            # alone would disable a working install for the rest of the session.
+            raise LimitFetchError(
+                f"Codex app-server exited mid-request (status {status})"
             ) from exc
         raise LimitFetchError(f"Codex app-server connection failed: {exc}") from exc
     finally:

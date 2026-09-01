@@ -1,5 +1,6 @@
 """Direct Claude and Codex provider-limit fetching."""
 
+import errno
 import io
 import json
 import os
@@ -293,3 +294,100 @@ def test_codex_rpc_write_failure_mid_conversation_is_normalized(tmp_path, monkey
 
     assert "connection failed" in str(excinfo.value)
     assert not isinstance(excinfo.value, limits_fetch.CodexAppServerUnavailable)
+
+
+@posix_stub
+def test_codex_rpc_death_after_the_handshake_stays_retryable(tmp_path, monkeypatch):
+    """A CLI that DOES support app-server: it answers `initialize`, then is killed (OOM,
+    crash, pkill) before our follow-up write. Classifying that on the exit status alone
+    would call a working install 'may not support app-server' and latch it off for the
+    session — the engine would stop asking until the user restarts the panel."""
+    stub = _stub_codex(
+        tmp_path,
+        r"""
+        import os, sys
+        sys.stdin.readline()
+        sys.stdout.write('{"id":1,"result":{}}\n')
+        sys.stdout.flush()
+        os._exit(137)                             # SIGKILL-style death, mid-conversation
+        """,
+    )
+    monkeypatch.setattr(limits_fetch, "_codex_executable", lambda: str(stub))
+    real_popen = limits_fetch.subprocess.Popen
+
+    class _DeadBeforeFollowUp:
+        """Force the losing ordering deterministically: the handshake write goes through,
+        every later one waits for the child to be gone first."""
+
+        def __init__(self, stream, process):
+            self._stream, self._process, self._writes = stream, process, 0
+
+        def write(self, data):
+            self._writes += 1
+            if self._writes > 1:
+                self._process.wait(timeout=10)
+            return self._stream.write(data)
+
+        def flush(self):
+            return self._stream.flush()
+
+        def close(self):
+            return self._stream.close()
+
+    def popen_with_late_writes(*args, **kwargs):
+        process = real_popen(*args, **kwargs)
+        process.stdin = _DeadBeforeFollowUp(process.stdin, process)
+        return process
+
+    monkeypatch.setattr(limits_fetch.subprocess, "Popen", popen_with_late_writes)
+
+    with pytest.raises(LimitFetchError) as excinfo:
+        limits_fetch._run_codex_rpc(timeout=5)
+
+    assert "137" in str(excinfo.value)  # still says what happened
+    # …but is retryable: this install answered `initialize`, so it is not "unavailable".
+    assert not isinstance(excinfo.value, limits_fetch.CodexAppServerUnavailable)
+
+
+def test_spawn_failure_is_permanent_only_when_the_executable_is_gone(monkeypatch):
+    """A fork that fails under memory pressure must not disable the RPC for the session —
+    nor must a moment of ETXTBSY while the user upgrades the codex CLI in another
+    terminal. Only a vanished executable is permanent."""
+    monkeypatch.setattr(limits_fetch, "_codex_executable", lambda: "/nonexistent/codex")
+
+    def out_of_memory(*_args, **_kwargs):
+        raise OSError(errno.ENOMEM, "Cannot allocate memory")
+
+    monkeypatch.setattr(limits_fetch.subprocess, "Popen", out_of_memory)
+    with pytest.raises(LimitFetchError) as transient:
+        limits_fetch._run_codex_rpc(timeout=5)
+    assert not isinstance(transient.value, limits_fetch.CodexAppServerUnavailable)
+
+    def missing(*_args, **_kwargs):
+        raise FileNotFoundError(errno.ENOENT, "No such file or directory")
+
+    monkeypatch.setattr(limits_fetch.subprocess, "Popen", missing)
+    with pytest.raises(limits_fetch.CodexAppServerUnavailable):
+        limits_fetch._run_codex_rpc(timeout=5)
+
+
+@posix_stub
+def test_codex_rpc_ignores_valid_json_that_is_not_an_object(tmp_path, monkeypatch):
+    """The protocol frames objects, but a stray `123` / `[]` / `"text"` line is still valid
+    JSON: calling `.get()` on it raised AttributeError straight out of the module, which is
+    exactly the class of escape this fetcher is supposed to have none of."""
+    stub = _stub_codex(
+        tmp_path,
+        r"""
+        import sys
+        sys.stdin.readline()
+        sys.stdout.write('123\n[]\n"nope"\nnull\n')
+        sys.stdout.flush()
+        """,
+    )
+    monkeypatch.setattr(limits_fetch, "_codex_executable", lambda: str(stub))
+
+    with pytest.raises(LimitFetchError) as excinfo:
+        limits_fetch._run_codex_rpc(timeout=5)
+
+    assert "closed before returning rate limits" in str(excinfo.value)

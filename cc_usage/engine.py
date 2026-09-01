@@ -87,12 +87,19 @@ class Engine:
             if self.limits_cache_path is not None
             else {}
         )
-        # Guards the copy-and-rebind of `limit_captures` so the UI-thread scan and the
-        # limit-refresh worker serialize their writes instead of racing (T13). Readers
-        # (snapshot()/save) never take it — every writer rebinds a fresh dict, so a
-        # reader only ever iterates a fully-built one. Never held across a network call.
+        # Guards the copy-and-rebind of `limit_captures` and of `_worker_warnings` so the
+        # UI-thread scan and the limit-refresh worker serialize their writes instead of
+        # racing (T13). Readers (snapshot()/save) never take it — every writer rebinds a
+        # fresh dict, so a reader only ever iterates a fully-built one. Never held across
+        # a network call.
         self._limits_lock = threading.Lock()
         self.limit_warnings: list[str] = []
+        # Background-worker/timer failures (T14 R3), keyed by the step that failed. Kept
+        # deliberately OUT of `limit_warnings`, which `refresh_limits` replaces wholesale —
+        # a warning recorded by another step moments earlier would simply be destroyed.
+        # Keying by step also bounds the surface: a failure repeating every tick stays one
+        # line, and the step's own success clears it.
+        self._worker_warnings: dict[str, str] = {}
         # Latched "the local codex CLI cannot serve app-server" message (T14 R4). Once set
         # it keeps reporting itself but is never retried: the refresh timer would otherwise
         # respawn a process that dies instantly, every 300 s, for the life of the session.
@@ -354,6 +361,27 @@ class Engine:
         if self.limits_cache_path is not None:
             save_limits_cache(self.limit_captures, self.limits_cache_path)
 
+    @property
+    def worker_warnings(self) -> list[str]:
+        """Current background-worker failures, in the order they were first recorded."""
+        return list(self._worker_warnings.values())
+
+    def record_worker_warning(self, label: str, message: str | None) -> None:
+        """Record a worker failure under `label`, or clear it with `message=None`.
+
+        Copy-and-rebind under the limits lock, exactly like `limit_captures`: `snapshot()`
+        reads this from the UI thread while workers write it, and the scan and limits
+        workers must not lose each other's updates through a read-modify-write race."""
+        with self._limits_lock:
+            if message is None and label not in self._worker_warnings:
+                return  # nothing to clear — no needless rebind on the common success path
+            warnings = dict(self._worker_warnings)
+            if message is None:
+                warnings.pop(label, None)
+            else:
+                warnings[label] = message
+            self._worker_warnings = warnings
+
     def _sync_codex_limits(
         self, rpc_capture: dict | None = None, base: dict[str, dict] | None = None
     ) -> None:
@@ -461,7 +489,7 @@ class Engine:
                 for name, capture in self.limit_captures.items()
             ),
             unknown_models=set(self.parser.stats.unknown_models),
-            warnings=[*self.warnings, *self.limit_warnings],
+            warnings=[*self.warnings, *self.limit_warnings, *self.worker_warnings],
             heartbeat=hb,
             accounts=accounts,
             account_scope=self.account_scope,
