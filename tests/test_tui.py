@@ -1059,3 +1059,65 @@ def test_date_range_preset_keeps_literal_calendar_span(tmp_config):
             assert app.screen._compute_range().n_days == 30
 
     asyncio.run(scenario())
+
+
+# ── T14: a background worker must never terminate the app ───────────────────────
+def test_limit_refresh_error_never_kills_the_app(tmp_config, monkeypatch):
+    """The regression guard for the reported crash. Textual's `run_worker` defaults to
+    `exit_on_error=True`, so the BrokenPipeError that escaped the Codex RPC tore down a
+    panel that had been up 22 hours. The worker must absorb it into a visible warning and
+    leave the app running — this fails (app dead) on the pre-fix worker."""
+    app = _app()
+
+    def boom():
+        raise BrokenPipeError(32, "Broken pipe")
+
+    monkeypatch.setattr(app.engine, "refresh_limits", boom)
+
+    async def scenario():
+        async with app.run_test() as pilot:
+            from rich.console import Group
+            from textual.widgets import Static
+
+            app._refresh_limits()  # what the 300 s timer fires
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+
+            assert app.is_running  # the panel SURVIVED the worker failure
+            assert any("BrokenPipeError" in w for w in app.engine.limit_warnings)
+            # …and the failure is on-screen, not swallowed: the panel re-rendered with
+            # the warning in the same footnote surface a Claude login failure uses.
+            notes = app.query_one("#notes", Static).renderable
+            assert isinstance(notes, Group)
+            assert any("BrokenPipeError" in text.plain for text in notes.renderables)
+
+    asyncio.run(scenario())
+
+
+def test_scan_failure_leaves_the_panel_up_with_a_warning(tmp_config, monkeypatch):
+    """Same invariant on the other worker: a scan blowing up used to reach Textual and
+    kill the app. It must leave the app running with the reason on the status line."""
+    from rich.text import Text
+    from textual.widgets import Static
+
+    eng = Engine(Config(), cache_path=None)  # not scanned -> on_mount runs the scan worker
+    monkeypatch.setattr(eng, "prime_cache", lambda: False)
+
+    def boom(progress=None, cancelled=None):
+        raise RuntimeError("transcript cache is corrupt")
+
+    monkeypatch.setattr(eng, "scan", boom)
+    app = CCUsageApp(eng)
+
+    async def scenario():
+        async with app.run_test() as pilot:
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+
+            assert app.is_running  # the panel SURVIVED the failed scan
+            assert app._scan_in_progress is False  # bookkeeping reset -> `r` can retry
+            status = app.query_one("#spend", Static).renderable
+            assert isinstance(status, Text)
+            assert "scan failed" in status.plain and "corrupt" in status.plain
+
+    asyncio.run(scenario())

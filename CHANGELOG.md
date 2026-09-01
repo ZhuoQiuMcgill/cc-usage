@@ -8,7 +8,21 @@ See [VERSIONING.md](VERSIONING.md) for the release policy.
 
 ## [Unreleased]
 
-_No unreleased changes yet._
+### Fixed
+
+- **A failing Codex app-server can no longer crash the panel.** On a codex CLI that does
+  not accept `app-server --stdio` (e.g. codex-cli 0.135.0, which exits with status 2), the
+  background limits refresh raced the dying child: usually the `initialize` write landed in
+  the pipe buffer and failed gracefully, but when the read end had already closed it raised
+  `BrokenPipeError` — an `OSError`, not a `LimitFetchError` — which escaped the fetcher, the
+  engine, and finally Textual's worker, tearing the whole TUI down with a traceback (reported
+  after ~22 hours of uptime). Every failure of talking to the app-server is now normalized to
+  a `LimitFetchError` that names the child's exit status, both provider paths in the limits
+  refresh degrade to a warning instead of propagating, and neither background worker (limits
+  refresh or transcript scan) can terminate the app any more: a failure becomes a visible
+  panel warning and the panel keeps running. An app-server that can never work in this
+  session is asked once rather than respawned on every 300 s tick, and the stray
+  `Exception ignored while finalizing file … BrokenPipeError` noise at teardown is gone.
 
 ## [2.4.2] - 2026-07-17
 

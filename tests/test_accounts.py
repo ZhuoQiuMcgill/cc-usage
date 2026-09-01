@@ -26,6 +26,7 @@ from cc_usage.aggregate import aggregate_accounts
 from cc_usage.config import Config
 from cc_usage.engine import Engine
 from cc_usage.limits_fetch import (
+    CodexAppServerUnavailable,
     LimitFetchError,
     fetch_account_limits,
     load_limits_cache,
@@ -777,6 +778,87 @@ def test_codex_last_good_survives_when_snapshot_gone():
     eng.parser.latest_rate_limits_by_account = {}  # source rollout gone -> no live snapshot
     eng._sync_codex_limits()
     assert eng.limit_captures["codex:codex"] is last_good  # last-good retained
+
+
+# ── T14: no limits failure may reach the caller (worker) as an exception ─────────
+def test_codex_rpc_unexpected_exception_does_not_propagate(monkeypatch):
+    """D2: `refresh_limits` caught only LimitFetchError, so the BrokenPipeError the RPC
+    used to leak (D1) travelled straight through the engine into Textual's worker and
+    killed the app. Any exception must degrade to a warning with the refresh intact."""
+    eng = _engine_with([_rec("codex", cost=1.0, inp=10)], ["personal"], ["codex"])
+    eng.parser.latest_rate_limits_by_account = {"codex": _codex_snap(28.0, NOW + 3600, NOW)}
+    claude = normalize_claude_limits(_CLAUDE_RESPONSE, now=NOW)
+    monkeypatch.setattr(
+        engine_module,
+        "fetch_account_limits",
+        lambda roots, existing: ({**existing, "claude:personal": claude}, []),
+    )
+
+    def boom():
+        raise BrokenPipeError(32, "Broken pipe")
+
+    monkeypatch.setattr(engine_module, "fetch_codex_limits", boom)
+
+    eng.refresh_limits()  # must return normally
+
+    assert eng.limit_captures["claude:personal"] is claude  # Claude still refreshed
+    assert _codex_pct(eng, "codex") == 28.0  # codex snapshots still folded in
+
+
+def test_claude_fetch_unexpected_exception_keeps_last_good_captures(monkeypatch):
+    """R2, the Claude half: that path had no guard at all at this level. An unexpected
+    failure must keep every last-good capture and surface a warning, never propagate."""
+    eng = _engine_with([_rec("personal", cost=1.0, inp=10)], ["personal"])
+    last_good = normalize_claude_limits(_CLAUDE_RESPONSE, now=NOW)
+    eng.limit_captures = {"claude:personal": last_good}
+
+    def boom(roots, existing):
+        raise RuntimeError("account discovery exploded")
+
+    monkeypatch.setattr(engine_module, "fetch_account_limits", boom)
+
+    eng.refresh_limits()  # must return normally
+
+    assert eng.limit_captures["claude:personal"] is last_good  # last-good untouched
+    assert any("account discovery exploded" in w for w in eng.limit_warnings)
+
+
+def test_codex_rpc_not_respawned_after_a_permanent_failure(monkeypatch):
+    """R4: the 300 s timer respawned the doomed child on every tick, forever. One
+    permanent failure latches — no second spawn — while the warning stays visible."""
+    eng = _engine_with([_rec("codex", cost=1.0, inp=10)], [], ["codex"])
+    eng.parser.latest_rate_limits_by_account = {}  # nothing covers the default root
+    calls = []
+
+    def boom():
+        calls.append(1)
+        raise CodexAppServerUnavailable(
+            "Codex app-server exited before accepting the request (status 2)"
+        )
+
+    monkeypatch.setattr(engine_module, "fetch_codex_limits", boom)
+    eng.refresh_limits()
+    eng.refresh_limits()
+
+    assert len(calls) == 1  # never respawned within the session
+    assert any("status 2" in w for w in eng.limit_warnings)  # and still reported
+
+
+def test_codex_rpc_retried_after_a_transient_failure(monkeypatch):
+    """The other half of R4: only a *permanent* failure latches. A timeout can clear on
+    its own, so the next tick must still try."""
+    eng = _engine_with([_rec("codex", cost=1.0, inp=10)], [], ["codex"])
+    calls = []
+
+    def boom():
+        calls.append(1)
+        raise LimitFetchError("Codex rate-limit fetch timed out")
+
+    monkeypatch.setattr(engine_module, "fetch_codex_limits", boom)
+    eng.refresh_limits()
+    eng.refresh_limits()
+
+    assert len(calls) == 2
 
 
 # ── R7: engine root reload ──────────────────────────────────────────────────────

@@ -2,6 +2,9 @@
 
 import io
 import json
+import os
+import sys
+import textwrap
 
 import pytest
 
@@ -202,3 +205,91 @@ def test_claude_refresh_delegates_to_official_client(tmp_path, monkeypatch):
 
     assert token == "fresh-token"
     assert observed["args"] == ["claude", "--print", "--max-turns", "0", ""]
+
+
+# ── T14: a failing Codex app-server must never escape as a raw OSError ──────────
+def _stub_codex(tmp_path, body: str):
+    """Write an executable stub standing in for the `codex` CLI and return its path.
+
+    The RPC is driven for real against this process: the crash under test lives in the
+    subprocess plumbing itself (a write into a pipe whose read end is gone), so stubbing
+    `_run_codex_rpc` — the function under test — would prove nothing.
+    """
+    script = tmp_path / "codex"
+    script.write_text(f"#!{sys.executable}\n" + textwrap.dedent(body).lstrip(), "utf-8")
+    script.chmod(0o755)
+    return script
+
+
+posix_stub = pytest.mark.skipif(
+    os.name == "nt", reason="the stub CLI is a POSIX shebang script"
+)
+
+
+@posix_stub
+def test_codex_rpc_broken_pipe_surfaces_as_limit_fetch_error(tmp_path, monkeypatch):
+    """The reported v2.4.2 crash. The installed codex CLI exits immediately (status 2);
+    when our `initialize` write loses the race to the closing read end, `stdin.write`
+    raises BrokenPipeError — an OSError, not a LimitFetchError, so it escaped the module
+    and (via Textual's exit_on_error worker) killed the whole panel.
+
+    The ordering is *forced* — wait for the child to die before the first write — because
+    the bug is intermittent by nature and must not be left to timing.
+    """
+    stub = _stub_codex(tmp_path, "import sys\nsys.exit(2)\n")
+    monkeypatch.setattr(limits_fetch, "_codex_executable", lambda: str(stub))
+    real_popen = limits_fetch.subprocess.Popen
+
+    def popen_then_reap(*args, **kwargs):
+        process = real_popen(*args, **kwargs)
+        process.wait(timeout=10)  # the child is gone BEFORE we write -> guaranteed EPIPE
+        return process
+
+    monkeypatch.setattr(limits_fetch.subprocess, "Popen", popen_then_reap)
+
+    with pytest.raises(LimitFetchError) as excinfo:
+        limits_fetch._run_codex_rpc(timeout=5)
+
+    assert "status 2" in str(excinfo.value)  # actionable: names the child's exit status
+    assert isinstance(excinfo.value, limits_fetch.CodexAppServerUnavailable)
+
+
+@posix_stub
+def test_codex_rpc_survivable_ordering_still_raises_limit_fetch_error(
+    tmp_path, monkeypatch
+):
+    """The other side of the same race: the write lands in the pipe buffer before the
+    child hangs up. That ordering was already survivable — pinned here so the fix for the
+    losing ordering cannot change what the caller sees on the winning one."""
+    stub = _stub_codex(tmp_path, "import sys\nsys.stdin.readline()\nsys.exit(2)\n")
+    monkeypatch.setattr(limits_fetch, "_codex_executable", lambda: str(stub))
+
+    with pytest.raises(LimitFetchError) as excinfo:
+        limits_fetch._run_codex_rpc(timeout=5)
+
+    assert "closed before returning rate limits" in str(excinfo.value)
+
+
+@posix_stub
+def test_codex_rpc_write_failure_mid_conversation_is_normalized(tmp_path, monkeypatch):
+    """A child that answers `initialize` and then hangs up on stdin while still running:
+    the follow-up write fails with the process alive, so no exit status can be quoted. It
+    must still be a LimitFetchError — and a retryable one, since the app-server did talk."""
+    stub = _stub_codex(
+        tmp_path,
+        r"""
+        import os, sys, time
+        sys.stdin.readline()                      # take the initialize frame
+        os.close(0)                               # hang up on stdin, stay alive
+        sys.stdout.write('{"id":1,"result":{}}\n')
+        sys.stdout.flush()
+        time.sleep(30)
+        """,
+    )
+    monkeypatch.setattr(limits_fetch, "_codex_executable", lambda: str(stub))
+
+    with pytest.raises(LimitFetchError) as excinfo:
+        limits_fetch._run_codex_rpc(timeout=5)
+
+    assert "connection failed" in str(excinfo.value)
+    assert not isinstance(excinfo.value, limits_fetch.CodexAppServerUnavailable)

@@ -39,6 +39,7 @@ from .aggregate import (
 )
 from .config import Config, save_config
 from .limits_fetch import (
+    CodexAppServerUnavailable,
     LimitFetchError,
     captured_at,
     fetch_account_limits,
@@ -92,6 +93,10 @@ class Engine:
         # reader only ever iterates a fully-built one. Never held across a network call.
         self._limits_lock = threading.Lock()
         self.limit_warnings: list[str] = []
+        # Latched "the local codex CLI cannot serve app-server" message (T14 R4). Once set
+        # it keeps reporting itself but is never retried: the refresh timer would otherwise
+        # respawn a process that dies instantly, every 300 s, for the life of the session.
+        self._codex_rpc_error: str | None = None
         self.last_scan_at: float | None = None
         self.last_scan_seconds: float | None = None
         # Cached "does any Codex usage exist" flag (recomputed each scan) so the account
@@ -307,19 +312,38 @@ class Engine:
         only speak for the *default* codex root's account — its login. The RPC-failure
         warning is suppressed once a snapshot already covers that account (it is noise
         when limits render from files) and surfaces only when we have nothing at all.
-        Per-account isolation: one account's failure keeps its last-good capture."""
+        Per-account isolation: one account's failure keeps its last-good capture.
+
+        Nothing here may raise: this runs on a background worker, and an escaping
+        exception tears the whole TUI down (T14). Both provider paths degrade to a
+        warning, and an RPC that can never succeed in this session is asked only once."""
         enabled_claude = [r for r in self.roots if r.enabled]
-        captures, warnings = fetch_account_limits(enabled_claude, self.limit_captures)
+        try:
+            captures, warnings = fetch_account_limits(enabled_claude, self.limit_captures)
+        except Exception as exc:
+            # `fetch_account_limits` already isolates each account's LimitFetchError, so
+            # anything escaping it is unexpected — and this runs on a worker whose
+            # exceptions terminate the app (T14 R2). Keep every last-good capture, report.
+            captures = dict(self.limit_captures)
+            warnings = [f"Claude limit refresh failed: {exc}"]
         default_codex = next(
             (r for r in self.codex_roots if r.enabled and r.source == "auto"), None
         )
         rpc_capture: dict | None = None
-        rpc_error: str | None = None
-        if default_codex is not None:
+        # A latched failure still warns (the user deserves to know why the RPC is gone)
+        # but is never retried.
+        rpc_error: str | None = self._codex_rpc_error if default_codex is not None else None
+        if default_codex is not None and rpc_error is None:
             try:
                 rpc_capture = fetch_codex_limits()
+            except CodexAppServerUnavailable as exc:
+                rpc_error = self._codex_rpc_error = str(exc)  # permanent: stop asking (R4)
             except LimitFetchError as exc:
                 rpc_error = str(exc)
+            except Exception as exc:
+                # Belt and braces: the RPC normalizes its own failures, but an unexpected
+                # escape must still degrade to a warning rather than reach the worker.
+                rpc_error = f"Codex rate-limit fetch failed: {exc}"
         # Fold Codex snapshots + RPC onto the freshly-fetched Claude captures and rebind
         # `limit_captures` once, atomically — never a separate in-place write a concurrent
         # reader could catch mid-mutation.
