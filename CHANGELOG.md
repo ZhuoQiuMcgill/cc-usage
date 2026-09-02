@@ -8,6 +8,10 @@ See [VERSIONING.md](VERSIONING.md) for the release policy.
 
 ## [Unreleased]
 
+_No unreleased changes yet._
+
+## [2.4.4] - 2026-09-01
+
 ### Added
 
 - **Claude Fable 5.1 pricing.** `claude-fable-5-1` is now in the bundled pricing table
@@ -375,7 +379,8 @@ formal, pip-installable tool.
   a GitHub Release on each `v*` tag, with PyPI publishing gated on a
   `PYPI_API_TOKEN` secret.
 
-[Unreleased]: https://github.com/ZhuoQiuMcgill/cc-usage/compare/v2.4.3...HEAD
+[Unreleased]: https://github.com/ZhuoQiuMcgill/cc-usage/compare/v2.4.4...HEAD
+[2.4.4]: https://github.com/ZhuoQiuMcgill/cc-usage/compare/v2.4.3...v2.4.4
 [2.4.3]: https://github.com/ZhuoQiuMcgill/cc-usage/compare/v2.4.2...v2.4.3
 [2.4.2]: https://github.com/ZhuoQiuMcgill/cc-usage/compare/v2.4.1...v2.4.2
 [2.4.1]: https://github.com/ZhuoQiuMcgill/cc-usage/compare/v2.4.0...v2.4.1
