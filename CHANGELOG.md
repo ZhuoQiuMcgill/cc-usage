@@ -8,7 +8,20 @@ See [VERSIONING.md](VERSIONING.md) for the release policy.
 
 ## [Unreleased]
 
-_No unreleased changes yet._
+### Added
+
+- **Claude Fable 5.1 pricing.** `claude-fable-5-1` is now in the bundled pricing table
+  ($10 input / $50 output per 1M tokens — the same tier as Fable 5, which stays served
+  under its own id), so its usage is costed instead of counted as unpriced. Only a
+  `-YYYYMMDD` date stamp is stripped during matching, so the `-5-1` point-release suffix
+  resolves to its own row rather than collapsing into `claude-fable-5`.
+
+### Fixed
+
+- **Claude Sonnet 5 was priced 50% too high.** The table carried the original $3/$15 list
+  price, but Sonnet 5's $2/$10 introductory rate became the standing rate rather than
+  expiring. Sonnet 5 usage was therefore overstated by half; it is now $2 input / $10
+  output per 1M tokens. Historical Sonnet 5 costs will drop accordingly on the next scan.
 
 ## [2.4.3] - 2026-09-01
 

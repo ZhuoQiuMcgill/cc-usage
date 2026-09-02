@@ -30,15 +30,37 @@ def test_get_rates_known_and_unknown():
 
 
 def test_bundled_pricing_prices_sonnet_5():
-    """Claude Sonnet 5 (claude-sonnet-5) ships in the pricing table at $3/$15 and
-    resolves through the tolerant matcher, including a [1m] variant."""
+    """Claude Sonnet 5 (claude-sonnet-5) ships at $2/$10 and resolves through the
+    tolerant matcher, including a [1m] variant.
+
+    The $2/$10 introductory rate replaced the original $3/$15 list price rather
+    than expiring, so the table tracks $2/$10 as the standing rate."""
     import json
     from importlib.resources import files
 
     models = json.loads((files("cc_usage") / "data" / "pricing.json").read_text())["models"]
-    assert models["claude-sonnet-5"] == {"input": 3.0, "output": 15.0}
-    assert get_rates("claude-sonnet-5", models) == Rates(3.0, 15.0)
-    assert get_rates("claude-sonnet-5[1m]", models) == Rates(3.0, 15.0)
+    assert models["claude-sonnet-5"] == {"input": 2.0, "output": 10.0}
+    assert get_rates("claude-sonnet-5", models) == Rates(2.0, 10.0)
+    assert get_rates("claude-sonnet-5[1m]", models) == Rates(2.0, 10.0)
+
+
+def test_bundled_pricing_prices_fable_5_1():
+    """Claude Fable 5.1 (claude-fable-5-1) ships at $10/$50 — the same tier as
+    Fable 5, which stays served under its own id.
+
+    The point-release suffix must survive normalization: only a `-YYYYMMDD` date
+    stamp is stripped, so `-5-1` stays put and resolves to its own row rather
+    than collapsing into `claude-fable-5`."""
+    import json
+    from importlib.resources import files
+
+    models = json.loads((files("cc_usage") / "data" / "pricing.json").read_text())["models"]
+    assert models["claude-fable-5-1"] == {"input": 10.0, "output": 50.0}
+    assert get_rates("claude-fable-5-1", models) == Rates(10.0, 50.0)
+    assert get_rates("claude-fable-5-1[1m]", models) == Rates(10.0, 50.0)
+    assert normalize_model("claude-fable-5-1") == "claude-fable-5-1"
+    # Fable 5 keeps its own entry and is not shadowed by the point release.
+    assert get_rates("claude-fable-5", models) == Rates(10.0, 50.0)
 
 
 def test_bundled_pricing_prices_opus_5():
