@@ -8,7 +8,14 @@ See [VERSIONING.md](VERSIONING.md) for the release policy.
 
 ## [Unreleased]
 
-_No unreleased changes yet._
+### Added
+
+- **GPT-6 Astra pricing.** `gpt-6-astra` is now in the bundled pricing table with the
+  full OpenAI rate card — $10 input / $50 output per 1M tokens, $1 cached input, $12.50
+  cache writes (1.25x the uncached input rate), and the 272K long-context tier that bills
+  the whole request at 2x input/cache and 1.5x output. Codex Desktop already writes this
+  id, so that usage was being counted but reported as `unpriced`. Rates from
+  https://developers.openai.com/api/docs/pricing (2026-09-01).
 
 ## [2.4.4] - 2026-09-01
 

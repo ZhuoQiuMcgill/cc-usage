@@ -99,6 +99,72 @@ def test_bundled_openai_pricing_uses_official_standard_rates():
     assert get_rates("gpt-5.6", models) == get_rates("gpt-5.6-sol", models)
 
 
+def test_bundled_pricing_prices_gpt_6_astra():
+    """GPT-6 Astra (gpt-6-astra) ships with the full OpenAI rate card: $10/$50
+    standard, $1 cached input, $12.50 cache writes (1.25x input), and the 272K
+    long-context tier at 2x input/cache and 1.5x output.
+
+    Rates from https://developers.openai.com/api/docs/pricing (2026-09-01)."""
+    import json
+    from importlib.resources import files
+
+    models = json.loads((files("cc_usage") / "data" / "pricing.json").read_text())["models"]
+    assert models["gpt-6-astra"] == {
+        "input": 10.0,
+        "cache_read": 1.0,
+        "cache_write": 12.5,
+        "output": 50.0,
+        "long_context_threshold": 272000,
+        "long_context_input_multiplier": 2.0,
+        "long_context_output_multiplier": 1.5,
+    }
+    rates = get_rates("gpt-6-astra", models)
+    assert rates == Rates(
+        input=10.0,
+        output=50.0,
+        cache_read=1.0,
+        cache_write=12.5,
+        long_context_threshold=272000,
+        long_context_input_multiplier=2.0,
+        long_context_output_multiplier=1.5,
+    )
+    # Cache writes are 1.25x the uncached input rate, per the published card.
+    assert rates.cache_write == rates.input * 1.25
+    # Distinct from the gpt-5.6 flagship it sits above, and not aliased to it.
+    assert get_rates("gpt-6-astra", models) != get_rates("gpt-5.6-sol", models)
+
+
+def test_gpt_6_astra_long_context_threshold_is_exclusive():
+    """"More than 272K input tokens" - a prompt exactly at the threshold bills at
+    the standard rate; one token over scales the whole request."""
+    import json
+    from importlib.resources import files
+
+    models = json.loads((files("cc_usage") / "data" / "pricing.json").read_text())["models"]
+    rates = get_rates("gpt-6-astra", models)
+
+    def cost(input_tokens: int, cache_read: int = 0) -> float:
+        return compute_cost(
+            input_tokens=input_tokens,
+            output_tokens=0,
+            cache_read=cache_read,
+            cache_creation_total=0,
+            ephemeral_5m=0,
+            ephemeral_1h=0,
+            rates=rates,
+        )
+
+    assert math.isclose(cost(272_000), 272_000 * 10.0 / 1e6, abs_tol=1e-12)
+    assert math.isclose(cost(272_001), 272_001 * 20.0 / 1e6, abs_tol=1e-12)
+    # The threshold counts cached tokens as input too, so a mostly-cached prompt
+    # can cross it: 100K fresh + 200K cached = 300K -> long-context rates.
+    assert math.isclose(
+        cost(100_000, cache_read=200_000),
+        (100_000 * 20.0 + 200_000 * 2.0) / 1e6,
+        abs_tol=1e-12,
+    )
+
+
 def test_openai_long_context_and_explicit_cache_rates():
     rates = Rates(
         input=5.0,
