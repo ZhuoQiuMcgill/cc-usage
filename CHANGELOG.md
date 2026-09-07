@@ -8,6 +8,10 @@ See [VERSIONING.md](VERSIONING.md) for the release policy.
 
 ## [Unreleased]
 
+_No unreleased changes yet._
+
+## [2.4.5] - 2026-09-01
+
 ### Added
 
 - **GPT-6 Astra pricing.** `gpt-6-astra` is now in the bundled pricing table with the
@@ -386,7 +390,8 @@ formal, pip-installable tool.
   a GitHub Release on each `v*` tag, with PyPI publishing gated on a
   `PYPI_API_TOKEN` secret.
 
-[Unreleased]: https://github.com/ZhuoQiuMcgill/cc-usage/compare/v2.4.4...HEAD
+[Unreleased]: https://github.com/ZhuoQiuMcgill/cc-usage/compare/v2.4.5...HEAD
+[2.4.5]: https://github.com/ZhuoQiuMcgill/cc-usage/compare/v2.4.4...v2.4.5
 [2.4.4]: https://github.com/ZhuoQiuMcgill/cc-usage/compare/v2.4.3...v2.4.4
 [2.4.3]: https://github.com/ZhuoQiuMcgill/cc-usage/compare/v2.4.2...v2.4.3
 [2.4.2]: https://github.com/ZhuoQiuMcgill/cc-usage/compare/v2.4.1...v2.4.2
