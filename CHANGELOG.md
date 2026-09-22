@@ -8,6 +8,10 @@ See [VERSIONING.md](VERSIONING.md) for the release policy.
 
 ## [Unreleased]
 
+_No unreleased changes yet._
+
+## [2.4.6] - 2026-09-22
+
 ### Added
 
 - **Claude Opus 5.5 pricing.** `claude-opus-5-5` is now in the bundled pricing table at
@@ -402,7 +406,8 @@ formal, pip-installable tool.
   a GitHub Release on each `v*` tag, with PyPI publishing gated on a
   `PYPI_API_TOKEN` secret.
 
-[Unreleased]: https://github.com/ZhuoQiuMcgill/cc-usage/compare/v2.4.5...HEAD
+[Unreleased]: https://github.com/ZhuoQiuMcgill/cc-usage/compare/v2.4.6...HEAD
+[2.4.6]: https://github.com/ZhuoQiuMcgill/cc-usage/compare/v2.4.5...v2.4.6
 [2.4.5]: https://github.com/ZhuoQiuMcgill/cc-usage/compare/v2.4.4...v2.4.5
 [2.4.4]: https://github.com/ZhuoQiuMcgill/cc-usage/compare/v2.4.3...v2.4.4
 [2.4.3]: https://github.com/ZhuoQiuMcgill/cc-usage/compare/v2.4.2...v2.4.3
