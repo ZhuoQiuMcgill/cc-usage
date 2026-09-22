@@ -8,6 +8,10 @@ See [VERSIONING.md](VERSIONING.md) for the release policy.
 
 ## [Unreleased]
 
+_No unreleased changes yet._
+
+## [2.5.0] - 2026-09-22
+
 ### Added
 
 - **Per-1M rates on the Models board.** The Models board now shows a `$/M` column after
@@ -421,7 +425,8 @@ formal, pip-installable tool.
   a GitHub Release on each `v*` tag, with PyPI publishing gated on a
   `PYPI_API_TOKEN` secret.
 
-[Unreleased]: https://github.com/ZhuoQiuMcgill/cc-usage/compare/v2.4.6...HEAD
+[Unreleased]: https://github.com/ZhuoQiuMcgill/cc-usage/compare/v2.5.0...HEAD
+[2.5.0]: https://github.com/ZhuoQiuMcgill/cc-usage/compare/v2.4.6...v2.5.0
 [2.4.6]: https://github.com/ZhuoQiuMcgill/cc-usage/compare/v2.4.5...v2.4.6
 [2.4.5]: https://github.com/ZhuoQiuMcgill/cc-usage/compare/v2.4.4...v2.4.5
 [2.4.4]: https://github.com/ZhuoQiuMcgill/cc-usage/compare/v2.4.3...v2.4.4
