@@ -5,7 +5,9 @@ import json
 from importlib.resources import files
 from pathlib import Path
 
+from rich.cells import cell_len
 from rich.console import Console
+from rich.measure import Measurement
 
 import cc_usage.pricing as pricing_module
 from cc_usage.aggregate import ModelAgg, WindowAgg, aggregate_range
@@ -370,6 +372,85 @@ def test_rates_drop_rather_than_squeeze_the_model_column_below_its_floor():
         "$123,456.78",
     ]
     assert "acme-experimental-model" in _plain(build_panel(state), width=100)
+
+
+def test_squeeze_stops_exactly_at_the_floor_and_keeps_priced_names_whole():
+    """The narrowest width that still shows rates squeezes the Model column to exactly
+    13 cells — `gpt-5.6-terra`, the longest bundled priced name, still whole — and one
+    column narrower the board is the plain one, never a cut priced name."""
+    state = _board_state(
+        [
+            ("gpt-5.6-terra", True, 999_900_000, 999_900_000, 999_900_000, 123_456.78),
+            ("codex-unattributed", False, 999_900_000, 999_900_000, 999_900_000, 0.0),
+        ]
+    )
+    theme = get_theme("dark")
+    first = next(
+        w for w in range(40, 131) if "$/M" in _plain(model_block(state, theme), width=w)
+    )
+    squeezed = _plain(model_block(state, theme), width=first)
+    assert _row(squeezed, "gpt-5.6-terra")[0] == "gpt-5.6-terra"
+    assert _row(squeezed, "codex-")[:2] == ["codex-unat…", "*"]  # 13 cells: the floor
+    narrower = _plain(model_block(state, theme), width=first - 1)
+    assert len(RATE_FOOTNOTE) <= first - 1  # the footnote isn't what drops the rates
+    assert _header(narrower) == ["Model", "In", "Out", "Cache", "Cost"]
+    assert "gpt-5.6-terra" in narrower and "…" not in narrower
+
+
+def test_shortened_names_that_would_collide_fall_back_to_the_plain_board():
+    """Cutting `gpt-5.1-codex-max` / `gpt-5.1-codex-mini` to a shared prefix would show
+    two identical labels (with different rates, if both were priced): keep the plain
+    board instead. Wherever rates do show, every Model label is distinct."""
+    rows = [
+        ("gpt-5.6-sol", True, 91_400_000, 8_000_000, 3_900_000_000, 2639.20),
+        ("gpt-5.1-codex-max", False, 40_000_000, 3_000_000, 1_000_000_000, 0.0),
+        ("gpt-5.1-codex-mini", False, 9_000_000, 700_000, 300_000_000, 0.0),
+    ]
+    priced = {
+        **BUNDLED,
+        "gpt-5.1-codex-max": {"input": 1.25, "output": 10.0, "cache_read": 0.125},
+        "gpt-5.1-codex-mini": {"input": 0.25, "output": 2.0, "cache_read": 0.025},
+    }
+    theme = get_theme("dark")
+    for state in (
+        _board_state(rows),
+        _board_state([(mid, True, *rest) for mid, _known, *rest in rows], pricing=priced),
+    ):
+        at_70 = _plain(model_block(state, theme), width=70)
+        assert _header(at_70) == ["Model", "In", "Out", "Cache", "Cost"]
+        assert "gpt-5.1-codex-max" in at_70 and "gpt-5.1-codex-mini" in at_70
+        for width in range(40, 131):
+            out = _plain(model_block(state, theme), width=width)
+            if "$/M" not in out:
+                continue
+            labels = [_row(out, prefix)[0] for prefix in ("gpt-5.6-sol", "gpt-5.1-codex-ma",
+                                                          "gpt-5.1-codex-mi")]
+            assert len(set(labels)) == 3, (width, labels)
+
+
+def test_measurement_matches_what_is_drawn_at_every_width():
+    """Textual sizes the Models widget from `__rich_measure__`, then draws at that size.
+    The measurement must be exactly the width drawn, and drawing at the measured width
+    must give the very same board — rated or plain — as drawing at the offered width."""
+    states = [
+        _board_state(),
+        _board_state(  # short names: here the footnote, not the table, sets the fit
+            [
+                ("claude-opus-5", True, 15_000, 4_300_000, 1_600_000_000, 1075.69),
+                ("claude-fable-5-1", True, 17_000, 1_500_000, 412_900_000, 386.50),
+                ("claude-opus-5-5", True, 1_000, 61_000, 100_500_000, 40.16),
+            ]
+        ),
+    ]
+    theme = get_theme("dark")
+    for state in states:
+        for width in range(40, 131):
+            board = model_block(state, theme)
+            console = Console(file=io.StringIO(), width=width, no_color=True)
+            measured = Measurement.get(console, console.options, board).maximum
+            drawn = _plain(board, width=width)
+            assert max(cell_len(line) for line in drawn.splitlines()) == measured, width
+            assert _plain(board, width=measured) == drawn, width
 
 
 def test_user_pricing_override_drives_the_rates_shown(tmp_path, monkeypatch):

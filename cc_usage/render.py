@@ -485,17 +485,27 @@ class _RatedModelBoard:
     `--once` on any terminal (which never sets `compact`) both get a board that fits:
       * the rated table with full names, if it fits;
       * else the rated table with the Model column squeezed (never below
-        `_MODEL_MIN_WIDTH`) and long names shortened, their ` *` marker kept;
+        `_MODEL_MIN_WIDTH`) and long names shortened, their ` *` marker kept — unless
+        shortening would give two rows the same label (e.g. `gpt-5.1-codex-max` and
+        `gpt-5.1-codex-mini`), which would put different rates on identical names;
       * else the plain board, exactly as it rendered before T16.
     Token, rate and cost cells are never cut. `__rich_measure__` reports the choice made
     at the offered width, so Textual's `width: auto` sizing agrees with the render.
     """
 
-    def __init__(self, build, names: list[str], footnote: Text, plain: Table) -> None:
+    def __init__(
+        self, build, names: list[tuple[str, bool]], footnote: Text, plain: Table
+    ) -> None:
         self._build = build  # (name_width | None) -> rated Table
-        self._name_col = max(cell_len(name) for name in [*names, "Model", "Total"])
+        self._names = names  # (display name, unpriced) per row
+        full = [_fit_name(name, unpriced, None) for name, unpriced in names]
+        self._name_col = max(cell_len(name) for name in [*full, "Model", "Total"])
         self._footnote = footnote
         self._plain = plain
+
+    def _labels_stay_distinct(self, width: int) -> bool:
+        labels = [_fit_name(name, unpriced, width) for name, unpriced in self._names]
+        return len(set(labels)) == len(labels)
 
     def _choose(self, console, options):
         width = options.max_width
@@ -506,7 +516,7 @@ class _RatedModelBoard:
         budget = width - (natural - self._name_col)  # room left for the Model column
         if budget >= self._name_col:
             return Group(full, self._footnote)
-        if budget >= _MODEL_MIN_WIDTH:
+        if budget >= _MODEL_MIN_WIDTH and self._labels_stay_distinct(budget):
             return Group(self._build(budget), self._footnote)
         return self._plain
 
@@ -532,7 +542,7 @@ def model_block(state: RenderState, theme: dict[str, str]):
         return plain
     return _RatedModelBoard(
         lambda name_width: _rated_model_table(theme, win_key, win, rows, cards, name_width),
-        [_fit_name(pretty_model_name(m.model), not m.known, None) for m in rows],
+        [(pretty_model_name(m.model), not m.known) for m in rows],
         Text(RATE_FOOTNOTE, style=theme["dim"]),
         plain,
     )

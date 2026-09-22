@@ -20,8 +20,9 @@ See [VERSIONING.md](VERSIONING.md) for the release policy.
   appear only in the full layout with cost shown, and only when the board fits the width
   it is drawn at. In the TUI that means 76 columns or more; `--once` checks the actual
   terminal width. If a long model id doesn't fit at that width, it is shortened with `…`
-  and keeps its ` *` unpriced marker, but never below 13 characters. Where the rates
-  don't fit at all, the board is drawn exactly as before. The compact layout, cost-off,
+  and keeps its ` *` unpriced marker. It is never shortened below 13 characters, or to
+  a label another row would share. Where the rates don't fit at all, the board is drawn
+  exactly as before. The compact layout, cost-off,
   empty and all-unpriced boards are unchanged.
 
 ## [2.4.6] - 2026-09-22
