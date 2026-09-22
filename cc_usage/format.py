@@ -1,4 +1,4 @@
-"""Human-friendly formatting: token counts (K/M/B), money ($), durations, names."""
+"""Human-friendly formatting: token counts (K/M/B), money ($), rates, durations, names."""
 
 from __future__ import annotations
 
@@ -41,6 +41,16 @@ def human_money(x: float) -> str:
         return f"${x:,.2f}"
     except (TypeError, ValueError):
         return "$0.00"
+
+
+def human_rate(rate: float) -> str:
+    """Price per 1M tokens: 5.0 -> '5.00', 0.25 -> '0.25', 0.075 -> '0.075'.
+
+    Two decimals, or three when two would round the rate off — a $0.075 cache read
+    must never read as '0.07' or '0.08'.
+    """
+    two = f"{rate:.2f}"
+    return two if abs(float(two) - rate) < 1e-9 else f"{rate:.3f}"
 
 
 def human_duration(seconds: float) -> str:

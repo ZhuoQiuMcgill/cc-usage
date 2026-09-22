@@ -497,4 +497,7 @@ class Engine:
             # (Claude labels, plus Codex labels once there is more than one codex root).
             account_names=self._scope_accounts(),
             account_ui=self.account_ui_active,
+            # The exact table the parser priced the records with, so the Models board's
+            # $/M columns show the rates behind the Cost column (T16).
+            pricing=self.parser.pricing,
         )
