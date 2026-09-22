@@ -43,14 +43,21 @@ def human_money(x: float) -> str:
         return "$0.00"
 
 
-def human_rate(rate: float) -> str:
-    """Price per 1M tokens: 5.0 -> '5.00', 0.25 -> '0.25', 0.075 -> '0.075'.
+_RATE_MAX_DECIMALS = 6
 
-    Two decimals, or three when two would round the rate off — a $0.075 cache read
-    must never read as '0.07' or '0.08'.
+
+def human_rate(rate: float) -> str:
+    """Price per 1M tokens: 5.0 -> '5.00', 0.075 -> '0.075', 0.0375 -> '0.0375'.
+
+    At least two decimals, and only as many more as the rate needs to be shown without
+    rounding it off (a $0.075 cache read never reads as '0.07'/'0.08'), up to six.
     """
-    two = f"{rate:.2f}"
-    return two if abs(float(two) - rate) < 1e-9 else f"{rate:.3f}"
+    text = f"{rate:.2f}"
+    for places in range(3, _RATE_MAX_DECIMALS + 1):
+        if abs(float(text) - rate) < 1e-9:
+            break
+        text = f"{rate:.{places}f}"
+    return text
 
 
 def human_duration(seconds: float) -> str:

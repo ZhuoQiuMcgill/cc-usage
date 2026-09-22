@@ -1,0 +1,59 @@
+### compact_60
+Models · last 7d                       
+Model                 Tokens       Cost
+gpt-5.6-sol             4.0B  $2,639.20
+Opus 4.8                1.8B  $2,158.96
+Opus 4.7              710.3M    $901.10
+gpt-5.6-terra         204.6M     $75.00
+gpt-5.6-luna           41.0M      $5.25
+codex-unattributed *    2.2B   unpriced
+Total                   9.0B  $5,779.51
+### nocost_100
+Models · last 7d                           
+Model                     In    Out   Cache
+gpt-5.6-sol            91.4M   8.0M    3.9B
+Opus 4.8                3.4M  22.5M    1.8B
+Opus 4.7                1.2M   9.1M  700.0M
+gpt-5.6-terra           4.0M   600K  200.0M
+gpt-5.6-luna            900K   100K   40.0M
+codex-unattributed *   75.5M   5.6M    2.1B
+Total                 176.4M  45.9M    8.7B
+### full_44
+Models · last 7d                            
+Model                   In   Out  Ca…   Cost
+gpt-5.6-sol           91.…  8.0M  3.…  $2,6…
+Opus 4.8              3.4M  22.…  1.…  $2,1…
+Opus 4.7              1.2M  9.1M  70…  $901…
+gpt-5.6-terra         4.0M  600K  20…  $75.…
+gpt-5.6-luna          900K  100K  40…  $5.25
+codex-unattributed *  75.…  5.6M  2.…  unpr…
+Total                 176…  45.…  8.…  $5,7…
+### full_54
+Models · last 7d                                      
+Model                     In    Out   Cache       Cost
+gpt-5.6-sol            91.4M   8.0M    3.9B  $2,639.20
+Opus 4.8                3.4M  22.5M    1.8B  $2,158.96
+Opus 4.7                1.2M   9.1M  700.0M    $901.10
+gpt-5.6-terra           4.0M   600K  200.0M     $75.00
+gpt-5.6-luna            900K   100K   40.0M      $5.25
+codex-unattributed *   75.5M   5.6M    2.1B   unpriced
+Total                 176.4M  45.9M    8.7B  $5,779.51
+### full_64
+Models · last 7d                                      
+Model                     In    Out   Cache       Cost
+gpt-5.6-sol            91.4M   8.0M    3.9B  $2,639.20
+Opus 4.8                3.4M  22.5M    1.8B  $2,158.96
+Opus 4.7                1.2M   9.1M  700.0M    $901.10
+gpt-5.6-terra           4.0M   600K  200.0M     $75.00
+gpt-5.6-luna            900K   100K   40.0M      $5.25
+codex-unattributed *   75.5M   5.6M    2.1B   unpriced
+Total                 176.4M  45.9M    8.7B  $5,779.51
+### unpriced_100
+Models · last 7d                                  
+Model                    In   Out  Cache      Cost
+codex-unattributed *  75.5M  5.6M   2.1B  unpriced
+Total                 75.5M  5.6M   2.1B  unpriced
+### empty_100
+Models · last 7d                                             
+Model                                    In  Out  Cache  Cost
+no usage in last 7d · s changes default                      

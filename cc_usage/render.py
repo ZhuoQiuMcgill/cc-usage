@@ -18,14 +18,16 @@ import time
 from dataclasses import dataclass, field
 
 from rich import box
+from rich.cells import cell_len
 from rich.console import Group
+from rich.measure import Measurement
 from rich.panel import Panel
 from rich.rule import Rule
 from rich.table import Table
 from rich.text import Text
 
 from .accounts import CODEX_ACCOUNT
-from .aggregate import AccountAgg, RangeAgg, Series, WindowAgg
+from .aggregate import AccountAgg, ModelAgg, RangeAgg, Series, WindowAgg
 from .braille import chart_rows
 from .config import Config
 from .cost import Rates, get_rates
@@ -331,82 +333,45 @@ def heartbeat_renderable(state: RenderState, theme: dict[str, str]):
     return Group(*lines)
 
 
-# T16: one line under the Models table whenever its $/M columns are shown. Kept within
-# the 70 columns a width-76 panel leaves for content, so it never wraps.
-RATE_FOOTNOTE = "$/M = published rate · Cache = read rate; writes bill 1.25-2x input"
+# T16: one dim line under the Models table whenever its $/M columns are shown. The board
+# only shows rates when this fits too (it does within the 70 content columns a 76-col
+# panel leaves), so it never wraps.
+RATE_FOOTNOTE = "$/M = base rate · Cache = read rate; writes & long context cost more"
+# The narrowest the Model column may be squeezed to make room for the rates: the longest
+# bundled priced name (`gpt-5.6-terra`), so only unusually long ids are ever shortened.
+# Any narrower and the board drops its rates instead.
+_MODEL_MIN_WIDTH = 13
+_UNBOUNDED_WIDTH = 10_000
 
 
-def _rate_cells(card: Rates | None) -> list[str]:
-    """Standard-tier In / Out / Cache-read $/M cells for one model row (`—` if unpriced).
-
-    Long-context surcharges are deliberately not shown: the columns carry the published
-    base rate, and the cache rate comes from the engine's own `Rates.cache_read_rate`."""
-    if card is None:
-        return ["—"] * 3
-    return [human_rate(card.input), human_rate(card.output), human_rate(card.cache_read_rate)]
-
-
-def _breakdown_cells(tokens: tuple[int, int, int], rates: list[str] | None) -> list[str]:
-    """In / Out / Cache token cells, each followed by its $/M cell when rates are shown."""
-    cells = [human_tokens(n) for n in tokens]
-    if rates is None:
-        return cells
-    return [cell for pair in zip(cells, rates) for cell in pair]
-
-
-def model_block(state: RenderState, theme: dict[str, str]):
-    win_key = state.config.default_window
-    win = state.windows.get(win_key) or state.windows["all"]
-    show_cost = state.config.show_cost
-    rows = win.models_sorted()
-    # $/M columns (T16): full width only, and only with cost shown — rates are cost
-    # information. An empty window has nothing to price, so it keeps the plain layout.
-    show_rates = show_cost and not state.compact and bool(rows)
-
-    title = f"Models · {_WINDOW_LABEL.get(win_key, win_key)}"
-    t = Table(
+def _models_table(theme: dict[str, str], win_key: str) -> Table:
+    return Table(
         box=None,
         pad_edge=False,
         expand=False,
-        title=title,
+        title=f"Models · {_WINDOW_LABEL.get(win_key, win_key)}",
         title_justify="left",
         title_style=theme["label"],
     )
-    # The rate columns widen the table by ~21 characters. If that overflows (a long
-    # unpriced id such as `codex-unattributed *` on a ~76-col terminal), Rich squeezes
-    # only wrapable columns: make the Model column the sole one, its names ellipsizing on
-    # a single line, so no number is ever truncated. Without rates nothing changes.
-    t.add_column("Model", style=theme["model"], no_wrap=not show_rates)
+
+
+def _plain_model_table(
+    state: RenderState, theme: dict[str, str], win_key: str, win: WindowAgg, rows: list[ModelAgg]
+) -> Table:
+    """The Models board without rates: the pre-T16 table, compact or full, unchanged."""
+    show_cost = state.config.show_cost
+    t = _models_table(theme, win_key)
+    t.add_column("Model", style=theme["model"], no_wrap=True)
     if state.compact:
         t.add_column(
             "Tokens", justify="right", header_style=theme["header"], style=theme["value"]
         )
     else:
-        for label in ("In", "Out", "Cache"):
-            t.add_column(
-                label,
-                justify="right",
-                header_style=theme["header"],
-                style=theme["value"],
-                no_wrap=show_rates,
-            )
-            if show_rates:
-                # Secondary: dim, so the token counts stay the primary read.
-                t.add_column(
-                    "$/M",
-                    justify="right",
-                    header_style=theme["dim"],
-                    style=theme["dim"],
-                    no_wrap=True,
-                )
+        t.add_column("In", justify="right", header_style=theme["header"], style=theme["value"])
+        t.add_column("Out", justify="right", header_style=theme["header"], style=theme["value"])
+        t.add_column("Cache", justify="right", header_style=theme["header"], style=theme["value"])
     if show_cost:
-        t.add_column(
-            "Cost",
-            justify="right",
-            header_style=theme["header"],
-            style=theme["value"],
-            no_wrap=show_rates,
-        )
+        t.add_column("Cost", justify="right", header_style=theme["header"], style=theme["value"])
 
     if not rows:
         span = (2 if state.compact else 4) + (1 if show_cost else 0)
@@ -418,32 +383,159 @@ def model_block(state: RenderState, theme: dict[str, str]):
         name = pretty_model_name(m.model)
         if not m.known:
             name += " *"
-        if state.compact:
-            cells = [name, human_tokens(m.total_tokens)]
-        else:
-            rates = None
-            if show_rates:
-                rates = _rate_cells(get_rates(m.model, state.pricing) if m.known else None)
-                name = Text(name, no_wrap=True, overflow="ellipsis")
-            tokens = (m.input_tokens, m.output_tokens, m.cache_tokens)
-            cells = [name, *_breakdown_cells(tokens, rates)]
+        cells = [name, human_tokens(m.total_tokens)] if state.compact else [
+            name,
+            human_tokens(m.input_tokens),
+            human_tokens(m.output_tokens),
+            human_tokens(m.cache_tokens),
+        ]
         if show_cost:
             cells.append(_cost_label(m.cost, 0 if m.known else m.total_tokens))
         t.add_row(*cells, style=(theme["dim"] if not m.known else None))
 
     t.add_section()
-    if state.compact:
-        total_cells = ["Total", human_tokens(win.total_tokens)]
-    else:
-        # Rates don't aggregate across models: the Total row leaves its $/M cells blank.
-        tokens = (win.input_tokens, win.output_tokens, win.cache_tokens)
-        total_cells = ["Total", *_breakdown_cells(tokens, [""] * 3 if show_rates else None)]
+    total_cells = ["Total", human_tokens(win.total_tokens)] if state.compact else [
+        "Total",
+        human_tokens(win.input_tokens),
+        human_tokens(win.output_tokens),
+        human_tokens(win.cache_tokens),
+    ]
     if show_cost:
         total_cells.append(_cost_label(win.cost, win.unpriced_tokens))
     t.add_row(*total_cells, style=theme["total"])
-    if show_rates:
-        return Group(t, Text(RATE_FOOTNOTE, style=theme["dim"]))
     return t
+
+
+def _rate_cells(card: Rates | None) -> list[str]:
+    """Standard-tier In / Out / Cache-read $/M cells for one model row (`—` if unpriced).
+
+    Long-context surcharges are deliberately not shown (the footnote says they cost
+    more); the cache rate comes from the engine's own `Rates.cache_read_rate`."""
+    if card is None:
+        return ["—"] * 3
+    return [human_rate(card.input), human_rate(card.output), human_rate(card.cache_read_rate())]
+
+
+def _breakdown_cells(tokens: tuple[int, int, int], rates: list[str]) -> list[str]:
+    """In / Out / Cache token cells, each followed by its $/M cell."""
+    cells = [human_tokens(n) for n in tokens]
+    return [cell for pair in zip(cells, rates) for cell in pair]
+
+
+def _fit_name(name: str, unpriced: bool, width: int | None) -> str:
+    """`name` plus the ` *` unpriced marker, shortened with `…` to `width` if needed.
+
+    Only the name is cut: the marker ties the row to the `* price unavailable` footnote,
+    so it always survives."""
+    marker = " *" if unpriced else ""
+    if width is None or cell_len(name + marker) <= width:
+        return name + marker
+    return name[: max(0, width - len(marker) - 1)] + "…" + marker
+
+
+def _rated_model_table(
+    theme: dict[str, str],
+    win_key: str,
+    win: WindowAgg,
+    rows: list[ModelAgg],
+    cards: dict[str, Rates | None],
+    name_width: int | None,
+) -> Table:
+    """The Models board with a `$/M` column after In, Out and Cache (T16).
+
+    `name_width` shortens model names to fit (None = full names). Every column is
+    no-wrap: `_RatedModelBoard` only renders this table at a width it fits."""
+    t = _models_table(theme, win_key)
+    t.add_column("Model", style=theme["model"], no_wrap=True)
+    for label in ("In", "Out", "Cache"):
+        t.add_column(
+            label, justify="right", header_style=theme["header"], style=theme["value"],
+            no_wrap=True,
+        )
+        # Secondary: dim, so the token counts stay the primary read.
+        t.add_column(
+            "$/M", justify="right", header_style=theme["dim"], style=theme["dim"], no_wrap=True
+        )
+    t.add_column(
+        "Cost", justify="right", header_style=theme["header"], style=theme["value"], no_wrap=True
+    )
+    for m in rows:
+        tokens = (m.input_tokens, m.output_tokens, m.cache_tokens)
+        t.add_row(
+            _fit_name(pretty_model_name(m.model), not m.known, name_width),
+            *_breakdown_cells(tokens, _rate_cells(cards[m.model])),
+            _cost_label(m.cost, 0 if m.known else m.total_tokens),
+            style=(theme["dim"] if not m.known else None),
+        )
+    t.add_section()
+    # Rates don't aggregate across models: the Total row leaves its $/M cells blank.
+    t.add_row(
+        "Total",
+        *_breakdown_cells((win.input_tokens, win.output_tokens, win.cache_tokens), [""] * 3),
+        _cost_label(win.cost, win.unpriced_tokens),
+        style=theme["total"],
+    )
+    return t
+
+
+class _RatedModelBoard:
+    """The Models board with its `$/M` columns, when they fit the width it renders at.
+
+    Decided on every render from the real `max_width`, so the TUI at any size and
+    `--once` on any terminal (which never sets `compact`) both get a board that fits:
+      * the rated table with full names, if it fits;
+      * else the rated table with the Model column squeezed (never below
+        `_MODEL_MIN_WIDTH`) and long names shortened, their ` *` marker kept;
+      * else the plain board, exactly as it rendered before T16.
+    Token, rate and cost cells are never cut. `__rich_measure__` reports the choice made
+    at the offered width, so Textual's `width: auto` sizing agrees with the render.
+    """
+
+    def __init__(self, build, names: list[str], footnote: Text, plain: Table) -> None:
+        self._build = build  # (name_width | None) -> rated Table
+        self._name_col = max(cell_len(name) for name in [*names, "Model", "Total"])
+        self._footnote = footnote
+        self._plain = plain
+
+    def _choose(self, console, options):
+        width = options.max_width
+        if self._footnote.cell_len > width:
+            return self._plain
+        full = self._build(None)
+        natural = Measurement.get(console, options.update_width(_UNBOUNDED_WIDTH), full).maximum
+        budget = width - (natural - self._name_col)  # room left for the Model column
+        if budget >= self._name_col:
+            return Group(full, self._footnote)
+        if budget >= _MODEL_MIN_WIDTH:
+            return Group(self._build(budget), self._footnote)
+        return self._plain
+
+    def __rich_console__(self, console, options):
+        yield self._choose(console, options)
+
+    def __rich_measure__(self, console, options):
+        return Measurement.get(console, options, self._choose(console, options))
+
+
+def model_block(state: RenderState, theme: dict[str, str]):
+    win_key = state.config.default_window
+    win = state.windows.get(win_key) or state.windows["all"]
+    rows = win.models_sorted()
+    plain = _plain_model_table(state, theme, win_key, win, rows)
+    # $/M columns (T16) belong to the full layout with cost shown — rates are cost
+    # information — and need at least one row with a rate card: an empty or all-unpriced
+    # window, or a state built without pricing, has nothing to price.
+    if state.compact or not state.config.show_cost:
+        return plain
+    cards = {m.model: (get_rates(m.model, state.pricing) if m.known else None) for m in rows}
+    if all(card is None for card in cards.values()):
+        return plain
+    return _RatedModelBoard(
+        lambda name_width: _rated_model_table(theme, win_key, win, rows, cards, name_width),
+        [_fit_name(pretty_model_name(m.model), not m.known, None) for m in rows],
+        Text(RATE_FOOTNOTE, style=theme["dim"]),
+        plain,
+    )
 
 
 # ── Multi-account (T11) ─────────────────────────────────────────────────────────
