@@ -8,7 +8,19 @@ See [VERSIONING.md](VERSIONING.md) for the release policy.
 
 ## [Unreleased]
 
-_No unreleased changes yet._
+### Added
+
+- **Claude Opus 5.5 pricing.** `claude-opus-5-5` is now in the bundled pricing table at
+  $4 input / $20 output per 1M tokens, with cache reads at $0.20 (0.05x input rather than
+  the usual 0.1x). Cache writes keep the standard 1.25x (5-minute) and 2x (1-hour) rates.
+  Its usage was previously counted but reported as `unpriced`.
+
+### Fixed
+
+- **Claude Fable 5.1 cache reads were priced 4x too high.** Fable 5.1 bills cache reads at
+  $0.25 per 1M tokens (0.025x input), but the table left the rate to the engine's default
+  of 0.1x input ($1.00). The rate is now stated explicitly; cached Fable 5.1 traffic costs
+  drop accordingly on the next scan.
 
 ## [2.4.5] - 2026-09-01
 

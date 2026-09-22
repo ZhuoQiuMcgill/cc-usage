@@ -55,12 +55,45 @@ def test_bundled_pricing_prices_fable_5_1():
     from importlib.resources import files
 
     models = json.loads((files("cc_usage") / "data" / "pricing.json").read_text())["models"]
-    assert models["claude-fable-5-1"] == {"input": 10.0, "output": 50.0}
-    assert get_rates("claude-fable-5-1", models) == Rates(10.0, 50.0)
-    assert get_rates("claude-fable-5-1[1m]", models) == Rates(10.0, 50.0)
+    # Cache reads are $0.25 (0.025x input), not the 0.1x the engine derives by
+    # default, so the rate must be stated explicitly.
+    fable_5_1 = Rates(10.0, 50.0, cache_read=0.25)
+    assert models["claude-fable-5-1"] == {"input": 10.0, "output": 50.0, "cache_read": 0.25}
+    assert get_rates("claude-fable-5-1", models) == fable_5_1
+    assert get_rates("claude-fable-5-1[1m]", models) == fable_5_1
     assert normalize_model("claude-fable-5-1") == "claude-fable-5-1"
     # Fable 5 keeps its own entry and is not shadowed by the point release.
     assert get_rates("claude-fable-5", models) == Rates(10.0, 50.0)
+
+
+def test_bundled_pricing_prices_opus_5_5():
+    """Claude Opus 5.5 (claude-opus-5-5) ships at $4/$20 with cache reads at $0.20
+    (0.05x input, not the default 0.1x). Cache writes keep the standard 1.25x (5m)
+    and 2x (1h) multipliers, so a mixed request prices to the published card."""
+    import json
+    from importlib.resources import files
+
+    models = json.loads((files("cc_usage") / "data" / "pricing.json").read_text())["models"]
+    opus_5_5 = Rates(4.0, 20.0, cache_read=0.20)
+    assert models["claude-opus-5-5"] == {"input": 4.0, "output": 20.0, "cache_read": 0.2}
+    assert get_rates("claude-opus-5-5", models) == opus_5_5
+    assert get_rates("claude-opus-5-5[1m]", models) == opus_5_5
+    # Distinct row, not collapsed into claude-opus-5.
+    assert get_rates("claude-opus-5", models) == Rates(5.0, 25.0)
+
+    cost = compute_cost(
+        input_tokens=100_000,
+        output_tokens=10_000,
+        cache_read=1_000_000,
+        cache_creation_total=200_000,
+        ephemeral_5m=100_000,
+        ephemeral_1h=100_000,
+        rates=opus_5_5,
+    )
+    # $4 in, $20 out, $0.20 cache read, $5 5m write, $8 1h write.
+    expected = (100_000 * 4.0 + 10_000 * 20.0 + 1_000_000 * 0.20
+                + 100_000 * 5.0 + 100_000 * 8.0) / 1_000_000
+    assert math.isclose(cost, expected, abs_tol=1e-12)
 
 
 def test_bundled_pricing_prices_opus_5():
