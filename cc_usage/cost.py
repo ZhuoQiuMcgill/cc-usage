@@ -45,6 +45,19 @@ class Rates:
     long_context_input_multiplier: float = 1.0
     long_context_output_multiplier: float = 1.0
 
+    def cache_read_rate(self, input_mult: float = 1.0) -> float:
+        """Cache-read rate per 1M: the explicit ``cache_read`` when the row states one,
+        else ``input * CACHE_READ_MULT`` — scaled by ``input_mult`` (the long-context
+        input multiplier; 1.0 is the standard tier).
+
+        The one derivation both `compute_cost` and the Models board use, so the rate a
+        user reads can never disagree with the rate their cost was computed at. The
+        arithmetic order (`input * input_mult * CACHE_READ_MULT`) is the order
+        `compute_cost` has always used, so costs stay bit-identical."""
+        if self.cache_read is not None:
+            return self.cache_read * input_mult
+        return self.input * input_mult * CACHE_READ_MULT
+
 
 def normalize_model(model: str | None) -> str:
     """Lower-case and strip tolerant suffixes so transcript ids match pricing keys.
@@ -133,12 +146,7 @@ def compute_cost(
     orr = output_rate / 1_000_000.0
 
     cost = input_tokens * ir + output_tokens * orr
-    cache_read_rate = (
-        card.cache_read * input_mult
-        if card.cache_read is not None
-        else input_rate * CACHE_READ_MULT
-    )
-    cost += cache_read * cache_read_rate / 1_000_000.0
+    cost += cache_read * card.cache_read_rate(input_mult) / 1_000_000.0
 
     if card.cache_write is not None:
         cost += cache_creation_total * card.cache_write * input_mult / 1_000_000.0

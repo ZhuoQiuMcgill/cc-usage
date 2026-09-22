@@ -8,7 +8,22 @@ See [VERSIONING.md](VERSIONING.md) for the release policy.
 
 ## [Unreleased]
 
-_No unreleased changes yet._
+### Added
+
+- **Per-1M rates on the Models board.** The Models board now shows a `$/M` column after
+  each of In, Out and Cache, so each model's cost can be read against its price. The
+  rates come from the same resolved rate card the cost engine bills with, including any
+  edits to your `pricing.json`. They are the base (standard-tier) rates, and Cache shows
+  the cache-read rate: the stated one, or 0.1x input when the table gives none. A
+  one-line footnote notes that cache writes and long-context requests cost more.
+  Unpriced models show `—`, and the Total row leaves its rate cells blank. The rates
+  appear only in the full layout with cost shown, and only when the board fits the width
+  it is drawn at. In the TUI that means 76 columns or more; `--once` checks the actual
+  terminal width. If a long model id doesn't fit at that width, it is shortened with `…`
+  and keeps its ` *` unpriced marker. It is never shortened below 13 characters, or to
+  a label another row would share. Where the rates don't fit at all, the board is drawn
+  exactly as before. The compact layout, cost-off,
+  empty and all-unpriced boards are unchanged.
 
 ## [2.4.6] - 2026-09-22
 

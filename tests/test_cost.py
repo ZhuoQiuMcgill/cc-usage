@@ -313,3 +313,59 @@ def test_subbuckets_differ_from_fallback():
     assert math.isclose(via_buckets, 1000 * 5e-6 * 2.00, abs_tol=1e-12)
     assert math.isclose(via_fallback, 1000 * 5e-6 * 1.25, abs_tol=1e-12)
     assert via_buckets > via_fallback
+
+
+def test_cache_read_rate_is_the_rate_compute_cost_bills():
+    """T16 R2: `Rates.cache_read_rate` is the single cache-read derivation. The Models
+    board displays it and `compute_cost` bills with it, so 1M cache-read tokens always
+    cost exactly the displayed rate — explicit rows and derived rows alike."""
+    import json
+    from importlib.resources import files
+
+    from cc_usage.cost import CACHE_READ_MULT
+
+    models = json.loads((files("cc_usage") / "data" / "pricing.json").read_text())["models"]
+    derived = get_rates("claude-opus-4-8", models)  # no cache_read -> input x 0.1
+    explicit = get_rates("claude-opus-5-5", models)  # cache_read 0.20 (not 0.1x)
+    gpt_mini = get_rates("gpt-5.4-mini", models)  # cache_read 0.075
+    assert derived.cache_read_rate() == 5.0 * CACHE_READ_MULT == 0.5
+    assert explicit.cache_read_rate() == 0.20
+    assert gpt_mini.cache_read_rate() == 0.075
+
+    for card in (derived, explicit, gpt_mini, Rates(3.0, 15.0)):
+        billed = compute_cost(
+            input_tokens=0,
+            output_tokens=0,
+            cache_read=1_000_000,
+            cache_creation_total=0,
+            ephemeral_5m=0,
+            ephemeral_1h=0,
+            rates=card,
+        )
+        assert math.isclose(billed, card.cache_read_rate(), abs_tol=1e-12)
+
+
+def test_long_context_cache_reads_keep_the_pre_t16_arithmetic_order():
+    """Routing cache reads through the helper must not move a single bit: a derived
+    rate is still (input x multiplier) x 0.1, in that order. The two orders differ in
+    the last place for, e.g., input 0.3 at a 1.7x long-context multiplier."""
+    from cc_usage.cost import CACHE_READ_MULT
+
+    card = Rates(
+        input=0.3,
+        output=1.0,
+        long_context_threshold=10,
+        long_context_input_multiplier=1.7,
+    )
+    assert (0.3 * 1.7) * CACHE_READ_MULT != (0.3 * CACHE_READ_MULT) * 1.7  # orders differ
+    billed = compute_cost(
+        input_tokens=0,
+        output_tokens=0,
+        cache_read=1_000_000,
+        cache_creation_total=0,
+        ephemeral_5m=0,
+        ephemeral_1h=0,
+        rates=card,
+    )
+    assert card.cache_read_rate(1.7) == (0.3 * 1.7) * CACHE_READ_MULT
+    assert billed == 1_000_000 * ((0.3 * 1.7) * CACHE_READ_MULT) / 1_000_000.0

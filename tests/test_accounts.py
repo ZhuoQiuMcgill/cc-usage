@@ -422,7 +422,9 @@ def test_single_account_no_codex_is_zero_noise():
     assert account_scope_line(s, THEME) is None
     assert by_account_block(s, THEME) is None
 
-    # Full-panel byte pin against the fixture captured from the pre-T11 build_panel.
+    # Full-panel byte pin against the fixture captured from the pre-T11 build_panel,
+    # re-captured deliberately for T16 (the Models board gained its $/M rate columns
+    # and their footnote; nothing else in the panel moved).
     # The clock strings in the panel are local-time, so pin TZ=UTC for the render and
     # restore it afterwards (never leak process-global TZ state into other tests).
     import os
@@ -461,6 +463,7 @@ def test_single_account_no_codex_is_zero_noise():
             interval=5,
             rl_present=True,
             heartbeat=series(recs, now, "24h", "cost"),
+            pricing=PRICING,
         )
         out = _plain(build_panel(state), width=100)
         golden = (Path(__file__).parent / "fixtures" / "panel_single_account.txt").read_text("utf-8")
