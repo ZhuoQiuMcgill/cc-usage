@@ -15,6 +15,12 @@ what generalises, not the limits RPC). Discovery is honoured only when the user 
 configured extra roots — a plain single `~/.claude` + `~/.codex` setup hands the parser no
 explicit roots, so it keeps its PROJECTS_DIR/CODEX_DIR-driven behaviour and single-account
 output stays byte-identical.
+
+Usage ledger (T17): after each scan the worker writes new/changed records to a durable,
+content-free SQLite ledger, and every view is built from the live records plus the
+ledger's *orphans* — rows whose key is no longer in the live parsed set because their
+transcript is gone. Orphans are normally few, so memory and startup stay flat; with no
+transcript deleted there are none and every view is exactly the live parse.
 """
 
 from __future__ import annotations
@@ -24,9 +30,12 @@ import time
 from pathlib import Path
 
 from .accounts import (
+    CLAUDE_PROVIDER,
     CODEX_PROVIDER,
+    _dedupe_label,
     discover_claude_roots,
     discover_codex_roots,
+    root_identity,
 )
 from .aggregate import (
     HEARTBEAT_METRICS,
@@ -38,6 +47,14 @@ from .aggregate import (
     series,
 )
 from .config import Config, save_config
+from .ledger import (
+    Ledger,
+    LedgerBusy,
+    LedgerCorrupt,
+    LedgerError,
+    LedgerRow,
+    orphan_record,
+)
 from .limits_fetch import (
     CodexAppServerUnavailable,
     LimitFetchError,
@@ -49,6 +66,7 @@ from .limits_fetch import (
 )
 from .parser import CancelCheck, Parser, ProgressCallback, ScanCancelled, UsageRecord
 from .paths import (
+    LEDGER_DB,
     LIMITS_CACHE_JSON,
     PARSE_CACHE,
 )
@@ -56,9 +74,20 @@ from .pricing import load_pricing
 from .ratelimits import account_buckets
 from .render import RenderState
 
+# Sentinel for "put the ledger beside the parse cache" (the default).
+_BESIDE_CACHE = object()
+# While nothing forces a full orphan diff, re-run it at most this often when another
+# process has committed to the shared ledger (it may hold history this one lacks).
+_LEDGER_REDIFF_SECS = 300.0
+
 
 class Engine:
-    def __init__(self, config: Config, cache_path: Path | None = PARSE_CACHE):
+    def __init__(
+        self,
+        config: Config,
+        cache_path: Path | None = PARSE_CACHE,
+        ledger_path: Path | None | object = _BESIDE_CACHE,
+    ):
         self.config = config
         pricing, warns = load_pricing()
         self.warnings: list[str] = list(warns)
@@ -94,6 +123,33 @@ class Engine:
         # a network call.
         self._limits_lock = threading.Lock()
         self.limit_warnings: list[str] = []
+        # Durable usage ledger (T17). Lives beside the parse cache — so production uses
+        # CONFIG_DIR/ledger.sqlite3 and a test's tmp cache gets a tmp ledger — and is off
+        # when there is no cache (cache_path=None keeps tests fully in-memory). Opened
+        # lazily by the first sync, which always runs on a worker thread.
+        if ledger_path is _BESIDE_CACHE:
+            ledger_path = cache_path.with_name(LEDGER_DB.name) if cache_path is not None else None
+        self.ledger_path: Path | None = Path(ledger_path) if ledger_path is not None else None
+        self._ledger = Ledger(self.ledger_path) if self.ledger_path is not None else None
+        # Serializes ledger syncs (the scan worker's and the post-refresh ledger
+        # worker's). Never taken on the UI thread except by close().
+        self._ledger_lock = threading.Lock()
+        # The parser + epoch the last full orphan diff was computed against; a different
+        # parser (root swap) or epoch (records discarded) forces the next diff.
+        self._ledger_synced_parser: Parser | None = None
+        self._ledger_synced_epoch = -1
+        self._ledger_full_at = 0.0
+        self._ledger_retry = False
+        self._identity_cache: tuple[tuple, dict[str, tuple[str, str, str]]] | None = None
+        # Ledger-only history (T17): records whose transcripts are gone, rebuilt from the
+        # ledger and priced with the current table. Rebound (never mutated) by the ledger
+        # worker, so the UI thread only ever reads a complete list.
+        self._orphans: list[UsageRecord] = []
+        # (label, provider) of accounts present only in the ledger — roots no longer
+        # configured — so the by-account rollup can still attribute their history.
+        self._history_accounts: list[tuple[str, str]] = []
+        # Cached live+orphan view for the UI thread (see `records`).
+        self._view: tuple | None = None
         # Background-worker/timer failures (T14 R3), keyed by the step that failed. Kept
         # deliberately OUT of `limit_warnings`, which `refresh_limits` replaces wholesale —
         # a warning recorded by another step moments earlier would simply be destroyed.
@@ -189,13 +245,51 @@ class Engine:
             return scope
         return "all"
 
+    @property
+    def records(self) -> list[UsageRecord]:
+        """Every record the views aggregate: the live parse plus ledger-only history.
+
+        With no orphans (the normal case: no transcript has been deleted) this is the
+        parser's own list, uncopied, so ledger-on output is exactly ledger-off output.
+        Otherwise the orphans not (or no longer) live are appended; filtering by the live
+        key set here, at read time, means a record can never be counted both live and
+        from the ledger — even in the moment between a scan picking a key up again and
+        the ledger worker pruning it."""
+        return self._view_state()[0]
+
+    def _view_state(self) -> tuple[list[UsageRecord], set[str]]:
+        """(live + ledger-only records, unpriced model names among the ledger-only ones).
+
+        Cached until a scan appends (the only way a key becomes live) or the orphan list
+        or parser is replaced. UI/main thread only, like snapshot()."""
+        parser = self.parser
+        live = parser.records
+        orphans = self._orphans
+        if not orphans:
+            return live, set()
+        view = self._view
+        if (
+            view is not None
+            and view[0] is parser
+            and view[1] is live
+            and view[2] == len(live)
+            and view[3] is orphans
+        ):
+            return view[4], view[5]
+        extra = [o for o in orphans if not parser.has_key(o.lkey)]
+        combined = live + extra if extra else live
+        unknown = {o.model_norm for o in extra if not o.known and o.model_norm != "(unknown)"}
+        self._view = (parser, live, len(live), orphans, combined, unknown)
+        return combined, unknown
+
     def _scoped_records(self) -> list[UsageRecord]:
-        """Records under the active scope. "all" returns the list itself (no copy) so
+        """Records under the active scope. "all" returns the view itself (no copy) so
         the single-account hot path is untouched; a specific account excludes Codex."""
+        records = self.records
         if self.account_scope == "all":
-            return self.parser.records
+            return records
         scope = self.account_scope
-        return [r for r in self.parser.records if r.account == scope]
+        return [r for r in records if r.account == scope]
 
     def cycle_account_scope(self, step: int = 1) -> str:
         """Cycle scope all -> each isolatable account -> all (Claude accounts, plus
@@ -232,14 +326,21 @@ class Engine:
         if [(r.label, r.enabled) for r in (*self.roots, *self.codex_roots)] == before:
             return False
         with self._swap_lock:
+            old = self.parser
             self.parser = Parser(
-                self.parser.pricing,
-                cache_path=self.parser.cache_path,
+                old.pricing,
+                cache_path=old.cache_path,
                 roots=self._parser_roots(),
             )
+            # Records the old parser saw but the ledger has not stored yet still go in.
+            self.parser.restore_dirty(old.take_dirty())
             self._generation += 1
             self._scanned = False
             self._codex_in_data = False
+            # The orphan set depends on which roots are enabled; the rescan's ledger sync
+            # recomputes it against the new parser.
+            self._orphans = []
+            self._history_accounts = []
             self.account_scope = self._valid_scope(self.account_scope)
             # Keep the persisted config in step with the (possibly reset) scope so a
             # later save_config never writes back a scope that no longer exists.
@@ -247,7 +348,9 @@ class Engine:
         return True
 
     def _refresh_account_flags(self) -> None:
-        self._codex_in_data = any(r.provider == CODEX_PROVIDER for r in self.parser.records)
+        self._codex_in_data = any(
+            r.provider == CODEX_PROVIDER for r in self.parser.records
+        ) or any(r.provider == CODEX_PROVIDER for r in self._orphans)
 
     # ── data ───────────────────────────────────────────────────────────────
     @property
@@ -308,6 +411,227 @@ class Engine:
     def ensure_scanned(self) -> None:
         if not self._scanned:
             self.scan()
+
+    # ── usage ledger (T17) ───────────────────────────────────────────────────
+    @property
+    def ledger_pending(self) -> bool:
+        """Whether a ledger sync has work: changed records, a due orphan diff, or a
+        failed write to retry. Cheap; the app polls it after each UI-thread scan."""
+        if self._ledger is None or not self._scanned:
+            return False
+        parser = self.parser
+        return (
+            parser.has_dirty()
+            or self._ledger_retry
+            or self._ledger_synced_parser is not parser
+            or self._ledger_synced_epoch != parser.epoch
+        )
+
+    def sync_ledger(self) -> None:
+        """Write new/changed records to the ledger and refresh the ledger-only history.
+
+        Worker threads (and `--once`) only — never the UI thread's render tick (R8).
+        Never raises (T14): a busy database retries on the next scan, a full disk or
+        read-only config dir runs without the ledger, and an unreadable file is renamed
+        aside (never deleted) and rebuilt from the transcripts — each with a warning,
+        while the panel keeps showing the in-memory data."""
+        if self._ledger is None:
+            return
+        try:
+            with self._ledger_lock:
+                self._sync_ledger_locked()
+        except Exception as exc:  # a bug here must still not take the panel down
+            self._ledger_retry = True
+            self.record_worker_warning(
+                "ledger", f"usage ledger sync failed: {type(exc).__name__}: {exc}"
+            )
+
+    def _sync_ledger_locked(self) -> None:
+        with self._swap_lock:
+            parser = self.parser
+            generation = self._generation
+            scanned = self._scanned
+        if not scanned:
+            return  # mid root-swap: the rescan's worker syncs the new parser
+        try:
+            try:
+                result = self._ledger_pass(parser)
+            except LedgerCorrupt as exc:
+                moved = self._ledger.move_aside()
+                if moved is not None:
+                    self.record_worker_warning(
+                        "ledger moved",
+                        f"usage ledger was unreadable ({exc}); moved it to {moved} "
+                        "and started a fresh one from the transcripts",
+                    )
+                # A fresh file: the retry's full diff backfills every live record.
+                self._ledger_synced_parser = None
+                result = self._ledger_pass(parser)
+        except LedgerBusy as exc:
+            self._ledger_retry = True
+            self.record_worker_warning(
+                "ledger", f"usage ledger busy ({exc}); will retry on the next scan"
+            )
+            return
+        except LedgerError as exc:
+            self._ledger_retry = True
+            self._ledger.close()
+            self.record_worker_warning(
+                "ledger", f"usage ledger unavailable ({exc}); running without it"
+            )
+            return
+        self._ledger_retry = False
+        self.record_worker_warning("ledger", None)
+        if result is None:
+            return
+        orphans, history_accounts = result
+        with self._swap_lock:
+            if generation != self._generation:
+                return  # the roots changed under us; the rescan recomputes this
+            self._orphans = orphans
+            self._history_accounts = history_accounts
+            self._refresh_account_flags()
+
+    def ledger_identities(self) -> dict[str, tuple[str, str, str]]:
+        """label -> (provider, identity, label) for every discovered root, enabled or
+        not. Resolving paths touches the filesystem, so it is cached per root set."""
+        signature = (tuple(self.roots), tuple(self.codex_roots))
+        cached = self._identity_cache
+        if cached is not None and cached[0] == signature:
+            return cached[1]
+        out: dict[str, tuple[str, str, str]] = {}
+        for root in self.roots:
+            out[root.label] = (CLAUDE_PROVIDER, root_identity(root.path), root.label)
+        for root in self.codex_roots:
+            out[root.label] = (CODEX_PROVIDER, root_identity(root.path), root.label)
+        self._identity_cache = (signature, out)
+        return out
+
+    def _ledger_row(
+        self, record: UsageRecord, identities: dict[str, tuple[str, str, str]]
+    ) -> LedgerRow:
+        known = identities.get(record.account)
+        if known is not None and known[0] == record.provider:
+            _provider, identity, label = known
+        else:
+            # No discovered root carries this label (e.g. a legacy/embedded parser):
+            # keep the row under a stable label-derived identity rather than drop it.
+            identity, label = f"label:{record.account}", record.account
+        return LedgerRow.from_record(record, record.provider, identity, label)
+
+    def _ledger_pass(self, parser: Parser):
+        """One sync: store changed records, then (when due) redo the orphan diff.
+
+        Returns (orphans, history_accounts) when the ledger-only view was recomputed,
+        else None. A full diff runs on the first sync of a parser, after its records
+        were discarded (epoch bump), and — throttled — when another process wrote. It
+        reads every stored key once: stored-but-not-live keys are the orphans, and
+        live-but-not-stored records are backfilled (the first run writes them all)."""
+        ledger = self._ledger
+        epoch = parser.epoch
+        full = self._ledger_synced_parser is not parser or self._ledger_synced_epoch != epoch
+        if (
+            not full
+            and ledger.is_open
+            and time.monotonic() - self._ledger_full_at >= _LEDGER_REDIFF_SECS
+        ):
+            full = ledger.changed_elsewhere()
+        identities = self.ledger_identities()
+        dirty = parser.take_dirty()
+        try:
+            if full:
+                live = parser.live_index()
+                stored = ledger.key_accounts()
+                pending = dict(dirty)
+                for key, record in live.items():
+                    if key not in stored:
+                        pending.setdefault(key, record)
+            else:
+                pending = dirty
+            if pending:
+                ledger.write([self._ledger_row(r, identities) for r in pending.values()])
+        except BaseException:
+            parser.restore_dirty(dirty)  # nothing was stored: retry these next time
+            raise
+        if not full:
+            if self._orphans and any(parser.has_key(o.lkey) for o in self._orphans):
+                orphans = [o for o in self._orphans if not parser.has_key(o.lkey)]
+                return orphans, self._history_accounts
+            return None
+        # Keys written just now that are not live (an unstored update to a record whose
+        # transcript was already gone) are orphans too.
+        candidates = {key: account for key, account in stored.items() if key not in live}
+        for key in pending:
+            if key not in live and key not in candidates:
+                candidates[key] = None
+        result = self._load_orphans(parser, candidates, identities)
+        self._ledger_synced_parser = parser
+        self._ledger_synced_epoch = epoch
+        self._ledger_full_at = time.monotonic()
+        return result
+
+    def _load_orphans(
+        self,
+        parser: Parser,
+        candidates: dict[int, int | None],
+        identities: dict[str, tuple[str, str, str]],
+    ) -> tuple[list[UsageRecord], list[tuple[str, str]]]:
+        """Rebuild the ledger-only records for `candidates` (key -> account id).
+
+        Account labels (R5): a row whose root is still discovered shows under that
+        root's *current* label, so a rename keeps one account; a disabled root's rows
+        are excluded, like its live records; a root no longer configured falls back to
+        the label stored with its rows, suffixed if a current account already uses it so
+        two accounts never merge."""
+        if not candidates:
+            return [], []
+        ledger = self._ledger
+        accounts = ledger.accounts()
+        models = ledger.models()
+        configured = {(prov, ident): label for label, (prov, ident, _l) in identities.items()}
+        enabled = {r.label for r in (*self.roots, *self.codex_roots) if r.enabled}
+        used = set(identities)
+        display: dict[int, tuple[str, str, bool] | None] = {}
+        for account_id in sorted(accounts):
+            provider, identity, stored_label = accounts[account_id]
+            label = configured.get((provider, identity))
+            if label is not None:
+                display[account_id] = (label, provider, False) if label in enabled else None
+            else:
+                display[account_id] = (_dedupe_label(stored_label, used), provider, True)
+        keys = [
+            key
+            for key, account_id in candidates.items()
+            if account_id is None or display.get(account_id) is not None
+        ]
+        orphans: list[UsageRecord] = []
+        history: dict[str, str] = {}
+        pricing = parser.pricing
+        for row in ledger.rows(keys):
+            shown = display.get(row[1])
+            if shown is None:
+                continue  # a disabled root (or an unknown account id)
+            label, provider, history_only = shown
+            orphans.append(
+                orphan_record(
+                    row,
+                    provider=provider,
+                    label=label,
+                    model_raw=models.get(row[3], ""),
+                    pricing=pricing,
+                )
+            )
+            if history_only:
+                history[label] = provider
+        orphans.sort(key=lambda r: r.ts)
+        return orphans, sorted(history.items())
+
+    def close(self) -> None:
+        """Release the ledger connection (waits for an in-flight sync to finish)."""
+        if self._ledger is None:
+            return
+        with self._ledger_lock:
+            self._ledger.close()
 
     # ── heartbeat controls ───────────────────────────────────────────────────
     def refresh_limits(self) -> None:
@@ -471,7 +795,12 @@ class Engine:
         accounts = []
         if self.account_scope == "all":
             rollup = aggregate_accounts(
-                self.parser.records, now, self.config.default_window, labels, codex_labels
+                self.records,
+                now,
+                self.config.default_window,
+                labels,
+                codex_labels,
+                history_accounts=self._history_accounts,
             )
             if len(rollup) >= 2:
                 accounts = rollup
@@ -488,7 +817,7 @@ class Engine:
                 capture and (name.startswith("codex:") or name.startswith("claude:"))
                 for name, capture in self.limit_captures.items()
             ),
-            unknown_models=set(self.parser.stats.unknown_models),
+            unknown_models=set(self.parser.stats.unknown_models) | self._view_state()[1],
             warnings=[*self.warnings, *self.limit_warnings, *self.worker_warnings],
             heartbeat=hb,
             accounts=accounts,

@@ -45,6 +45,11 @@ WRAPPER_SCRIPT = CONFIG_DIR / "statusline-wrapper.sh"
 # just falls back to a full scan. Never holds anything from ~/.claude beyond parsed usage.
 PARSE_CACHE = CONFIG_DIR / "parse-cache.pkl"
 
+# Durable usage ledger (T17): a compact, content-free SQLite record of every usage event
+# ccusage has parsed, so history survives Claude Code deleting old transcripts. Unlike
+# the parse cache this is NOT derived data once transcripts are gone — do not delete it.
+LEDGER_DB = CONFIG_DIR / "ledger.sqlite3"
+
 # Backups (the .orig pair is created on first capture/install; preinstall snapshots
 # are written immediately before the wrapper repoints settings.json).
 SETTINGS_ORIG = BACKUPS_DIR / "settings.json.orig"
