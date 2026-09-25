@@ -41,6 +41,16 @@ See [VERSIONING.md](VERSIONING.md) for the release policy.
 
 ### Fixed
 
+- **Codex usage was overcounted by about 3%.** Codex often writes the same `token_count`
+  event more than once: again at the same moment, or seconds later, with no new model
+  call behind it. ccusage counted each copy. A Codex event now counts only when the
+  session's cumulative token counters actually advance, so each rollout's counted usage
+  equals what its own counters report. On the reference machine this removed 430 million
+  tokens and $93.72 (2.9%) from Codex's all-time cost, across 3,295 duplicate events.
+  Claude totals are unchanged. Two cases are handled explicitly. A rollout resumed or
+  forked from another starts from its parent's total, which the parent's own rollout
+  already counts, so the child adds only its own turns. Counters that restart after a
+  context compaction count their new total.
 - **A rewritten Codex rollout no longer counts its events twice.** When a rollout shrank
   and was read again from the top, its earlier `token_count` events were added a second
   time. Codex events now have stable keys, so a re-read folds into the existing records.

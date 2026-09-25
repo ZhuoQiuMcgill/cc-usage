@@ -211,9 +211,11 @@ class World:
             codex_tokens(t0, (100, 20, 10), (100, 20, 10))
             + codex_context(t0 + 1)
             + codex_tokens(t0 + 60, (400, 120, 60), (300, 100, 50))
-            # Codex's consecutive exact repeat of an event: the parser counts both.
+            # Codex re-emits an event, at the same and at a later timestamp: the
+            # cumulative total did not move, so neither is new usage.
             + codex_tokens(t0 + 60, (400, 120, 60), (300, 100, 50))
-            # Same timestamp as the repeat, different counters: a distinct event.
+            + codex_tokens(t0 + 90, (400, 120, 60), (300, 100, 50))
+            # Same timestamp as the re-emission, counters advanced: a distinct event.
             + codex_tokens(t0 + 60, (500, 150, 70), (100, 30, 10))
         )
 
@@ -321,7 +323,7 @@ def delete_some(world: World) -> None:
 def test_deleted_transcripts_stay_in_every_view_warm_and_cold(world):
     first = world.scanned()
     before = views(first)
-    assert before["records"] == 10  # 6 Claude messages + 4 Codex events
+    assert before["records"] == 9  # 6 Claude messages + 3 counted Codex events
     first.close()
 
     delete_some(world)
@@ -343,8 +345,8 @@ def test_deleted_transcripts_stay_in_every_view_warm_and_cold(world):
     # Cold: no parse cache at all; the ledger alone carries the deleted history.
     cold = world.scanned(cache="fresh.pkl")
     assert_same(views(cold), before)
-    assert len(cold.records) == 10  # nothing counted twice
-    assert len({r.lkey for r in cold.records}) == 10
+    assert len(cold.records) == 9  # nothing counted twice
+    assert len({r.lkey for r in cold.records}) == 9
     cold.close()
 
     # And a warm restart after the rebuild still shows it (orphans are not cached).
@@ -368,7 +370,7 @@ def test_history_is_visible_before_the_first_scan_completes_in_the_tui(world, tm
             await app.workers.wait_for_complete()
             await pilot.pause()
             assert app.is_running
-            assert len(eng.records) == 10
+            assert len(eng.records) == 9
             assert eng.snapshot(now=NOW).windows["all"].input_tokens == sum(
                 r.input_tokens for r in eng.records
             )
@@ -414,7 +416,7 @@ def test_truncated_codex_rollout_is_not_counted_twice(world):
     eng.scan()
     eng.sync_ledger()
     assert_same(views(eng), before)
-    assert len(ledger_rows(world.ledger)) == 10
+    assert len(ledger_rows(world.ledger)) == 9
 
 
 def test_rotated_transcript_is_not_counted_twice(world):
@@ -424,7 +426,7 @@ def test_rotated_transcript_is_not_counted_twice(world):
     (world.alpha / "s1.jsonl").rename(world.alpha / "s1-rotated.jsonl")
     again = world.scanned()  # the missing path discards the cache; keys are unchanged
     assert_same(views(again), before)
-    assert len(ledger_rows(world.ledger)) == 10
+    assert len(ledger_rows(world.ledger)) == 9
 
 
 # ── 3. streaming merge ───────────────────────────────────────────────────────────
@@ -475,7 +477,7 @@ def test_codex_key_is_stable_across_reparse_archive_move_and_cold_rebuild(tmp_pa
     first = Parser(PRICING, cache_path=cache, roots=roots)
     first.scan()
     keys = _codex_keys(first)
-    assert len(keys) == 4 and len(set(keys)) == 4  # the exact repeat got its own key
+    assert len(keys) == 3 and len(set(keys)) == 3  # re-emissions are not records
     first.save_cache()
 
     reparse = Parser(PRICING, roots=roots)  # re-parse from scratch
@@ -504,11 +506,11 @@ def test_codex_key_is_stable_across_reparse_archive_move_and_cold_rebuild(tmp_pa
 
 def test_codex_ledger_rows_survive_the_archive_move_without_duplicates(world):
     world.scanned().close()
-    assert len(ledger_rows(world.ledger)) == 10
+    assert len(ledger_rows(world.ledger)) == 9
     (world.sessions / ROLLOUT).rename(world.archive / ROLLOUT)
     world.scanned().close()
     world.scanned(cache="fresh.pkl").close()  # cold rebuild from the archive
-    assert len(ledger_rows(world.ledger)) == 10
+    assert len(ledger_rows(world.ledger)) == 9
 
 
 def test_codex_unattributed_row_is_reattributed(world):
@@ -545,7 +547,7 @@ def test_orphans_are_repriced_and_live_costs_are_bit_identical(world):
 
     eng = world.scanned(cache="fresh.pkl")
     orphans = [r for r in eng.records if not eng.parser.has_key(r.lkey)]
-    assert len(orphans) == 7
+    assert len(orphans) == 6
     for r in orphans:
         rates = get_rates(r.model_raw, world.pricing)
         expected = compute_cost(
@@ -656,7 +658,7 @@ def test_ledger_holds_no_transcript_content(world):
         for p in world.state.iterdir()
         if p.name.startswith("ledger.sqlite3")
     )
-    assert len(ledger_rows(world.ledger)) == 11
+    assert len(ledger_rows(world.ledger)) == 10
     assert marker.encode() not in blob
     assert str(world.base).encode() not in blob  # not even the roots' paths
 
@@ -668,7 +670,7 @@ def test_corrupt_ledger_is_moved_aside_and_rebuilt(world):
     eng = world.scanned()
     moved = sorted(world.state.glob("ledger.sqlite3.corrupt-*"))
     assert len(moved) == 1 and moved[0].read_bytes() == garbage  # kept, never deleted
-    assert len(ledger_rows(world.ledger)) == 10  # a fresh ledger from the transcripts
+    assert len(ledger_rows(world.ledger)) == 9  # a fresh ledger from the transcripts
     warnings = eng.snapshot(now=NOW).warnings
     assert any(str(moved[0]) in w for w in warnings)
 
@@ -688,7 +690,7 @@ def test_corrupt_ledger_never_takes_the_panel_down(world):
             await app.workers.wait_for_complete()
             await pilot.pause()
             assert app.is_running
-            assert len(eng.records) == 10
+            assert len(eng.records) == 9
             notes = [t.plain for t in app.query_one("#notes", Static).renderable.renderables]
             assert any("corrupt-" in t and "moved it to" in t for t in notes)
 
@@ -714,7 +716,7 @@ def test_unexpected_ledger_failure_leaves_the_panel_up(world, monkeypatch):
             await app.workers.wait_for_complete()
             await pilot.pause()
             assert app.is_running
-            assert eng.is_scanned and len(eng.records) == 10
+            assert eng.is_scanned and len(eng.records) == 9
             assert any("ledger exploded" in w for w in eng.worker_warnings)
 
     asyncio.run(scenario())
@@ -732,13 +734,13 @@ def test_busy_ledger_retries_on_the_next_scan(world, monkeypatch):
         eng.scan()
         eng.sync_ledger()
         assert any("busy" in w for w in eng.snapshot(now=NOW).warnings)
-        assert len(eng.records) == 11  # the panel keeps its in-memory data
+        assert len(eng.records) == 10  # the panel keeps its in-memory data
         assert eng.ledger_pending  # …and will retry
     finally:
         blocker.rollback()
         blocker.close()
     eng.sync_ledger()  # the next scan's sync
-    assert len(ledger_rows(world.ledger)) == 11
+    assert len(ledger_rows(world.ledger)) == 10
     assert not any("ledger" in w for w in eng.snapshot(now=NOW).warnings)
 
 
@@ -761,7 +763,7 @@ def test_unwritable_ledger_runs_without_it_and_recovers(world, monkeypatch):
     again = world.engine()
     assert again.prime_cache()
     again.sync_ledger()  # …and stored by the next run
-    assert len(ledger_rows(world.ledger)) == 10
+    assert len(ledger_rows(world.ledger)) == 9
     assert_same(views(again), before)
 
 
@@ -779,7 +781,7 @@ def test_read_only_config_dir_runs_without_the_ledger(world):
         eng.sync_ledger()  # must not raise
         warnings = eng.snapshot(now=NOW).warnings
         assert any("usage ledger unavailable" in w and "running without it" in w for w in warnings)
-        assert len(eng.records) == 10 and eng.ledger_pending  # data intact; retried later
+        assert len(eng.records) == 9 and eng.ledger_pending  # data intact; retried later
     finally:
         locked.chmod(0o755)
     assert not (locked / "l.db").exists()
@@ -815,7 +817,7 @@ def test_ledger_writes_only_happen_on_worker_threads(world, monkeypatch):
     asyncio.run(scenario())
     eng.close()
     assert len(threads) >= 2 and not any(threads)
-    assert len(ledger_rows(world.ledger)) == 11
+    assert len(ledger_rows(world.ledger)) == 10
 
 
 # ── 9. concurrent writers ────────────────────────────────────────────────────────
@@ -855,7 +857,7 @@ def test_two_engines_writing_one_ledger_concurrently(world, tmp_path):
     conn = sqlite3.connect(world.ledger)
     try:
         assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
-        assert conn.execute("SELECT count(*) FROM usage").fetchone()[0] == 10 + 30
+        assert conn.execute("SELECT count(*) FROM usage").fetchone()[0] == 9 + 30
     finally:
         conn.close()
     for eng in engines:
@@ -921,7 +923,7 @@ def test_ledger_on_and_off_are_identical_without_deletions(world):
     assert on.records is on.parser.records  # no orphans: the live list, uncopied
     a, b = views(on), views(off)
     assert a == b  # exact, floats included
-    assert len(ledger_rows(world.ledger)) == len(on.parser.records) == 10
+    assert len(ledger_rows(world.ledger)) == len(on.parser.records) == 9
 
 
 def test_ledger_rows_match_the_live_records(world):
@@ -978,12 +980,12 @@ def test_ledger_info_reports_rows_range_and_orphans(world, info):
     code, out = info()
     assert code == 0
     assert str(world.ledger) in out
-    assert "records     10  (claude 6 · codex 4)" in out
-    assert "personal 4" in out and "company 2" in out and "codex 4" in out
+    assert "records     9  (claude 6 · codex 3)" in out
+    assert "personal 4" in out and "company 2" in out and "codex 3" in out
     first = datetime.datetime.fromtimestamp(NOW - 20 * D).date().isoformat()
     last = datetime.datetime.fromtimestamp(NOW - 0.5 * H).date().isoformat()
     assert f"covers      {first} → {last}" in out
-    assert "orphans     7 " in out  # 3 deleted Claude messages + 4 Codex events
+    assert "orphans     6 " in out  # 3 deleted Claude messages + 3 Codex events
     assert "unrecorded  1 " in out
     assert "before you shorten Claude Code's transcript retention" in " ".join(out.split())
     # Read-only: the ledger, its WAL and the parse cache are untouched.

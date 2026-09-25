@@ -86,10 +86,10 @@ _READ_BUFFER_BYTES = 4 * 1024 * 1024
 # stores `latest_rate_limits_by_account` keyed by account label instead of a single
 # `latest_rate_limits`; a v6 cache carries the old key and is dropped (rebuilt once).
 # v8: every record carries its stable ledger key (T17) and the dedup index is keyed by
-# it for both providers; Codex keys need per-file state (the consecutive-duplicate
-# ordinal) that an older cache cannot supply, so a v7 cache is rebuilt once. That one
-# cold scan is also what backfills the usage ledger on first run.
-_CACHE_VERSION = 8
+# it for both providers. That one cold scan is also what backfills the usage ledger.
+# v9: a Codex token_count counts only when the rollout's cumulative counters advance, so
+# records cached under v8 (which counted re-emitted events) are rebuilt once.
+_CACHE_VERSION = 9
 
 # Session id embedded in a Codex rollout's file name (rollout-<ts>-<uuid>.jsonl). It is
 # the same id as the rollout's session_meta and survives the active->archive move.
@@ -322,10 +322,6 @@ class Parser:
         # those records instead of permanently inventing a literal `codex` model.
         self._codex_pending: dict[str, list[UsageRecord]] = {}
         self._codex_totals: dict[str, tuple[int, int, int]] = {}
-        # Per-file (position, ordinal) of the last Codex record, so a consecutive exact
-        # repeat of a token_count event (Codex emits some; the parser counts both) gets
-        # a distinct, still-stable key instead of colliding with the first (T17).
-        self._codex_dup: dict[str, tuple[str, int]] = {}
         # Records created or changed since the usage ledger last took them (T17). The
         # scan thread marks, the ledger worker takes; the lock makes the hand-off
         # atomic so a mark can never land in a dict the worker is already iterating.
@@ -616,49 +612,64 @@ class Parser:
             )
         last_tuple = None
         if isinstance(last, dict):
-            raw_input = self._codex_int(last.get("input_tokens"))
-            cached_input = self._codex_int(last.get("cached_input_tokens"))
-            cache_read = min(raw_input, cached_input)
-            output_tokens = self._codex_int(last.get("output_tokens"))
-            last_tuple = (raw_input, cached_input, output_tokens)
-        elif current_total is not None:
-            previous = self._codex_totals.get(source, (0, 0, 0))
-            raw_input = max(0, current_total[0] - previous[0])
-            cache_read = min(raw_input, max(0, current_total[1] - previous[1]))
-            output_tokens = max(0, current_total[2] - previous[2])
+            last_tuple = (
+                self._codex_int(last.get("input_tokens")),
+                self._codex_int(last.get("cached_input_tokens")),
+                self._codex_int(last.get("output_tokens")),
+            )
+        # What this event adds is decided by the rollout's cumulative counters
+        # (`total_token_usage`), so a rollout's counted usage sums to exactly what its
+        # counters say it used:
+        #   * first event of a rollout -> its per-turn `last_token_usage`: a resumed or
+        #     forked rollout starts from its parent's total, which the parent's own
+        #     rollout already counts;
+        #   * total unchanged -> nothing: Codex re-emits a token_count (at the same or
+        #     a later timestamp) without any new model call, and counting its `last`
+        #     again double counted ~2.9% of Codex cost;
+        #   * total grew -> the growth (equal to `last` for 50,155 of 50,157 real
+        #     events; the other two are usage `last` does not report, such as a
+        #     compaction call);
+        #   * total fell -> the counters restarted: the new total is all new usage.
+        # An event without cumulative counters falls back to its `last`.
+        if current_total is not None:
+            previous = self._codex_totals.get(source)
+            self._codex_totals[source] = current_total
+            if previous is None:
+                usage = last_tuple if last_tuple is not None else current_total
+            elif current_total == previous:
+                return None
+            elif all(now >= before for now, before in zip(current_total, previous)):
+                usage = tuple(now - before for now, before in zip(current_total, previous))
+            else:
+                usage = current_total
+        elif last_tuple is not None:
+            usage = last_tuple
         else:
             return None
-        if current_total is not None:
-            self._codex_totals[source] = current_total
+        raw_input, cached_input, output_tokens = usage
         if raw_input == 0 and output_tokens == 0:
             return None
 
         # Codex input_tokens includes cached_input_tokens; keep cached input separate.
+        cache_read = min(raw_input, cached_input)
         input_tokens = raw_input - cache_read
 
-        # Stable key (T17 R3): the rollout's session id + this event's position in it.
-        # The position is the event's own timestamp plus the cumulative and per-turn
-        # counters it reports — all line content, so identical on every re-parse,
-        # after an active->archive move and on a cold rebuild. Timestamps alone are
-        # not unique (a third of real events share one with a sibling); with the
-        # counters they are, except for Codex's consecutive exact repeats, which the
-        # ordinal separates the same way on every parse.
-        position = _KEY_SEP.join(
-            (
-                str(obj.get("timestamp")),
-                ",".join(map(str, current_total)) if current_total is not None else "",
-                ",".join(map(str, last_tuple)) if last_tuple is not None else "",
-            )
-        )
-        previous_position = self._codex_dup.get(source)
-        ordinal = (
-            previous_position[1] + 1
-            if previous_position is not None and previous_position[0] == position
-            else 0
-        )
-        self._codex_dup[source] = (position, ordinal)
+        # Stable key (T17 R3): the rollout's session id + this event's position in it:
+        # its own timestamp and the cumulative and per-turn counters it reports. All of
+        # it is line content, so the key is identical on every re-parse, after an
+        # active->archive move and on a cold rebuild. A timestamp alone is not unique
+        # (a third of real events share one with a sibling), but a counted event always
+        # carries a total no other counted event in the rollout has.
         key = ledger_key(
-            f"x{_KEY_SEP}{codex_session_id(source)}{_KEY_SEP}{position}{_KEY_SEP}{ordinal}"
+            _KEY_SEP.join(
+                (
+                    "x",
+                    codex_session_id(source),
+                    str(obj.get("timestamp")),
+                    ",".join(map(str, current_total)) if current_total is not None else "",
+                    ",".join(map(str, last_tuple)) if last_tuple is not None else "",
+                )
+            )
         )
         existing = self._by_key.get(key)
         if existing is not None:
@@ -777,7 +788,6 @@ class Parser:
             # already held instead of being counted again (T17).
             start = 0
             self._codex_totals.pop(sp, None)
-            self._codex_dup.pop(sp, None)
             self._file_models.pop(sp, None)
 
         consumed = 0
@@ -926,7 +936,6 @@ class Parser:
         self._file_models = {}
         self._codex_pending = {}
         self._codex_totals = {}
-        self._codex_dup = {}
         self.latest_rate_limits_by_account = {}
         self._cache_unvalidated = False
         # Records just left the live set; the ledger must redo its orphan diff. The
@@ -969,8 +978,6 @@ class Parser:
                 self._codex_pending[new] = self._codex_pending.pop(old)
             if old in self._codex_totals:
                 self._codex_totals[new] = self._codex_totals.pop(old)
-            if old in self._codex_dup:
-                self._codex_dup[new] = self._codex_dup.pop(old)
         return True
 
     # ── persistent cache (M6 across process runs) ─────────────────────────────
@@ -1026,14 +1033,12 @@ class Parser:
             file_models = codex.get("file_models", {})
             pending = codex.get("pending", {})
             totals = codex.get("totals", {})
-            dup = codex.get("dup", {})
             latest_by_account = codex.get("latest_rate_limits_by_account")
             unflushed = data.get("unflushed", [])
             if (
                 not isinstance(file_models, dict)
                 or not isinstance(pending, dict)
                 or not isinstance(totals, dict)
-                or not isinstance(dup, dict)
                 or not isinstance(unflushed, list)
             ):
                 raise TypeError("invalid Codex cache state")
@@ -1043,9 +1048,6 @@ class Parser:
                 for source, indices in pending.items()
             }
             self._codex_totals = {str(key): tuple(value) for key, value in totals.items()}
-            self._codex_dup = {
-                str(key): (str(value[0]), int(value[1])) for key, value in dup.items()
-            }
             # Records the ledger had not yet stored when this cache was written (a
             # failed or skipped ledger write): queue them again so none is lost.
             self._dirty = {int(key): by_key[int(key)] for key in unflushed if key in by_key}
@@ -1117,7 +1119,6 @@ class Parser:
                     for source, records in self._codex_pending.items()
                 },
                 "totals": self._codex_totals,
-                "dup": self._codex_dup,
                 "latest_rate_limits_by_account": self.latest_rate_limits_by_account,
             },
         }
