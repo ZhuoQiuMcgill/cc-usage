@@ -612,3 +612,46 @@ def test_codex_counting_is_the_same_incrementally_and_warm(tmp_path, monkeypatch
     once.scan()
     assert _counted(parser) == _counted(once) == _expected(_EVENTS)
     assert sorted(r.lkey for r in parser.records) == sorted(r.lkey for r in once.records)
+
+
+def test_codex_partial_counter_fall_counts_only_that_turn(tmp_path):
+    """Only a restart (every counter fell, or the total fell to exactly `last`) counts a
+    whole new total; a partial fall — never seen in real data — must not re-count a
+    session, and a first event without `last` is an inherited base, not usage."""
+    path = tmp_path / "rollout.jsonl"
+    path.write_text(
+        _context("gpt-test")
+        + _tokens("2026-07-12T12:00:01.000Z", (290_000_000, 280_000_000, 400_000), (1000, 200, 50))
+        # input fell, output grew: not a restart
+        + _tokens("2026-07-12T12:01:00.000Z", (1_500, 1_000, 400_500), (1500, 1000, 500))
+        # every counter fell: a restart
+        + _tokens("2026-07-12T12:02:00.000Z", (700, 300, 90), (400, 300, 60)),
+        "utf-8",
+    )
+    parser = Parser({"gpt-test": {"input": 2.0, "output": 8.0}})
+    parser.ingest_file(path)
+    assert _counted(parser) == (1000 + 1500 + 700, 200 + 1000 + 300, 50 + 500 + 90)
+
+    base_only = tmp_path / "base.jsonl"
+    base_only.write_text(
+        _line(
+            {
+                "timestamp": "2026-07-12T12:00:00.000Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "total_token_usage": {
+                            "input_tokens": 5_000_000,
+                            "cached_input_tokens": 4_000_000,
+                            "output_tokens": 9_000,
+                        }
+                    },
+                },
+            }
+        ),
+        "utf-8",
+    )
+    fresh = Parser({"gpt-test": {"input": 2.0, "output": 8.0}})
+    fresh.ingest_file(base_only)
+    assert fresh.records == []

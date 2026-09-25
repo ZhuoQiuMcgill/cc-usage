@@ -646,19 +646,33 @@ class Parser:
         #   * total grew -> the growth (equal to `last` for 50,155 of 50,157 real
         #     events; the other two are usage `last` does not report, such as a
         #     compaction call);
-        #   * total fell -> the counters restarted: the new total is all new usage.
-        # An event without cumulative counters falls back to its `last`.
+        #   * every counter fell, or the total fell to exactly this event's `last`
+        #     -> the counters restarted: the new total is all new usage (all 9 real
+        #     restarts look like this);
+        #   * anything else (some counters fell, others did not) is not a restart
+        #     anyone has seen: count only this event's `last`, never a whole total
+        #     that could re-count most of a session.
+        # A first event without `last` is only an inherited base: nothing new. An
+        # event without cumulative counters falls back to its `last`.
         if current_total is not None:
             previous = self._codex_totals.get(source)
             self._codex_totals[source] = current_total
             if previous is None:
-                usage = last_tuple if last_tuple is not None else current_total
+                if last_tuple is None:
+                    return None
+                usage = last_tuple
             elif current_total == previous:
                 return None
             elif all(now >= before for now, before in zip(current_total, previous)):
                 usage = tuple(now - before for now, before in zip(current_total, previous))
-            else:
+            elif current_total == last_tuple or all(
+                now < before for now, before in zip(current_total, previous)
+            ):
                 usage = current_total
+            elif last_tuple is not None:
+                usage = last_tuple
+            else:
+                return None
         elif last_tuple is not None:
             usage = last_tuple
         else:
