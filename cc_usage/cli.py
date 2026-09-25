@@ -128,7 +128,7 @@ def run_ledger_info(config, out=None) -> int:
 
     from .engine import Engine
     from .format import human_bytes
-    from .ledger import LedgerError, read_summary
+    from .ledger import LedgerCorrupt, LedgerError, read_summary
 
     out = out or sys.stdout
     _configure_unicode_output(out)
@@ -145,9 +145,15 @@ def run_ledger_info(config, out=None) -> int:
         return 0
     try:
         summary = read_summary(path)
-    except LedgerError as exc:
+    except LedgerCorrupt as exc:
         say(f"  status      unreadable: {exc}")
-        say("  The next ccusage launch moves an unreadable ledger aside and starts a new one.")
+        say(
+            "  The next ccusage launch moves it aside (keeping it) and rebuilds the ledger "
+            "from its readable rows and the daily backup."
+        )
+        return 1
+    except LedgerError as exc:
+        say(f"  status      cannot be read: {exc}")
         return 1
 
     size = summary.size_bytes
@@ -159,23 +165,29 @@ def run_ledger_info(config, out=None) -> int:
 
     identities = engine.ledger_identities()
     current = {(prov, ident): label for label, (prov, ident, _l) in identities.items()}
-    enabled = {r.label for r in (*engine.roots, *engine.codex_roots) if r.enabled}
-    disabled = {key for key, label in current.items() if label not in enabled}
+    disabled_roots = [r for r in (*engine.roots, *engine.codex_roots) if not r.enabled]
+    disabled_labels = {r.label for r in disabled_roots}
+    disabled = {key for key, label in current.items() if label in disabled_labels}
     parts = []
     for label, provider, identity, count in summary.accounts:
         shown = current.get((provider, identity))
         if shown is None:
             parts.append(f"{label} {count:,} (root no longer configured)")
-        elif shown in enabled:
-            parts.append(f"{shown} {count:,}")
-        else:
+        elif shown in disabled_labels:
             parts.append(f"{shown} {count:,} (disabled)")
+        else:
+            parts.append(f"{shown} {count:,}")
     if parts:
         say(f"  accounts    {' · '.join(parts)}")
     if summary.first_ts is not None and summary.last_ts is not None:
         first = datetime.datetime.fromtimestamp(summary.first_ts).date().isoformat()
         last = datetime.datetime.fromtimestamp(summary.last_ts).date().isoformat()
         say(f"  covers      {first} → {last} (local dates)")
+    if summary.backup_time is not None:
+        stamp = datetime.datetime.fromtimestamp(summary.backup_time).strftime("%Y-%m-%d %H:%M")
+        say(f"  backup      {path.name}.bak from {stamp}")
+    else:
+        say("  backup      none yet (ccusage makes one a day while it runs)")
 
     out.flush()
     print("  (comparing with your transcripts…)", file=sys.stderr)
@@ -193,22 +205,35 @@ def run_ledger_info(config, out=None) -> int:
             unrecorded += 1
     say(f"  orphans     {orphans:,}  (usage whose transcripts are gone; kept only by the ledger)")
     say(f"  unrecorded  {unrecorded:,}  (parsed usage not in the ledger yet)")
+    for root in disabled_roots:
+        say(f"  disabled    {root.label} ({root.path}): not scanned, so its usage is not recorded")
     if skipped:
-        say(f"  disabled    {skipped:,}  (rows from disabled roots, not compared)")
+        say(f"              {skipped:,} earlier rows from disabled roots were not compared")
     say()
+    advice: list[str] = []
     if unrecorded:
-        advice = (
-            f"{unrecorded:,} parsed usage records are not in the ledger yet. Launch ccusage "
-            "(or run `ccusage --once`) to record them before you shorten Claude Code's "
-            "transcript retention."
+        noun = "record is" if unrecorded == 1 else "records are"
+        advice.append(
+            f"{unrecorded:,} parsed usage {noun} not in the ledger yet. Launch ccusage "
+            "(or run `ccusage --once`) to record them."
         )
+    if disabled_roots:
+        names = ", ".join(r.label for r in disabled_roots)
+        advice.append(
+            f"Disabled roots are not recorded ({names}). Enable them in Settings → "
+            "Accounts and launch ccusage, or their usage is lost when their transcripts "
+            "are deleted."
+        )
+    if advice:
+        advice.append("Do this before you shorten Claude Code's transcript retention.")
     else:
-        advice = (
-            "Every parsed usage record is in the ledger: usage from transcripts that "
-            "Claude Code deletes later stays in ccusage."
+        advice.append(
+            "Every parsed usage record from every enabled root is in the ledger: usage "
+            "from transcripts that Claude Code deletes later stays in ccusage."
         )
-    for line in textwrap.wrap(advice, width=88):
-        say(line)
+    for paragraph in advice:
+        for line in textwrap.wrap(paragraph, width=88):
+            say(line)
     return 0
 
 

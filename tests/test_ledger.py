@@ -10,6 +10,7 @@ ledger, pricing and discovery stubbed; nothing reads ~/.claude or ~/.codex.
 from __future__ import annotations
 
 import asyncio
+import copy
 import datetime
 import json
 import math
@@ -793,13 +794,20 @@ def test_ledger_writes_only_happen_on_worker_threads(world, monkeypatch):
     from cc_usage.app import CCUsageApp
 
     threads: list[bool] = []
+    backups: list[bool] = []
     real_write = ledger_module.Ledger.write
+    real_backup = ledger_module.Ledger.backup
 
     def spy(self, rows):
         threads.append(threading.current_thread() is threading.main_thread())
         return real_write(self, rows)
 
+    def spy_backup(self):
+        backups.append(threading.current_thread() is threading.main_thread())
+        return real_backup(self)
+
     monkeypatch.setattr(ledger_module.Ledger, "write", spy)
+    monkeypatch.setattr(ledger_module.Ledger, "backup", spy_backup)
     eng = world.engine()
     eng.refresh_limits = lambda: None
     app = CCUsageApp(eng)
@@ -817,6 +825,7 @@ def test_ledger_writes_only_happen_on_worker_threads(world, monkeypatch):
     asyncio.run(scenario())
     eng.close()
     assert len(threads) >= 2 and not any(threads)
+    assert backups == [False]  # the daily backup, taken by a worker too
     assert len(ledger_rows(world.ledger)) == 10
 
 
@@ -988,9 +997,15 @@ def test_ledger_info_reports_rows_range_and_orphans(world, info):
     assert "orphans     6 " in out  # 3 deleted Claude messages + 3 Codex events
     assert "unrecorded  1 " in out
     assert "before you shorten Claude Code's transcript retention" in " ".join(out.split())
-    # Read-only: the ledger, its WAL and the parse cache are untouched.
-    assert {p.name: p.stat().st_mtime_ns for p in world.state.iterdir()} == stamp
-    assert {p.name: p.read_bytes() for p in world.state.iterdir()} == snapshot
+    # Read-only: the ledger and the parse cache are untouched. A read-only SQLite
+    # connection may create its own -wal/-shm index files; the WAL stays empty.
+    after = {p.name: p for p in world.state.iterdir()}
+    for name, content in snapshot.items():
+        assert after[name].read_bytes() == content, name
+        assert after[name].stat().st_mtime_ns == stamp[name], name
+    assert set(after) - set(snapshot) <= {"ledger.sqlite3-wal", "ledger.sqlite3-shm"}
+    if "ledger.sqlite3-wal" in after and "ledger.sqlite3-wal" not in snapshot:
+        assert after["ledger.sqlite3-wal"].stat().st_size == 0
 
 
 def test_ledger_info_all_recorded(world, info):
@@ -998,7 +1013,10 @@ def test_ledger_info_all_recorded(world, info):
     code, out = info()
     assert code == 0
     assert "orphans     0 " in out and "unrecorded  0 " in out
-    assert "Every parsed usage record is in the ledger" in " ".join(out.split())
+    assert "Every parsed usage record from every enabled root is in the ledger" in " ".join(
+        out.split()
+    )
+    assert "disabled" not in out
 
 
 def test_ledger_info_on_a_corrupt_ledger_moves_nothing(world, info):
@@ -1007,3 +1025,588 @@ def test_ledger_info_on_a_corrupt_ledger_moves_nothing(world, info):
     assert code == 1 and "unreadable" in out
     assert world.ledger.read_bytes() == b"not a database" * 100
     assert not list(world.state.glob("ledger.sqlite3.corrupt-*"))
+
+
+# ── critic round 1 ───────────────────────────────────────────────────────────────
+def _synthetic_rows(world: World, n: int, *, start: int = 0) -> list:
+    """History rows for the personal root that no transcript on disk still holds."""
+    from cc_usage.accounts import root_identity
+    from cc_usage.ledger import LedgerRow
+    from cc_usage.parser import ledger_key
+
+    identity = root_identity(world.personal)
+    return [
+        LedgerRow(
+            ledger_key(f"synthetic-{i}"),
+            "claude",
+            identity,
+            "personal",
+            round((NOW - 40 * D + i) * 1000),
+            "claude-opus-4-8",
+            100 + i % 7,
+            10 + i % 5,
+            1000,
+            0,
+            None,
+            None,
+        )
+        for i in range(start, start + n)
+    ]
+
+
+def _usage_count(path: Path) -> int:
+    conn = sqlite3.connect(path)
+    try:
+        return conn.execute("SELECT count(*) FROM usage").fetchone()[0]
+    finally:
+        conn.close()
+
+
+def _corrupt_a_usage_leaf(path: Path) -> None:
+    """Scribble over one leaf page of the usage table (not its root, not page 1)."""
+    conn = sqlite3.connect(path)
+    try:
+        root = conn.execute("SELECT rootpage FROM sqlite_master WHERE name = 'usage'").fetchone()[0]
+        page_size = conn.execute("PRAGMA page_size").fetchone()[0]
+        pages = conn.execute("PRAGMA page_count").fetchone()[0]
+    finally:
+        conn.close()
+    target = pages if pages != root else pages - 1
+    with open(path, "r+b") as fh:
+        fh.seek((target - 1) * page_size)
+        fh.write(b"\xa5" * page_size)
+    conn = sqlite3.connect(path)
+    try:
+        with pytest.raises(sqlite3.DatabaseError):
+            conn.execute("SELECT sum(inp) FROM usage").fetchone()
+    finally:
+        conn.close()
+
+
+# 1. a live record never shows less than the ledger stored for it
+def test_resumed_copy_with_lower_counters_keeps_the_stored_max(world):
+    """A resumed session copies a message into a newer file with zeroed counters.
+    Once retention deletes the original, the live record must not drop to the copy's
+    values — warm or cold."""
+    resumed = world.alpha / "s9-resumed.jsonl"
+    resumed.write_text(
+        claude_line("r4", "m4", NOW - 20 * D, 0, 0) + claude_line("r7", "m7", NOW - 1 * H, 10, 1),
+        "utf-8",
+    )
+    first = world.scanned()
+    before = views(first)
+    first.close()
+    (world.alpha / "sub" / "agent-1.jsonl").unlink()  # the original, with the real m4
+
+    warm = world.scanned()
+    assert_same(views(warm), before)
+    warm.close()
+    cold = world.scanned(cache="fresh.pkl")
+    assert_same(views(cold), before)
+    [m4] = [r for r in cold.records if r.input_tokens == 700]
+    assert cold.parser.has_key(m4.lkey)  # still live (from the copy), at the stored max
+    assert m4.output_tokens == 70 and m4.cache_read == 5000
+    # And the ledger was never lowered by the zeroed copy.
+    assert [row for row in ledger_rows(world.ledger) if row[0] == m4.lkey][0][5:8] == (700, 70, 5000)
+
+
+def test_cut_back_streaming_reply_keeps_its_final_count_after_a_cold_rebuild(world):
+    s3 = world.alpha / "s3.jsonl"
+    partial = claude_line("r9", "m9", NOW - 0.2 * H, 900, 5)
+    s3.write_text(partial + claude_line("r9", "m9", NOW - 0.2 * H, 900, 357), "utf-8")
+    first = world.scanned()
+    before = views(first)
+    first.close()
+    s3.write_text(partial, "utf-8")  # cut back to the partial line
+    cold = world.scanned(cache="fresh.pkl")
+    assert_same(views(cold), before)
+    [m9] = [r for r in cold.records if r.input_tokens == 900]
+    assert m9.output_tokens == 357
+
+
+# 2. the key scheme is recorded, migrated exactly once, and never guessed at
+def _meta_scheme(path: Path) -> int:
+    conn = sqlite3.connect(path)
+    try:
+        return int(conn.execute("SELECT v FROM meta WHERE k = 'key_scheme'").fetchone()[0])
+    finally:
+        conn.close()
+
+
+def test_ledger_records_its_key_scheme(world):
+    from cc_usage.parser import KEY_SCHEME
+
+    world.scanned().close()
+    assert _meta_scheme(world.ledger) == KEY_SCHEME
+    conn = sqlite3.connect(world.ledger)
+    try:
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == ledger_module.SCHEMA_VERSION
+    finally:
+        conn.close()
+
+
+def test_key_scheme_migration_runs_once(world, monkeypatch):
+    world.scanned().close()
+    current = ledger_module.KEY_SCHEME
+    calls = []
+
+    def migrate(conn):
+        calls.append(1)
+        conn.execute("DELETE FROM usage WHERE outp = 70")  # e.g. a record now dropped
+
+    monkeypatch.setattr(ledger_module, "KEY_SCHEME", current + 1)
+    monkeypatch.setitem(ledger_module.KEY_SCHEME_MIGRATIONS, current, migrate)
+    for _ in range(2):
+        eng = world.scanned()
+        assert not any("ledger" in w for w in eng.worker_warnings)
+        eng.close()
+    assert calls == [1]
+    assert _meta_scheme(world.ledger) == current + 1
+
+
+def test_ledger_without_a_migration_path_is_refused_untouched(world, monkeypatch):
+    world.scanned().close()
+    before = _usage_count(world.ledger)
+    monkeypatch.setattr(ledger_module, "KEY_SCHEME", ledger_module.KEY_SCHEME + 5)
+    eng = world.scanned()
+    assert any("no migration" in w and "running without it" in w for w in eng.worker_warnings)
+    assert len(eng.records) == 9  # the panel keeps its live data
+    eng.close()
+    assert _usage_count(world.ledger) == before
+    assert _meta_scheme(world.ledger) == ledger_module.KEY_SCHEME - 5
+
+
+def test_ledger_from_a_newer_scheme_is_left_untouched(world):
+    world.scanned().close()
+    conn = sqlite3.connect(world.ledger)
+    conn.execute("UPDATE meta SET v = '99' WHERE k = 'key_scheme'")
+    conn.commit()
+    conn.close()
+    eng = world.scanned()
+    assert any("newer than this ccusage" in w for w in eng.worker_warnings)
+    eng.close()
+    assert _meta_scheme(world.ledger) == 99
+
+
+def test_prerelease_ledger_is_migrated_without_double_counting(world):
+    """A ledger from the pre-release build (schema v1, no key scheme) keyed Codex
+    events differently: its Codex rows are dropped and re-recorded, Claude rows kept."""
+    eng = world.scanned()
+    before = views(eng)
+    eng.close()
+    conn = sqlite3.connect(world.ledger)
+    conn.execute("DROP TABLE meta")
+    conn.execute("PRAGMA user_version = 1")
+    acct = conn.execute("SELECT id FROM accounts WHERE provider = 'codex'").fetchone()[0]
+    model = conn.execute("SELECT id FROM models LIMIT 1").fetchone()[0]
+    conn.execute(  # an old-scheme Codex key that no longer matches any live event
+        "INSERT INTO usage VALUES (12345, ?, ?, ?, 777, 7, 0, 0, 0, 0)",
+        (acct, round((NOW - 5 * H) * 1000), model),
+    )
+    conn.commit()
+    conn.close()
+    (world.alpha / "sub" / "agent-1.jsonl").unlink()  # Claude history kept across it
+    again = world.scanned(cache="fresh.pkl")
+    assert_same(views(again), before)
+    assert 12345 not in {row[0] for row in ledger_rows(world.ledger)}
+    assert _meta_scheme(world.ledger) == ledger_module.KEY_SCHEME
+
+
+# 4. a lone surrogate in a transcript never stops the scan or the ledger
+def test_lone_surrogates_do_not_stop_the_scan_or_the_ledger(world):
+    weird = world.alpha / "weird.jsonl"
+    weird.write_text(
+        json.dumps(
+            {
+                "type": "assistant",
+                "requestId": "req-\ud800",
+                "timestamp": _iso(NOW - 2 * H),
+                "message": {
+                    "id": "msg-\udfff",
+                    "model": "claude-\ud800-odd",
+                    "usage": {"input_tokens": 11, "output_tokens": 2},
+                },
+            }
+        )
+        + "\n"
+        + claude_line("r8", "m8", NOW - 1 * H, 12, 3),
+        "utf-8",
+    )
+    eng = world.scanned()
+    eng.scan()  # the next tick too
+    assert {r.input_tokens for r in eng.parser.records} >= {11, 12}
+    assert not any("ledger" in w for w in eng.worker_warnings)
+    assert len(ledger_rows(world.ledger)) == 11
+
+
+# 5. an unreadable ledger is salvaged, and the daily backup fills what is not
+def test_partially_damaged_ledger_is_salvaged_row_by_row(tmp_path):
+    from cc_usage.ledger import Ledger, LedgerRow
+    from cc_usage.parser import ledger_key
+
+    path = tmp_path / "ledger.sqlite3"
+    rows = [
+        LedgerRow(ledger_key(f"k{i}"), "claude", "id", "personal", 1_780_000_000_000 + i,
+                  "claude-opus-4-8", i, 1, 2, 3, None, 0)
+        for i in range(5000)
+    ]
+    led = Ledger(path)
+    led.write(rows)
+    led.close()
+    _corrupt_a_usage_leaf(path)
+
+    led = Ledger(path)
+    moved = led.move_aside()
+    report = led.recover(moved)
+    led.close()
+    assert not report.salvage_complete and report.from_backup == 0
+    assert 5000 - 200 < report.salvaged < 5000  # only the scribbled page is lost
+    assert _usage_count(path) == report.salvaged
+    assert "no backup" in report.describe()
+    stored = {row[0]: row for row in ledger_rows(path)}
+    original = {r.key: r for r in rows}
+    assert all(original[k].inp == row[5] for k, row in stored.items())  # values intact
+
+
+def test_damaged_ledger_is_restored_from_the_backup(world):
+    """Deleted-transcript history lives only in the ledger; a damaged ledger must not
+    take it down with it."""
+    first = world.scanned()
+    first._ledger.write(_synthetic_rows(world, 3000))  # history of deleted transcripts
+    first._ledger_synced_parser = None
+    first.sync_ledger()
+    before = views(first)
+    assert before["records"] == 9 + 3000
+    first._ledger.backup()
+    first.close()
+    _corrupt_a_usage_leaf(world.ledger)
+
+    eng = world.scanned(cache="fresh.pkl")
+    assert_same(views(eng), before)  # nothing lost
+    moved = list(world.state.glob("ledger.sqlite3.corrupt-*"))
+    assert len(moved) == 1
+    [note] = [w for w in eng.worker_warnings if "damaged" in w]
+    assert str(moved[0]) in note and "from the backup of" in note
+    assert _usage_count(world.ledger) == 9 + 3000
+
+    # Even a ledger that is garbage from its first byte comes back from the backup.
+    eng.close()
+    world.ledger.write_bytes(b"\x00" * 8192)
+    again = world.scanned(cache="fresh2.pkl")
+    assert_same(views(again), before)
+
+
+def test_backup_is_daily_and_verified(world):
+    eng = world.scanned()
+    bak = world.state / "ledger.sqlite3.bak"
+    assert bak.exists() and _usage_count(bak) == 9
+    stamp = bak.stat().st_mtime_ns
+    with (world.alpha / "s1.jsonl").open("a", encoding="utf-8") as fh:
+        fh.write(claude_line("r7", "m7", NOW - 1 * H, 10, 1))
+    eng.scan()
+    eng.sync_ledger()
+    assert bak.stat().st_mtime_ns == stamp  # not again within the day
+    old = bak.stat().st_mtime - ledger_module.BACKUP_INTERVAL_SECS - 1
+    os.utime(bak, (old, old))
+    with (world.alpha / "s1.jsonl").open("a", encoding="utf-8") as fh:
+        fh.write(claude_line("r8", "m8", NOW - 1 * H, 10, 1))
+    eng.scan()
+    eng.sync_ledger()
+    assert _usage_count(bak) == 11  # refreshed once a day had passed
+    # A copy that fails its integrity check never replaces a good backup.
+    eng._ledger.write(_synthetic_rows(world, 3000))
+    eng.close()
+    good = bak.read_bytes()
+    _corrupt_a_usage_leaf(world.ledger)
+    with pytest.raises(ledger_module.LedgerCorrupt):
+        ledger_module.Ledger(world.ledger).backup()
+    assert bak.read_bytes() == good
+    assert not list(world.state.glob("*.tmp"))
+
+
+# 6. a second process follows the ledger to its new file
+def test_second_process_reopens_after_the_ledger_is_moved_aside(world):
+    from cc_usage.ledger import Ledger
+
+    world.scanned().close()
+    a, b = Ledger(world.ledger), Ledger(world.ledger)
+    b.write(_synthetic_rows(world, 1))  # b holds an open handle
+    moved = a.move_aside()
+    a.recover(moved)
+    a.close()
+    assert b.ensure_current() is True  # noticed the swap
+    b.write(_synthetic_rows(world, 1, start=100))
+    b.close()
+    assert _usage_count(moved) == 10  # nothing more went into the moved-aside file
+    assert _usage_count(world.ledger) == 11
+
+
+def test_engine_resyncs_everything_into_a_replaced_ledger(world):
+    eng = world.scanned()
+    other = ledger_module.Ledger(world.ledger)
+    moved = other.move_aside()
+    other.close()
+    assert moved is not None
+    world.ledger.unlink(missing_ok=True)
+    eng.sync_ledger()  # its old handle points at the moved file; it must follow
+    assert _usage_count(world.ledger) == 9
+    eng.close()
+
+
+# 7. --ledger-info
+def test_ledger_info_reads_an_uncheckpointed_wal(world, info):
+    world.scanned().close()
+    writer = ledger_module.Ledger(world.ledger)
+    writer._open().execute("PRAGMA wal_autocheckpoint = 0")
+    writer.write(_synthetic_rows(world, 25))
+    assert (world.state / "ledger.sqlite3-wal").stat().st_size > 0
+    try:
+        code, out = info()
+    finally:
+        writer.close()
+    assert code == 0
+    assert "records     34  (claude 31 · codex 3)" in out
+    assert "orphans     25 " in out
+
+
+def test_ledger_info_names_disabled_roots_and_never_calls_it_safe(world, info):
+    world.scanned().close()
+    world.claude_roots = [
+        world.claude_roots[0],
+        Root("company", world.company, world.company / "projects", "config", enabled=False),
+    ]
+    code, out = info()
+    flat = " ".join(out.split())
+    assert code == 0
+    assert f"disabled company ({world.company}): not scanned" in flat
+    assert "company 2 (disabled)" in flat
+    assert "Every parsed usage record" not in flat
+    assert "Disabled roots are not recorded (company)" in flat
+    assert "before you shorten Claude Code's transcript retention" in flat
+
+
+# 8. the view can never count a record both live and from the ledger
+def test_parser_registers_a_key_before_listing_the_record(world):
+    parser = Parser(PRICING)
+    seen: list[bool] = []
+
+    class Watched(list):
+        def append(self, record):
+            seen.append(parser.has_key(record.lkey))
+            super().append(record)
+
+    parser.records = Watched()
+    parser.ingest_file(world.alpha / "s1.jsonl")
+    assert seen and all(seen)
+
+
+def test_view_does_not_double_count_a_record_appended_mid_read(world, monkeypatch):
+    world.scanned().close()
+    (world.alpha / "sub" / "agent-1.jsonl").unlink()
+    eng = world.scanned(cache="fresh.pkl")
+    [orphan] = [r for r in eng.records if not eng.parser.has_key(r.lkey)][:1]
+    revived = copy.copy(orphan)
+    parser = eng.parser
+    real = parser.has_key
+    fired = []
+
+    def racing(key):
+        answer = real(key)
+        if key == orphan.lkey and not fired:  # a scan lands right after this check
+            fired.append(1)
+            parser._by_key[key] = revived
+            parser.records.append(revived)
+        return answer
+
+    monkeypatch.setattr(parser, "has_key", racing)
+    eng._view = None
+    records = eng.records
+    assert fired
+    assert sum(1 for r in records if r.lkey == orphan.lkey) <= 1
+
+
+# the critic's mutation list
+def test_revived_transcript_is_not_counted_twice(world):
+    agent = world.alpha / "sub" / "agent-1.jsonl"
+    text = agent.read_text("utf-8")
+    eng = world.scanned()
+    before = views(eng)
+    eng.close()
+    agent.unlink()
+    eng = world.scanned(cache="fresh.pkl")
+    assert len(eng._orphans) == 1
+    agent.write_text(text, "utf-8")  # the transcript comes back (restored, re-synced…)
+    eng.scan()
+    assert_same(views(eng), before)  # at once, before any ledger worker runs
+    eng.sync_ledger()
+    assert eng._orphans == []  # and the worker prunes it
+    assert_same(views(eng), before)
+
+
+def test_view_includes_records_appended_after_it_was_cached(world):
+    world.scanned().close()
+    delete_some(world)
+    eng = world.scanned(cache="fresh.pkl")
+    assert eng._orphans
+    before = views(eng)
+    with (world.alpha / "s1.jsonl").open("a", encoding="utf-8") as fh:
+        fh.write(claude_line("r7", "m7", NOW - 1 * H, 10, 1))
+    eng.scan()
+    after = views(eng)
+    assert after["records"] == before["records"] + 1
+    assert after["windows"]["all"][0] == before["windows"]["all"][0] + 10
+
+
+def test_upsert_never_lowers_a_stored_value(tmp_path):
+    from cc_usage.ledger import Ledger, LedgerRow
+
+    led = Ledger(tmp_path / "l.sqlite3")
+    high = LedgerRow(1, "claude", "i", "p", 1000, "m", 700, 70, 5000, 40, 30, 10)
+    low = LedgerRow(1, "claude", "i", "p", 1000, "m", 0, 0, 0, 0, 0, 0)
+    led.write([high])
+    led.write([low])
+    assert led.rows([1])[0][4:] == (700, 70, 5000, 40, 30, 10)
+    led.write([LedgerRow(1, "claude", "i", "p", 1000, "m", 800, 60, 5000, 40, 30, 10)])
+    assert led.rows([1])[0][4:] == (800, 70, 5000, 40, 30, 10)  # field-wise max
+    led.close()
+
+
+def test_subbucket_null_and_zero_merge_like_the_parser(tmp_path):
+    from cc_usage.ledger import Ledger, LedgerRow
+
+    led = Ledger(tmp_path / "l.sqlite3")
+
+    def row(key, e5, e1):
+        return LedgerRow(key, "claude", "i", "p", 1000, "m", 10, 1, 0, 400, e5, e1)
+
+    def grown(key, e5, e1):  # a later streaming line: more output, so the row updates
+        return LedgerRow(key, "claude", "i", "p", 1000, "m", 10, 99, 0, 400, e5, e1)
+
+    led.write([row(1, None, None), row(2, 300, 0), row(3, None, None), row(4, 500, 20)])
+    led.write([grown(1, 300, 100), grown(2, None, None), grown(3, None, None), grown(4, 200, 90)])
+    stored = {r[0]: r[8:] for r in led.rows([1, 2, 3, 4])}
+    # NULL = "no sub-bucket object": kept only while both sides lack it; else the max.
+    assert stored == {1: (300, 100), 2: (300, 0), 3: (None, None), 4: (500, 90)}
+    led.close()
+
+
+def test_failed_incremental_write_is_retried_on_the_next_sync(world, monkeypatch):
+    eng = world.scanned()  # the full diff is done; later syncs are incremental
+    with (world.alpha / "s1.jsonl").open("a", encoding="utf-8") as fh:
+        fh.write(claude_line("r7", "m7", NOW - 1 * H, 10, 1))
+    eng.scan()
+    real_write = ledger_module.Ledger.write
+
+    def busy(self, rows):
+        raise ledger_module.LedgerBusy("database is locked")
+
+    monkeypatch.setattr(ledger_module.Ledger, "write", busy)
+    eng.sync_ledger()
+    monkeypatch.setattr(ledger_module.Ledger, "write", real_write)
+    eng.sync_ledger()
+    assert len(ledger_rows(world.ledger)) == 10
+
+
+def test_unstored_record_survives_a_restart_after_its_transcript_is_deleted(
+    world, monkeypatch
+):
+    s3 = world.alpha / "s3.jsonl"
+    s3.write_text(claude_line("r1x", "m1x", NOW - 3 * D, 1, 1), "utf-8")
+    eng = world.scanned()
+    with s3.open("a", encoding="utf-8") as fh:
+        fh.write(claude_line("r7", "m7", NOW - 1 * H, 10, 1))
+    eng.scan()
+    real_write = ledger_module.Ledger.write
+
+    def full(self, rows):
+        raise LedgerUnavailable("database or disk is full")
+
+    monkeypatch.setattr(ledger_module.Ledger, "write", full)
+    eng.sync_ledger()
+    eng.save_cache()  # m7 is saved as not yet in the ledger
+    eng.close()
+    monkeypatch.setattr(ledger_module.Ledger, "write", real_write)
+    s3.unlink()  # …and its transcript is deleted before the next run
+
+    again = world.engine()
+    again.scan()  # like `--once`: the cache no longer matches disk and is rebuilt
+    again.sync_ledger()
+    assert any(r.input_tokens == 10 and r.output_tokens == 1 for r in again.records)
+    assert len(ledger_rows(world.ledger)) == 11
+
+
+def test_damaged_ledger_moves_its_wal_and_shm_aside_too(world):
+    world.ledger.write_bytes(b"not a database" * 300)
+    wal = world.state / "ledger.sqlite3-wal"
+    wal.write_bytes(b"old wal frames" * 10)
+    shm = world.state / "ledger.sqlite3-shm"
+    shm.write_bytes(b"\x00" * 64)
+    world.scanned().close()
+    [moved] = [p for p in world.state.glob("ledger.sqlite3.corrupt-*") if p.suffix != ".bak"
+               and not p.name.endswith(("-wal", "-shm"))]
+    assert Path(f"{moved}-wal").read_bytes() == b"old wal frames" * 10
+    assert Path(f"{moved}-shm").exists()
+    assert _usage_count(world.ledger) == 9
+
+
+def test_ledger_restored_from_an_older_backup_catches_up_with_the_parse(world):
+    """The backup predates a record's final streaming line. After recovery the ledger
+    must be raised to what the (warm) parse holds, not left at the backup's value."""
+    s3 = world.alpha / "s3.jsonl"
+    ts = NOW - 0.2 * H
+    s3.write_text(claude_line("r9", "m9", ts, 900, 7), "utf-8")
+    eng = world.scanned()  # the first sync also takes the daily backup (out = 7)
+    with s3.open("a", encoding="utf-8") as fh:
+        fh.write(claude_line("r9", "m9", ts + 5, 900, 1500))
+    eng.scan()
+    eng.sync_ledger()
+    eng.save_cache()
+    eng.close()
+    world.ledger.write_bytes(b"\x00" * 4096)  # nothing salvageable
+
+    warm = world.engine()
+    assert warm.prime_cache()  # the record is not dirty: it comes from the cache
+    warm.sync_ledger()
+    warm.close()
+    assert _ledger_output(world, ts) == 1500
+    s3.unlink()
+    cold = world.scanned(cache="fresh.pkl")
+    assert [r.output_tokens for r in cold.records if r.input_tokens == 900] == [1500]
+
+
+def test_backup_that_fails_its_check_never_replaces_the_good_one(world, monkeypatch):
+    eng = world.scanned()
+    bak = world.state / "ledger.sqlite3.bak"
+    good = bak.read_bytes()
+    real_connect = ledger_module.sqlite3.connect
+
+    class Checked(sqlite3.Connection):
+        def execute(self, sql, *args):
+            if "quick_check" in sql:  # the copy reports damage instead of "ok"
+                return super().execute("SELECT 'row 3 missing from index'")
+            return super().execute(sql, *args)
+
+    def connect(target, *args, **kwargs):
+        if str(target).endswith(".tmp"):
+            kwargs["factory"] = Checked
+        return real_connect(target, *args, **kwargs)
+
+    monkeypatch.setattr(ledger_module.sqlite3, "connect", connect)
+    with pytest.raises(ledger_module.LedgerCorrupt, match="integrity check"):
+        eng._ledger.backup()
+    assert bak.read_bytes() == good
+    assert not list(world.state.glob("*.tmp"))
+    eng.close()
+
+
+@pytest.mark.parametrize("damage", ["missing", "corrupt"])
+def test_warm_start_backfills_a_lost_ledger(world, damage):
+    world.scanned().close()
+    for side in world.state.glob("ledger.sqlite3*"):
+        side.unlink()  # the ledger and its backup are gone
+    if damage == "corrupt":
+        world.ledger.write_bytes(b"garbage" * 1000)
+    eng = world.engine()
+    assert eng.prime_cache()  # warm: nothing is re-parsed, so nothing is "dirty"
+    eng.sync_ledger()
+    assert len(ledger_rows(world.ledger)) == 9

@@ -48,11 +48,13 @@ from .aggregate import (
 )
 from .config import Config, save_config
 from .ledger import (
+    UNATTRIBUTED,
     Ledger,
     LedgerBusy,
     LedgerCorrupt,
     LedgerError,
     LedgerRow,
+    LedgerUnavailable,
     orphan_record,
 )
 from .limits_fetch import (
@@ -76,6 +78,12 @@ from .render import RenderState
 
 # Sentinel for "put the ledger beside the parse cache" (the default).
 _BESIDE_CACHE = object()
+
+
+def _gt(a: int | None, b: int | None) -> bool:
+    """`a` beats `b` for a sub-bucket where None means "absent" (never higher)."""
+    return a is not None and (b is None or a > b)
+
 # While nothing forces a full orphan diff, re-run it at most this often when another
 # process has committed to the shared ledger (it may hold history this one lacks).
 _LEDGER_REDIFF_SECS = 300.0
@@ -267,19 +275,23 @@ class Engine:
         orphans = self._orphans
         if not orphans:
             return live, set()
+        # Length first: the parser registers a key before it lists the record, so every
+        # record in live[:n] is already known as live when the orphans are filtered
+        # below — a scan appending concurrently can never make one count twice.
+        n = len(live)
         view = self._view
         if (
             view is not None
             and view[0] is parser
             and view[1] is live
-            and view[2] == len(live)
+            and view[2] == n
             and view[3] is orphans
         ):
             return view[4], view[5]
         extra = [o for o in orphans if not parser.has_key(o.lkey)]
-        combined = live + extra if extra else live
+        combined = live[:n] + extra
         unknown = {o.model_norm for o in extra if not o.known and o.model_norm != "(unknown)"}
-        self._view = (parser, live, len(live), orphans, combined, unknown)
+        self._view = (parser, live, n, orphans, combined, unknown)
         return combined, unknown
 
     def _scoped_records(self) -> list[UsageRecord]:
@@ -453,20 +465,20 @@ class Engine:
             scanned = self._scanned
         if not scanned:
             return  # mid root-swap: the rescan's worker syncs the new parser
+        ledger = self._ledger
+        recovered: str | None = None
         try:
             try:
                 result = self._ledger_pass(parser)
             except LedgerCorrupt as exc:
-                moved = self._ledger.move_aside()
-                if moved is not None:
-                    self.record_worker_warning(
-                        "ledger moved",
-                        f"usage ledger was unreadable ({exc}); moved it to {moved} "
-                        "and started a fresh one from the transcripts",
-                    )
-                # A fresh file: the retry's full diff backfills every live record.
+                recovered = self._recover_ledger(exc)
+                # A fresh file: the retry's full diff backfills every live record. A
+                # second LedgerCorrupt here is not retried again (it is unavailable).
                 self._ledger_synced_parser = None
-                result = self._ledger_pass(parser)
+                try:
+                    result = self._ledger_pass(parser)
+                except LedgerCorrupt as again:
+                    raise LedgerUnavailable(f"still unreadable after recovery: {again}")
         except LedgerBusy as exc:
             self._ledger_retry = True
             self.record_worker_warning(
@@ -475,13 +487,14 @@ class Engine:
             return
         except LedgerError as exc:
             self._ledger_retry = True
-            self._ledger.close()
+            ledger.close()
             self.record_worker_warning(
                 "ledger", f"usage ledger unavailable ({exc}); running without it"
             )
             return
         self._ledger_retry = False
         self.record_worker_warning("ledger", None)
+        self._backup_ledger(force=recovered is not None)
         if result is None:
             return
         orphans, history_accounts = result
@@ -491,6 +504,38 @@ class Engine:
             self._orphans = orphans
             self._history_accounts = history_accounts
             self._refresh_account_flags()
+
+    def _recover_ledger(self, exc: LedgerError) -> str | None:
+        """Move an unreadable ledger aside and rebuild it from everything still
+        readable: the damaged file's intact pages, then the daily backup. Returns the
+        warning shown (sticky for the session), or None if another ccusage already
+        replaced the file. Raises LedgerUnavailable if it cannot even be moved."""
+        ledger = self._ledger
+        moved = ledger.move_aside()
+        if moved is None:
+            return None
+        try:
+            report = ledger.recover(moved)
+        except LedgerError as failure:
+            message = (
+                f"the usage ledger was damaged ({exc}); moved it to {moved}, but "
+                f"recovering its history failed ({failure}); it stays in that file"
+            )
+        else:
+            message = report.describe()
+        self.record_worker_warning("ledger moved", message)
+        return message
+
+    def _backup_ledger(self, *, force: bool = False) -> None:
+        """Refresh ``ledger.sqlite3.bak`` at most once a day (worker path only)."""
+        ledger = self._ledger
+        try:
+            if force or ledger.backup_due():
+                ledger.backup()
+        except LedgerError as exc:
+            self.record_worker_warning("ledger backup", f"usage ledger backup failed: {exc}")
+            return
+        self.record_worker_warning("ledger backup", None)
 
     def ledger_identities(self) -> dict[str, tuple[str, str, str]]:
         """label -> (provider, identity, label) for every discovered root, enabled or
@@ -520,16 +565,24 @@ class Engine:
         return LedgerRow.from_record(record, record.provider, identity, label)
 
     def _ledger_pass(self, parser: Parser):
-        """One sync: store changed records, then (when due) redo the orphan diff.
+        """One sync: store changed records, then (when due) redo the full diff.
 
         Returns (orphans, history_accounts) when the ledger-only view was recomputed,
         else None. A full diff runs on the first sync of a parser, after its records
-        were discarded (epoch bump), and — throttled — when another process wrote. It
-        reads every stored key once: stored-but-not-live keys are the orphans, and
-        live-but-not-stored records are backfilled (the first run writes them all)."""
+        were discarded (epoch bump), when the ledger file was replaced under us, and —
+        throttled — when another process wrote. It streams every stored row once:
+          * stored, not live -> an orphan (history whose transcript is gone);
+          * live, not stored -> backfilled (the first run writes everything);
+          * both, stored higher in some field -> folded into the live record, so a
+            transcript that lost a record's best values (a resumed copy with lower
+            counters outliving the original, a cut-back streaming reply) never shows
+            less than was once seen;
+          * both, live higher -> written, so the ledger never lags the parse."""
         ledger = self._ledger
         epoch = parser.epoch
-        full = self._ledger_synced_parser is not parser or self._ledger_synced_epoch != epoch
+        full = ledger.ensure_current()
+        full = full or self._ledger_synced_parser is not parser
+        full = full or self._ledger_synced_epoch != epoch
         if (
             not full
             and ledger.is_open
@@ -541,11 +594,12 @@ class Engine:
         try:
             if full:
                 live = parser.live_index()
-                stored = ledger.key_accounts()
-                pending = dict(dirty)
-                for key, record in live.items():
-                    if key not in stored:
-                        pending.setdefault(key, record)
+                orphan_rows, absorb, stale = self._diff(ledger, live)
+                parser.absorb(absorb)
+                # What `live` still holds after the diff was never stored.
+                pending = {**live, **dirty}
+                for key, record in stale:
+                    pending.setdefault(key, record)
             else:
                 pending = dirty
             if pending:
@@ -558,32 +612,94 @@ class Engine:
                 orphans = [o for o in self._orphans if not parser.has_key(o.lkey)]
                 return orphans, self._history_accounts
             return None
-        # Keys written just now that are not live (an unstored update to a record whose
-        # transcript was already gone) are orphans too.
-        candidates = {key: account for key, account in stored.items() if key not in live}
-        for key in pending:
-            if key not in live and key not in candidates:
-                candidates[key] = None
-        result = self._load_orphans(parser, candidates, identities)
+        # A pending record that is not live (an update stored late for a record whose
+        # transcript is already gone) is an orphan too; read its merged row back.
+        late = [key for key in pending if not parser.has_key(key)]
+        for row in ledger.rows(late):
+            orphan_rows[row[0]] = row
+        result = self._load_orphans(parser, orphan_rows, identities)
         self._ledger_synced_parser = parser
         self._ledger_synced_epoch = epoch
         self._ledger_full_at = time.monotonic()
         return result
 
+    @staticmethod
+    def _diff(
+        ledger: Ledger, live: dict[int, UsageRecord]
+    ) -> tuple[dict[int, tuple], list[tuple], list[tuple[int, UsageRecord]]]:
+        """Stream the stored rows against the live index (consumed: what is left in
+        `live` afterwards was never stored). Returns (orphan rows by key, absorb
+        updates for `Parser.absorb`, live records the ledger holds lower values for)."""
+        unattributed = next(
+            (i for i, name in ledger.models().items() if name == UNATTRIBUTED), None
+        )
+        model_names: dict[int, str] | None = None
+        orphan_rows: dict[int, tuple] = {}
+        absorb: list[tuple] = []
+        stale: list[tuple[int, UsageRecord]] = []
+        pop = live.pop
+        for row in ledger.all_rows():
+            key, _acct, _ts, model, inp, outp, cr, cc, e5, e1 = row
+            record = pop(key, None)
+            if record is None:
+                orphan_rows[key] = row
+                continue
+            ri, ro = record.input_tokens, record.output_tokens
+            rcr, rcc = record.cache_read, record.cache_creation
+            r5, r1 = record._eph_5m, record._eph_1h
+            live_unattributed = record.model_raw == UNATTRIBUTED
+            stored_unattributed = model == unattributed
+            if (
+                inp == ri
+                and outp == ro
+                and cr == rcr
+                and cc == rcc
+                and e5 == r5
+                and e1 == r1
+                and live_unattributed == stored_unattributed
+            ):
+                continue  # the common case: identical
+            if (
+                inp > ri
+                or outp > ro
+                or cr > rcr
+                or cc > rcc
+                or _gt(e5, r5)
+                or _gt(e1, r1)
+                or (live_unattributed and not stored_unattributed)
+            ):
+                name = None
+                if live_unattributed and not stored_unattributed:
+                    if model_names is None:
+                        model_names = ledger.models()
+                    name = model_names.get(model)
+                absorb.append((record, inp, outp, cr, cc, e5, e1, name))
+            if (
+                ri > inp
+                or ro > outp
+                or rcr > cr
+                or rcc > cc
+                or _gt(r5, e5)
+                or _gt(r1, e1)
+                or (stored_unattributed and not live_unattributed)
+            ):
+                stale.append((key, record))
+        return orphan_rows, absorb, stale
+
     def _load_orphans(
         self,
         parser: Parser,
-        candidates: dict[int, int | None],
+        orphan_rows: dict[int, tuple],
         identities: dict[str, tuple[str, str, str]],
     ) -> tuple[list[UsageRecord], list[tuple[str, str]]]:
-        """Rebuild the ledger-only records for `candidates` (key -> account id).
+        """Rebuild the ledger-only records from their stored rows.
 
         Account labels (R5): a row whose root is still discovered shows under that
         root's *current* label, so a rename keeps one account; a disabled root's rows
         are excluded, like its live records; a root no longer configured falls back to
         the label stored with its rows, suffixed if a current account already uses it so
         two accounts never merge."""
-        if not candidates:
+        if not orphan_rows:
             return [], []
         ledger = self._ledger
         accounts = ledger.accounts()
@@ -599,15 +715,12 @@ class Engine:
                 display[account_id] = (label, provider, False) if label in enabled else None
             else:
                 display[account_id] = (_dedupe_label(stored_label, used), provider, True)
-        keys = [
-            key
-            for key, account_id in candidates.items()
-            if account_id is None or display.get(account_id) is not None
-        ]
         orphans: list[UsageRecord] = []
         history: dict[str, str] = {}
         pricing = parser.pricing
-        for row in ledger.rows(keys):
+        for key, row in orphan_rows.items():
+            if parser.has_key(key):
+                continue  # picked up by a scan since the diff read it
             shown = display.get(row[1])
             if shown is None:
                 continue  # a disabled root (or an unknown account id)

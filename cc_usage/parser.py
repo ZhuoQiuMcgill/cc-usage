@@ -220,14 +220,28 @@ def _legacy_default_roots() -> list[tuple[Path, str]]:
     return roots
 
 
+# Version of the rules that turn transcript lines into ledger records (T17): how a key
+# is derived, which events become records, and how their values are computed. The usage
+# ledger stores it and refuses to mix schemes. Bump it — together with a migration in
+# `ledger.KEY_SCHEME_MIGRATIONS` and a `_CACHE_VERSION` bump — whenever a change would
+# re-key an event, stop emitting one, or lower its values (see the ledger module).
+#   1: Claude (requestId, message.id) / uuid; Codex session + timestamp + counters, an
+#      event counted only when the rollout's cumulative counters advance.
+KEY_SCHEME = 1
+
+
 def ledger_key(material: str) -> int:
     """Stable signed 64-bit key for one usage event's key material (T17).
 
     BLAKE2b is stable across processes and Python versions (unlike `hash()`), and 64
     bits fit SQLite's INTEGER PRIMARY KEY, so the ledger needs no separate index. A
     collision needs ~4 billion events for even odds; at a million events it is ~3e-8.
+    ``surrogatepass`` keeps a JSON-escaped lone surrogate (``"\\ud800"``) in an id from
+    raising: `json.loads` yields it, and strict UTF-8 cannot encode it.
     """
-    digest = hashlib.blake2b(material.encode("utf-8"), digest_size=8).digest()
+    digest = hashlib.blake2b(
+        material.encode("utf-8", "surrogatepass"), digest_size=8
+    ).digest()
     return int.from_bytes(digest, "big", signed=True)
 
 
@@ -327,6 +341,9 @@ class Parser:
         # atomic so a mark can never land in a dict the worker is already iterating.
         self._dirty: dict[int, UsageRecord] = {}
         self._dirty_lock = threading.Lock()
+        # Serializes record mutation between a scan (UI thread or scan worker) and the
+        # ledger worker's `absorb`. Reentrant: a scan may load the cache under it.
+        self._lock = threading.RLock()
         # Bumped whenever the record set is discarded (a cache that no longer matches
         # disk). Records only ever *leave* the live set this way, so the ledger redoes
         # its full orphan diff exactly when this changes.
@@ -749,10 +766,14 @@ class Parser:
             # on to recognise Codex.
             rec.account = account_label
             rec.provider = CODEX_PROVIDER if is_codex else CLAUDE_PROVIDER
-            self.records.append(rec)
+            # Register the key *before* the record becomes visible in `records`: the
+            # engine's view reads `records[:n]` and then drops ledger orphans whose key
+            # is live, so a record that is listed is always already known as live and
+            # can never be counted a second time from the ledger.
             if rec.lkey is not None:
                 self._by_key[rec.lkey] = rec
                 self._mark_dirty(rec)
+            self.records.append(rec)
             if is_codex and source not in self._file_models:
                 self._codex_pending.setdefault(source, []).append(rec)
             self.stats.records += 1
@@ -852,7 +873,18 @@ class Parser:
         progress: ProgressCallback | None = None,
         cancelled: CancelCheck | None = None,
     ) -> ParseStats:
-        """Reconcile cached paths, then read new bytes with progress/cancellation."""
+        """Reconcile cached paths, then read new bytes with progress/cancellation.
+
+        Holds the parser lock throughout, so the ledger worker's `absorb` never
+        interleaves with a merge of the same record."""
+        with self._lock:
+            return self._scan(progress, cancelled)
+
+    def _scan(
+        self,
+        progress: ProgressCallback | None,
+        cancelled: CancelCheck | None,
+    ) -> ParseStats:
         if progress is not None:
             progress(ScanProgress(phase="discovering"))
         files = self._discover_files(cancelled)
@@ -921,12 +953,54 @@ class Parser:
         """Load cached aggregates immediately; filesystem reconciliation can follow."""
         if self.cache_path is None:
             return False
-        if self._cache_loaded:
-            return bool(self.records)
-        self._cache_loaded = True
-        loaded = self._load_cache(None)
-        self._cache_unvalidated = loaded
-        return loaded
+        with self._lock:
+            if self._cache_loaded:
+                return bool(self.records)
+            self._cache_loaded = True
+            loaded = self._load_cache(None)
+            self._cache_unvalidated = loaded
+            return loaded
+
+    def absorb(self, updates: list[tuple]) -> None:
+        """Raise live records to what the usage ledger already stores for them (T17).
+
+        A transcript can lose a record's best values while the record stays live: a
+        resumed session copies a message into a newer file with lower (even zeroed)
+        counters and retention then deletes the original, or a file is cut back
+        between a streaming reply's partial and final lines. The ledger kept the
+        maximum; folding it in here by the same field-wise max (T9) keeps the live view
+        from ever showing less than was once seen. Also adopts a resolved model for a
+        record still `codex-unattributed`. Each update is
+        ``(record, inp, outp, cr, cc, e5, e1, model_raw_or_None)``."""
+        if not updates:
+            return
+        with self._lock:
+            models_changed = False
+            for record, inp, outp, cr, cc, e5, e1, model in updates:
+                if model is not None and record.model_raw == "codex-unattributed":
+                    record.model_raw = model
+                    record.model_norm = normalize_model(model) or "codex-unattributed"
+                    record.known = get_rates(model, self.pricing) is not None
+                    models_changed = True
+                record.input_tokens = max(record.input_tokens, inp)
+                record.output_tokens = max(record.output_tokens, outp)
+                record.cache_read = max(record.cache_read, cr)
+                record.cache_creation = max(record.cache_creation, cc)
+                record._eph_5m = _max_opt(record._eph_5m, e5)
+                record._eph_1h = _max_opt(record._eph_1h, e1)
+                record.cost = compute_cost(
+                    input_tokens=record.input_tokens,
+                    output_tokens=record.output_tokens,
+                    cache_read=record.cache_read,
+                    cache_creation_total=record.cache_creation,
+                    ephemeral_5m=record._eph_5m,
+                    ephemeral_1h=record._eph_1h,
+                    rates=get_rates(record.model_raw, self.pricing),
+                )
+            if models_changed:
+                self.stats.unknown_models = {
+                    r.model_norm for r in self.records if not r.known and r.model_norm
+                }
 
     def _clear_cache_state(self) -> None:
         self.records = []

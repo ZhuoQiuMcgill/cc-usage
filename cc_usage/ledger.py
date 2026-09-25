@@ -28,25 +28,54 @@ parser's own rule — field-wise max (T9) — and a ``codex-unattributed`` model
 once the rollout's turn_context resolves it. WAL mode plus a busy timeout let several
 ccusage processes share the file. Every failure surfaces as a `LedgerError` subclass so
 the engine can degrade to a panel warning and keep running (T14).
+
+**Compatibility rule — read before changing the parser.** Once transcripts are deleted
+the ledger is the only copy of their usage, and it was written by *older* parser code.
+The engine treats "stored but not parsed" as history and merges by field-wise max, so a
+parser change that does any of the following silently corrupts history unless it ships
+with a ledger migration:
+
+* **changes how a key is derived** (every old row would come back as an orphan and be
+  counted a second time next to its re-keyed live twin);
+* **stops emitting a record it used to emit** (the old row comes back as an orphan);
+* **lowers a record's values** (the old, higher row wins the max merge forever).
+
+Such a change must bump `KEY_SCHEME` (in parser.py, next to the key derivation) *and*
+register a function in `KEY_SCHEME_MIGRATIONS` that rewrites the stored rows to the new
+rules — delete, re-key or lower them — inside the transaction the ledger opens for it.
+Bump the parse cache's `_CACHE_VERSION` too. A ledger whose scheme has no migration path
+is refused (the panel warns and runs without it) rather than double counted; a ledger
+written by a *newer* scheme is left untouched.
+
+Recovery: a daily backup (``ledger.sqlite3.bak``, SQLite's online backup API, verified
+before it replaces the previous one) is taken from the worker. An unreadable ledger is
+renamed aside — never deleted — and every readable row is salvaged from it, plus every
+row of the backup, into the fresh ledger through the same max merge.
 """
 
 from __future__ import annotations
 
 import os
+import shutil
 import sqlite3
+import tempfile
 import time
+import uuid
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
 from .accounts import CODEX_PROVIDER
 from .cost import compute_cost, get_rates, normalize_model
-from .parser import UsageRecord
+from .parser import KEY_SCHEME, UsageRecord
 
-SCHEMA_VERSION = 1
+# v1: the pre-release T17 build (no meta table). v2 adds `meta` (key scheme, lineage).
+SCHEMA_VERSION = 2
 BUSY_TIMEOUT_MS = 5000
 # Keep the WAL from lingering at the size of the first (backfill) transaction.
 _JOURNAL_SIZE_LIMIT = 4 * 1024 * 1024
 UNATTRIBUTED = "codex-unattributed"
+BACKUP_INTERVAL_SECS = 24 * 3600
 # Batch size for `key IN (...)` lookups: well under SQLite's variable limit on every
 # supported version (999 before 3.32).
 _IN_BATCH = 500
@@ -75,6 +104,7 @@ _SCHEMA = (
         e1 INTEGER
     )""",
 )
+_META = "CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT NOT NULL) WITHOUT ROWID"
 
 # Merge an incoming row into a stored one exactly as the parser merges streaming lines
 # (field-wise max, NULL sub-bucket kept only while both sides lack it), and let a
@@ -108,6 +138,26 @@ WHERE excluded.inp > usage.inp
 _ROW_COLUMNS = "key, acct, ts, model, inp, outp, cr, cc, e5, e1"
 
 
+# ── key-scheme migrations (see the compatibility rule above) ─────────────────────
+def _migrate_scheme_0(conn: sqlite3.Connection) -> None:
+    """Scheme 0 -> 1: the pre-release T17 build keyed Codex events with an ordinal and
+    stored Codex re-emissions as usage. Neither can be re-keyed from a stored row, so
+    its Codex rows are dropped; the next full sync re-records every rollout still on
+    disk under scheme 1. Claude keys did not change and are kept."""
+    conn.execute(
+        "DELETE FROM usage WHERE acct IN (SELECT id FROM accounts WHERE provider = ?)",
+        (CODEX_PROVIDER,),
+    )
+
+
+# KEY_SCHEME_MIGRATIONS[n] upgrades a ledger written under key scheme n to n + 1. Each
+# runs inside the write transaction that also records the new scheme, so a migration is
+# all-or-nothing and runs exactly once per ledger.
+KEY_SCHEME_MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
+    0: _migrate_scheme_0,
+}
+
+
 class LedgerError(Exception):
     """The ledger could not be used for this operation (never fatal to the panel)."""
 
@@ -121,9 +171,11 @@ class LedgerCorrupt(LedgerError):
 
 
 class LedgerUnavailable(LedgerError):
-    """Disk full, read-only or unopenable location, or a newer schema: run without it."""
+    """Disk full, read-only or unopenable location, or an incompatible ledger: run
+    without it."""
 
 
+_SQLITE_HEADER = b"SQLite format 3\x00"
 # SQLite primary result codes (the low byte of an extended code).
 _SQLITE_BUSY, _SQLITE_LOCKED, _SQLITE_CORRUPT, _SQLITE_NOTADB = 5, 6, 11, 26
 
@@ -161,6 +213,22 @@ def _rollback(conn: sqlite3.Connection) -> None:
             conn.execute("ROLLBACK")
     except sqlite3.Error:
         pass
+
+
+def _text(value: str) -> str:
+    """A str SQLite can store. Transcripts are JSON, and a JSON-escaped lone surrogate
+    (``"\\ud800"``) survives `json.loads` as a str that UTF-8 cannot encode; binding it
+    would fail the whole write. Such a character becomes U+FFFD in the stored copy."""
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        return value.encode("utf-8", "surrogatepass").decode("utf-8", "replace")
+    return value
+
+
+def _meta(conn: sqlite3.Connection, key: str) -> str | None:
+    row = conn.execute("SELECT v FROM meta WHERE k = ?", (key,)).fetchone()
+    return row[0] if row is not None else None
 
 
 @dataclass(frozen=True, slots=True)
@@ -240,6 +308,41 @@ def orphan_record(
     )
 
 
+@dataclass
+class Recovery:
+    """What `Ledger.recover` got back after an unreadable ledger was moved aside."""
+
+    moved: Path
+    salvaged: int  # rows read back from the damaged file
+    salvage_complete: bool  # every part of the damaged file was readable
+    from_backup: int  # rows only the backup still had
+    backup_time: float | None  # mtime of the backup used, if any
+
+    def describe(self) -> str:
+        parts = [f"the usage ledger was damaged; moved it to {self.moved}"]
+        if self.salvage_complete:
+            parts.append(f"recovered all {self.salvaged:,} rows from it — history intact")
+            return "; ".join(parts)
+        backup = (
+            f" and {self.from_backup:,} more from the backup of "
+            f"{time.strftime('%Y-%m-%d %H:%M', time.localtime(self.backup_time))}"
+            if self.backup_time is not None
+            else ""
+        )
+        parts.append(f"recovered {self.salvaged:,} readable rows{backup}")
+        if self.backup_time is not None:
+            parts.append(
+                "usage recorded only in the damaged part after the backup, for "
+                "transcripts already deleted, may be lost"
+            )
+        else:
+            parts.append(
+                "part of it was unreadable and there was no backup: history of deleted "
+                "transcripts in that part is lost"
+            )
+        return "; ".join(parts)
+
+
 class Ledger:
     """One process's connection to the shared ledger file.
 
@@ -250,6 +353,7 @@ class Ledger:
 
     def __init__(self, path: Path):
         self.path = Path(path)
+        self.backup_path = self.path.with_name(self.path.name + ".bak")
         self._conn: sqlite3.Connection | None = None
         self._file_id: tuple[int, int] | None = None
         self._data_version: int | None = None
@@ -259,13 +363,45 @@ class Ledger:
     def is_open(self) -> bool:
         return self._conn is not None
 
+    def _is_current(self) -> bool:
+        """Whether the ledger path still names the file our connection has open.
+
+        Another ccusage may have renamed an unreadable ledger aside and started a
+        fresh one; a connection opened before that still points at the renamed file,
+        and everything written through it would be lost to every later reader."""
+        current = _file_id(self.path)
+        return current is not None and current == self._file_id
+
+    def ensure_current(self) -> bool:
+        """Reconnect if the path now names a different file. True when it did (the
+        caller should treat the ledger as new and re-sync everything it holds)."""
+        if self._conn is None or self._is_current():
+            return False
+        self.close()
+        return True
+
     def _open(self) -> sqlite3.Connection:
         if self._conn is not None:
-            return self._conn
+            if self._is_current():
+                return self._conn
+            self.close()
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
             raise LedgerUnavailable(f"cannot create {self.path.parent}: {exc}") from exc
+        # Refuse a file that is not SQLite before SQLite touches it: closing a
+        # connection to such a file makes SQLite delete its -wal/-shm, and those belong
+        # with the damaged file when it is moved aside.
+        try:
+            with open(self.path, "rb") as fh:
+                head = fh.read(len(_SQLITE_HEADER))
+        except FileNotFoundError:
+            head = b""
+        except OSError as exc:
+            raise LedgerUnavailable(f"cannot read {self.path}: {exc}") from exc
+        if head and head != _SQLITE_HEADER:
+            self._file_id = _file_id(self.path)
+            raise LedgerCorrupt("file is not a database")
         try:
             conn = sqlite3.connect(
                 str(self.path),
@@ -276,7 +412,8 @@ class Ledger:
         except sqlite3.Error as exc:
             raise _classify(exc) from exc
         # Remember exactly which file we opened, so a corrupt-file rename never moves a
-        # fresh ledger another process has already put in its place.
+        # fresh ledger another process has already put in its place, and so a rename by
+        # another process is noticed (see `_is_current`).
         self._file_id = _file_id(self.path)
         try:
             conn.execute(f"PRAGMA busy_timeout = {BUSY_TIMEOUT_MS}")
@@ -297,20 +434,66 @@ class Ledger:
     @staticmethod
     def _ensure_schema(conn: sqlite3.Connection) -> None:
         version = conn.execute("PRAGMA user_version").fetchone()[0]
-        if version == SCHEMA_VERSION:
-            return
         if version > SCHEMA_VERSION:
             raise LedgerUnavailable(
                 f"ledger schema v{version} is newer than this ccusage understands "
                 f"(v{SCHEMA_VERSION}); leaving it untouched"
             )
+        if version < SCHEMA_VERSION:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                # Re-check under the write lock: another process may have just done it.
+                version = conn.execute("PRAGMA user_version").fetchone()[0]
+                if version == 0:
+                    for statement in _SCHEMA:
+                        conn.execute(statement)
+                    conn.execute(_META)
+                    conn.execute(
+                        "INSERT INTO meta (k, v) VALUES ('key_scheme', ?), ('ledger_id', ?)",
+                        (str(KEY_SCHEME), uuid.uuid4().hex),
+                    )
+                elif version == 1:
+                    # A pre-release ledger: scheme 0 by definition; migrated just below.
+                    conn.execute(_META)
+                    conn.execute(
+                        "INSERT INTO meta (k, v) VALUES ('key_scheme', '0'), ('ledger_id', ?)",
+                        (uuid.uuid4().hex,),
+                    )
+                if version < SCHEMA_VERSION:
+                    conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+                conn.execute("COMMIT")
+            except BaseException:
+                _rollback(conn)
+                raise
+        Ledger._ensure_key_scheme(conn)
+
+    @staticmethod
+    def _ensure_key_scheme(conn: sqlite3.Connection) -> None:
+        """Run the key-scheme migrations this ledger needs, once, atomically."""
+        stored = int(_meta(conn, "key_scheme") or 0)
+        if stored == KEY_SCHEME:
+            return
+        if stored > KEY_SCHEME:
+            raise LedgerUnavailable(
+                f"ledger uses record key scheme v{stored}, newer than this ccusage "
+                f"(v{KEY_SCHEME}); leaving it untouched"
+            )
         conn.execute("BEGIN IMMEDIATE")
         try:
-            # Re-check under the write lock: another process may have just created it.
-            if conn.execute("PRAGMA user_version").fetchone()[0] == 0:
-                for statement in _SCHEMA:
-                    conn.execute(statement)
-                conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+            stored = int(_meta(conn, "key_scheme") or 0)
+            for version in range(stored, KEY_SCHEME):
+                migrate = KEY_SCHEME_MIGRATIONS.get(version)
+                if migrate is None:
+                    raise LedgerUnavailable(
+                        f"ledger uses record key scheme v{version} and there is no "
+                        f"migration to v{version + 1}; leaving it untouched"
+                    )
+                migrate(conn)
+            conn.execute(
+                "INSERT INTO meta (k, v) VALUES ('key_scheme', ?) "
+                "ON CONFLICT (k) DO UPDATE SET v = excluded.v",
+                (str(KEY_SCHEME),),
+            )
             conn.execute("COMMIT")
         except BaseException:
             _rollback(conn)
@@ -349,6 +532,8 @@ class Ledger:
             raise LedgerUnavailable(
                 f"ledger {self.path} is unreadable and could not be moved aside: {exc}"
             ) from exc
+        # The WAL belongs to the damaged file: left behind, SQLite could replay it into
+        # the fresh ledger. Moved alongside, it stays readable for the salvage.
         for suffix in ("-wal", "-shm"):
             side = Path(f"{self.path}{suffix}")
             if side.exists():
@@ -379,13 +564,13 @@ class Ledger:
             conn.execute("BEGIN IMMEDIATE")
             try:
                 accounts = self._intern_accounts(conn, rows)
-                models = self._intern_models(conn, {row.model for row in rows})
+                models = self._intern_models(conn, {_text(row.model) for row in rows})
                 params = sorted(
                     (
                         row.key,
-                        accounts[(row.provider, row.identity)],
+                        accounts[(_text(row.provider), _text(row.identity))],
                         row.ts_ms,
-                        models[row.model],
+                        models[_text(row.model)],
                         row.inp,
                         row.outp,
                         row.cr,
@@ -411,7 +596,7 @@ class Ledger:
     ) -> dict[tuple[str, str], int]:
         labels: dict[tuple[str, str], str] = {}
         for row in rows:
-            labels[(row.provider, row.identity)] = row.label
+            labels[(_text(row.provider), _text(row.identity))] = _text(row.label)
         # The label is the one current when these rows were written (R5); a later
         # rename updates it, but the identity — and so the account — stays the same.
         conn.executemany(
@@ -436,11 +621,11 @@ class Ledger:
         return {name: model_id for model_id, name in conn.execute("SELECT id, name FROM models")}
 
     # ── reads ────────────────────────────────────────────────────────────────
-    def key_accounts(self) -> dict[int, int]:
-        """Every stored key -> its account id (the cheap half of the orphan diff)."""
+    def all_rows(self) -> Iterator[tuple]:
+        """Stream every stored row (``_ROW_COLUMNS`` order) without holding them all."""
         conn = self._open()
         try:
-            return dict(conn.execute("SELECT key, acct FROM usage"))
+            yield from conn.execute(f"SELECT {_ROW_COLUMNS} FROM usage")
         except sqlite3.Error as exc:
             raise _classify(exc) from exc
 
@@ -490,6 +675,210 @@ class Ledger:
         except sqlite3.Error as exc:
             raise _classify(exc) from exc
 
+    # ── backup and recovery ──────────────────────────────────────────────────
+    def backup_due(self, now: float | None = None) -> bool:
+        try:
+            age = (time.time() if now is None else now) - self.backup_path.stat().st_mtime
+        except OSError:
+            return True
+        return age >= BACKUP_INTERVAL_SECS
+
+    def backup(self) -> None:
+        """Copy the ledger to ``ledger.sqlite3.bak`` with SQLite's online backup API.
+
+        The copy is made beside the target, checked with ``PRAGMA quick_check``, and
+        only then renamed over the previous backup, so a damaged source never replaces
+        a good backup. Worker threads only."""
+        conn = self._open()
+        tmp = self.backup_path.with_name(f"{self.backup_path.name}.{os.getpid()}.tmp")
+        try:
+            target = sqlite3.connect(str(tmp), isolation_level=None)
+            try:
+                conn.backup(target)
+                target.execute("PRAGMA journal_mode = DELETE")  # one self-contained file
+                check = target.execute("PRAGMA quick_check").fetchone()[0]
+            finally:
+                target.close()
+            if check != "ok":
+                raise LedgerCorrupt(f"backup copy failed its integrity check: {check}")
+            os.replace(tmp, self.backup_path)
+        except sqlite3.Error as exc:
+            raise _classify(exc) from exc
+        except OSError as exc:
+            raise LedgerUnavailable(f"cannot write {self.backup_path}: {exc}") from exc
+        finally:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+
+    def recover(self, moved: Path) -> Recovery:
+        """Salvage every readable row from a moved-aside ledger — and every row of the
+        backup — into this (fresh) ledger through the normal max merge."""
+        salvage = _read_salvage(moved)
+        backup = _read_salvage(self.backup_path) if self.backup_path.exists() else None
+        if (
+            backup is not None
+            and salvage.ledger_id is not None
+            and salvage.ledger_id == backup.ledger_id
+        ):
+            # Same lineage: the backup's id tables can stand in for damaged ones.
+            salvage.accounts = {**(backup.accounts or {}), **(salvage.accounts or {})}
+            salvage.models = {**(backup.models or {}), **(salvage.models or {})}
+        rows = salvage.to_rows()
+        self.write(rows)
+        seen = {row.key for row in rows}
+        from_backup = 0
+        backup_time = None
+        if backup is not None:
+            backup_rows = backup.to_rows()
+            self.write(backup_rows)
+            from_backup = sum(1 for row in backup_rows if row.key not in seen)
+            try:
+                backup_time = self.backup_path.stat().st_mtime
+            except OSError:
+                backup_time = None
+        return Recovery(
+            moved=moved,
+            salvaged=len(rows),
+            salvage_complete=salvage.complete,
+            from_backup=from_backup,
+            backup_time=backup_time,
+        )
+
+
+# ── salvage ────────────────────────────────────────────────────────────────────
+_KEY_MIN, _KEY_MAX = -(2**63), 2**63 - 1
+_TS_MAX = 4_102_444_800_000  # 2100-01-01 in ms: anything later is not a real record
+_TOKENS_MAX = 2**53
+
+
+@dataclass
+class _Salvaged:
+    raw: list[tuple]
+    accounts: dict[int, tuple[str, str, str]] | None
+    models: dict[int, str] | None
+    ledger_id: str | None
+    complete: bool
+
+    def to_rows(self) -> list[LedgerRow]:
+        rows: list[LedgerRow] = []
+        accounts = self.accounts or {}
+        models = self.models or {}
+        for key, acct, ts, model, inp, outp, cr, cc, e5, e1 in self.raw:
+            account = accounts.get(acct)
+            name = models.get(model)
+            if account is None or name is None:
+                self.complete = False
+                continue
+            provider, identity, label = account
+            rows.append(LedgerRow(key, provider, identity, label, ts, name, inp, outp, cr, cc, e5, e1))
+        return rows
+
+
+def _plausible(row: tuple) -> bool:
+    """Reject rows a damaged page could have produced that no real record can have."""
+    if len(row) != 10:
+        return False
+    key, acct, ts, model, inp, outp, cr, cc, e5, e1 = row
+    if not all(isinstance(v, int) for v in (key, acct, ts, model, inp, outp, cr, cc)):
+        return False
+    if not 0 < ts < _TS_MAX:
+        return False
+    if not all(0 <= v < _TOKENS_MAX for v in (inp, outp, cr, cc)):
+        return False
+    return all(v is None or (isinstance(v, int) and 0 <= v < _TOKENS_MAX) for v in (e5, e1))
+
+
+def _read_salvage(path: Path) -> _Salvaged:
+    """Read whatever a (possibly damaged) ledger file still yields.
+
+    Works on a scratch copy so the moved-aside evidence is never modified. The usage
+    table is read by key range; a range that hits a damaged page is split and retried
+    until the unreadable part is narrowed down, so one bad page costs only its own rows.
+    """
+    empty = _Salvaged([], None, None, None, False)
+    with tempfile.TemporaryDirectory(prefix="ccusage-salvage-") as scratch:
+        copy = Path(scratch) / "ledger.sqlite3"
+        try:
+            shutil.copyfile(path, copy)
+            for suffix in ("-wal", "-shm"):
+                side = Path(f"{path}{suffix}")
+                if side.exists():
+                    shutil.copyfile(side, Path(f"{copy}{suffix}"))
+        except OSError:
+            return empty
+        try:
+            conn = sqlite3.connect(str(copy), isolation_level=None)
+        except sqlite3.Error:
+            return empty
+        try:
+            return _salvage_connection(conn)
+        finally:
+            conn.close()
+
+
+# Salvage narrows an unreadable key range down to this width before giving up on it,
+# and stops splitting after this many failed reads (a wholly unreadable table would
+# otherwise cost ~a million probes).
+_SALVAGE_MIN_WIDTH = 2**46
+_SALVAGE_MAX_FAILURES = 20_000
+
+
+def _salvage_connection(conn: sqlite3.Connection) -> _Salvaged:
+    try:
+        conn.execute("SELECT count(*) FROM sqlite_master").fetchone()
+    except sqlite3.Error:
+        return _Salvaged([], None, None, None, False)  # not a database any more
+    complete = True
+
+    def read(sql: str) -> list[tuple] | None:
+        nonlocal complete
+        try:
+            return list(conn.execute(sql))
+        except sqlite3.Error:
+            complete = False
+            return None
+
+    account_rows = read("SELECT id, provider, identity, label FROM accounts")
+    model_rows = read("SELECT id, name FROM models")
+    meta_rows = read("SELECT k, v FROM meta")
+    accounts = (
+        {row[0]: (row[1], row[2], row[3]) for row in account_rows}
+        if account_rows is not None
+        else None
+    )
+    models = {row[0]: row[1] for row in model_rows} if model_rows is not None else None
+    ledger_id = dict(meta_rows).get("ledger_id") if meta_rows is not None else None
+
+    raw: list[tuple] = []
+    step = 2**58  # 64 top-level ranges over the signed 64-bit key space
+    pending = [(lo, min(lo + step - 1, _KEY_MAX)) for lo in range(_KEY_MIN, _KEY_MAX, step)]
+    failures = 0
+    while pending:
+        lo, hi = pending.pop()
+        try:
+            part = conn.execute(
+                f"SELECT {_ROW_COLUMNS} FROM usage WHERE key BETWEEN ? AND ?", (lo, hi)
+            ).fetchall()
+        except sqlite3.Error:
+            failures += 1
+            width = hi - lo + 1
+            if width <= _SALVAGE_MIN_WIDTH or failures > _SALVAGE_MAX_FAILURES:
+                complete = False  # this range sits on an unreadable page
+                continue
+            sub = width // 16
+            pending.extend(
+                (lo + i * sub, hi if i == 15 else lo + (i + 1) * sub - 1) for i in range(16)
+            )
+            continue
+        for row in part:
+            if _plausible(row):
+                raw.append(row)
+            else:
+                complete = False
+    return _Salvaged(raw, accounts, models, ledger_id, complete)
+
 
 # ── read-only inspection (`ccusage --ledger-info`) ─────────────────────────────
 @dataclass
@@ -504,6 +893,7 @@ class LedgerSummary:
     last_ts: float | None
     keys: dict[int, int]  # key -> account id
     account_ids: dict[int, tuple[str, str, str]]
+    backup_time: float | None = None
 
 
 def ledger_files_size(path: Path) -> int:
@@ -517,15 +907,24 @@ def ledger_files_size(path: Path) -> int:
     return total
 
 
-def read_summary(path: Path) -> LedgerSummary:
-    """Open the ledger strictly read-only and summarise it. Raises LedgerError.
+def read_summary(path: Path, *, retry_delay: float = 0.5) -> LedgerSummary:
+    """Summarise the ledger through a strictly read-only connection. Raises LedgerError.
 
-    With a WAL present (a ccusage is running, or one crashed mid-write) the read goes
-    through SQLite's read-only mode so recent commits are included. Without one, no
-    connection is open and the file is fully checkpointed, so it is read as immutable:
-    a read-only WAL open would otherwise leave empty -wal/-shm files behind."""
-    base = Path(path).resolve().as_uri()
-    uri = f"{base}?mode=ro" if Path(f"{path}-wal").exists() else f"{base}?immutable=1"
+    Always SQLite's ``mode=ro`` (never ``immutable``): a running ccusage may be
+    checkpointing, and only a real read-only connection sees a consistent snapshot of
+    the file plus its WAL. A failure is retried once before it is reported, so a
+    transient lock or a mid-checkpoint read never calls a healthy ledger unreadable.
+    Opening read-only may create SQLite's empty -wal/-shm index files; the ledger's
+    contents are never changed."""
+    try:
+        return _read_summary_once(path)
+    except LedgerError:
+        time.sleep(retry_delay)
+        return _read_summary_once(path)
+
+
+def _read_summary_once(path: Path) -> LedgerSummary:
+    uri = f"{Path(path).resolve().as_uri()}?mode=ro"
     try:
         conn = sqlite3.connect(uri, uri=True, timeout=BUSY_TIMEOUT_MS / 1000)
     except sqlite3.Error as exc:
@@ -535,7 +934,13 @@ def read_summary(path: Path) -> LedgerSummary:
         version = conn.execute("PRAGMA user_version").fetchone()[0]
         if version != SCHEMA_VERSION:
             raise LedgerUnavailable(
-                f"ledger schema v{version} is not v{SCHEMA_VERSION} (written by another ccusage?)"
+                f"ledger schema v{version}; this ccusage reads v{SCHEMA_VERSION} "
+                "(launch this ccusage once to upgrade it)"
+            )
+        scheme = int(_meta(conn, "key_scheme") or 0)
+        if scheme != KEY_SCHEME:
+            raise LedgerUnavailable(
+                f"ledger uses record key scheme v{scheme}; this ccusage uses v{KEY_SCHEME}"
             )
         account_ids = {
             account_id: (provider, identity, label)
@@ -559,6 +964,10 @@ def read_summary(path: Path) -> LedgerSummary:
         by_provider[provider] = by_provider.get(provider, 0) + count
         accounts.append((label, provider, identity, count))
     accounts.sort(key=lambda item: (-item[3], item[0]))
+    try:
+        backup_time = Path(f"{path}.bak").stat().st_mtime
+    except OSError:
+        backup_time = None
     return LedgerSummary(
         path=Path(path),
         size_bytes=ledger_files_size(Path(path)),
@@ -569,4 +978,5 @@ def read_summary(path: Path) -> LedgerSummary:
         last_ts=last / 1000 if last is not None else None,
         keys=keys,
         account_ids=account_ids,
+        backup_time=backup_time,
     )
