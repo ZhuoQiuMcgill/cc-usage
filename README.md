@@ -222,6 +222,7 @@ timers and the heartbeat update live.
 | `ccusage --update-prerelease` | Install the latest prerelease build (or `@main`) for testing (force-reinstall). |
 | `ccusage --update-stable` | Return to the latest official release (force-reinstall). |
 | `ccusage --check-prerelease` | Report your version vs the latest prerelease tag (installs nothing). |
+| `ccusage --ledger-info` | Show what the usage ledger holds and whether any parsed usage is missing from it (read-only; see [Keeping history](#keeping-history)). |
 | `ccusage --version` / `--help` | Version / usage. |
 
 Older releases could install a Claude statusline integration. Current releases never
@@ -368,6 +369,57 @@ newly appended rollout bytes and the scan runs in the background without blockin
 A plain single `~/.claude` + `~/.codex` setup is unaffected: no scope line, no By account
 block, and `a` does nothing — the panel is byte-for-byte what it was before.
 
+## Keeping history
+
+Claude Code deletes transcripts older than its `cleanupPeriodDays` setting (30 days by
+default). ccusage used to read its history only from those transcripts, so usage went
+missing from the panel once they were deleted. ccusage now keeps a **usage ledger**, a
+small SQLite file at `~/.config/cc-usage/ledger.sqlite3` with one row per usage event it
+has parsed. Every view (rolling windows, the heartbeat, the Models board, By account and
+the date-range screen) combines what is still in your transcripts with what only the
+ledger remembers. A deleted transcript's usage stays in your totals, and a record is never
+counted twice, including when a transcript is moved, rotated or rewritten.
+
+- **Tokens only.** A row holds the event's key, provider, account, timestamp, model id and
+  token counts (input, output, cache read, cache creation and the 5m/1h cache-write
+  split). It holds no prompts, responses, tool output, file paths, working directories,
+  project names or branches. The account is stored as a digest of its root's path, not as
+  the path.
+- **No stored cost.** Cost is recomputed from your current `pricing.json` whenever history
+  is loaded, so a pricing correction applies to all of it.
+- **Accounts.** History stays with the root it came from. Renaming a root's label keeps
+  its history under the new label, and disabling a root in Settings hides its history as
+  well as its live usage. A root you removed from your config still counts, under the last
+  label it had (with a `-2` suffix if a current account uses that label).
+- **Small.** On the reference machine, 125,000 usage records take 4.7 MB (about 40 bytes
+  per record when first written, about 50 per record added later). At that machine's
+  current rate the ledger grows by roughly 20–30 MB a year.
+- **First run.** The first launch of a ledger-enabled ccusage records everything currently
+  in your transcripts. Usage from transcripts that were deleted before then cannot be
+  recovered.
+
+**Before you shorten Claude Code's retention**, run:
+
+```bash
+ccusage --ledger-info
+```
+
+It prints the ledger's location, size, record count per provider and account, and the
+dates it covers. It then compares the ledger with your transcripts. `orphans` counts
+records whose transcripts are already gone, so that usage now exists only in the ledger.
+`unrecorded` counts parsed records that are not in the ledger yet. When `unrecorded` is 0,
+the ledger holds everything ccusage can see, and it is safe to lower `cleanupPeriodDays`
+in Claude Code's `settings.json`. If it is not 0, launch ccusage (or run `ccusage --once`)
+first. `--ledger-info` only reads: it never writes the ledger, the parse cache or a
+transcript, and it makes no network calls.
+
+Keep `ledger.sqlite3`. Unlike `parse-cache.pkl`, it cannot be rebuilt once transcripts
+have been deleted. Several ccusage windows can share it safely. If it ever becomes
+unreadable, ccusage renames it to `ledger.sqlite3.corrupt-<timestamp>` (it never deletes
+it), starts a fresh ledger from the transcripts still on disk, and shows a warning naming
+the moved file. If the config directory is read-only or the disk is full, the panel warns
+and keeps running without the ledger.
+
 ## Pricing (editable)
 
 Costs are the **API-equivalent dollar value** of your tokens (informational — you are on a
@@ -414,7 +466,13 @@ from totals, pricing coverage is reported, and they are flagged with a `*`.
   to archived storage preserves the warm cache instead of triggering a cold rebuild.
 - **Persistent incremental cache:** `parse-cache.pkl` remembers every file offset. A pricing
   change, true transcript deletion, incompatible format, or corrupt cache safely falls back
-  to a cold scan; results remain identical. The first-ever cold scan also runs off the UI
+  to a cold scan; results remain identical, because usage from deleted transcripts comes
+  back from the usage ledger (see [Keeping history](#keeping-history)).
+- **Stable record keys:** every usage event has a key taken from the transcript line
+  itself: `(requestId, message.id)` for Claude, and for Codex the rollout's session id plus
+  the event's timestamp and token counters. A key never depends on a file path, so a
+  re-read, moved, rotated or rewritten transcript folds into the records it already
+  produced instead of counting them again. The first-ever cold scan also runs off the UI
   thread. Discovery starts with an indeterminate status, followed by a byte-weighted
   progress bar with file and byte counts. Press `c` to cancel at a line boundary and
   `r` to resume without duplicating already parsed usage.
@@ -436,6 +494,7 @@ config.json                  your settings
 pricing.json                 editable price table
 provider-limits.json         normalized last-good Claude and Codex limits
 parse-cache.pkl              warm-start parse cache (derived; safe to delete anytime)
+ledger.sqlite3               usage history, tokens only (keep it: see Keeping history)
 backups/                     legacy statusline restore data, if an older version made it
 ```
 
@@ -452,7 +511,8 @@ Covers the cost model, dedup/extraction against hand-verified fixtures, rolling-
 boundaries, heartbeat rendering, config persistence, keyboard-driven Textual flows,
 Claude and Codex provider normalization, expired Claude credential refresh, credential
 non-leakage, Codex rollout parsing, legacy statusline restoration, and incremental
-warm-cache parsing.
+warm-cache parsing, and the usage ledger (deleted, truncated and moved transcripts,
+content-free storage, corruption, and concurrent writers).
 
 ## Scope & safety
 
@@ -460,7 +520,10 @@ warm-cache parsing.
   app-server broker. Claude's OAuth access token is read only in memory; persisted limit
   data contains percentages, labels, capture times, and reset times only.
 - `~/.claude` and `~/.codex` transcripts are read-only. ccusage never changes a
-  statusline. The hidden restore command changes Claude settings only when explicitly
+  statusline, and it never changes Claude Code's transcript retention; that choice is
+  yours (see [Keeping history](#keeping-history)).
+- The usage ledger stores token counts only: no prompts, responses, tool output, paths,
+  working directories or project names. The hidden restore command changes Claude settings only when explicitly
   invoked to remove an older ccusage integration.
 - Provider failures retain the last good normalized snapshot and surface a warning.
   Subscription percentages are provider-reported current values, distinct from the

@@ -8,7 +8,42 @@ See [VERSIONING.md](VERSIONING.md) for the release policy.
 
 ## [Unreleased]
 
-_No unreleased changes yet._
+### Added
+
+- **Usage history now survives transcript deletion.** Claude Code deletes transcripts
+  older than its `cleanupPeriodDays` setting (30 days by default), and until now the usage
+  in them disappeared from ccusage along with them. ccusage now keeps a usage ledger at
+  `~/.config/cc-usage/ledger.sqlite3`, with one small row per usage event it has parsed.
+  Every view (rolling windows, the heartbeat, the Models board, By account and the
+  date-range screen) combines your transcripts with the usage only the ledger still
+  remembers. A deleted, moved, rotated or rewritten transcript neither drops usage nor
+  counts it twice. The ledger holds token counts only (no prompts, responses, paths or
+  project names) and no cost: cost is recomputed from your current `pricing.json`, so
+  pricing fixes apply to all of history. On the reference machine 125,000 records take
+  4.7 MB. The first launch records everything currently in your transcripts. Usage from
+  transcripts deleted before that cannot be recovered. If the ledger becomes unreadable,
+  ccusage renames it to `ledger.sqlite3.corrupt-<timestamp>` (it never deletes it),
+  rebuilds it from the transcripts still on disk and shows a warning.
+- **`ccusage --ledger-info`.** Prints the ledger's location, size, records per provider
+  and account, and the dates it covers. It then compares the ledger with your transcripts:
+  `orphans` counts usage whose transcripts are already gone and that now exists only in
+  the ledger, and `unrecorded` counts parsed usage not in the ledger yet. **Run it before
+  shortening Claude Code's retention.** When `unrecorded` is 0, it is safe to lower
+  `cleanupPeriodDays`. If it is not 0, launch ccusage (or run `ccusage --once`) first.
+  The command only reads and makes no network calls.
+
+### Changed
+
+- **One cold scan after upgrading.** Every usage record now carries a stable key, so the
+  parse cache format changed. The first launch after upgrading rescans your transcripts
+  once in the background (about 17 seconds on the reference machine). That scan also
+  fills the ledger.
+
+### Fixed
+
+- **A rewritten Codex rollout no longer counts its events twice.** When a rollout shrank
+  and was read again from the top, its earlier `token_count` events were added a second
+  time. Codex events now have stable keys, so a re-read folds into the existing records.
 
 ## [2.5.0] - 2026-09-22
 
