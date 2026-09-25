@@ -21,23 +21,33 @@ See [VERSIONING.md](VERSIONING.md) for the release policy.
   project names) and no cost: cost is recomputed from your current `pricing.json`, so
   pricing fixes apply to all of history. On the reference machine 125,000 records take
   4.7 MB. The first launch records everything currently in your transcripts. Usage from
-  transcripts deleted before that cannot be recovered. If the ledger becomes unreadable,
-  ccusage renames it to `ledger.sqlite3.corrupt-<timestamp>` (it never deletes it),
-  rebuilds it from the transcripts still on disk and shows a warning.
+  transcripts deleted before that cannot be recovered. A record never shows less than
+  ccusage once saw for it. This matters when a resumed session copies a message into a
+  newer transcript with lower counts and the original is later deleted.
+- **Ledger backup and recovery.** Once a day ccusage copies the ledger to
+  `ledger.sqlite3.bak` and checks the copy before it replaces the previous backup. If the
+  ledger becomes unreadable, ccusage renames it to `ledger.sqlite3.corrupt-<timestamp>`
+  (it never deletes it). It then rebuilds the ledger from every row still readable in the
+  damaged file, every row of the backup and the transcripts on disk. The warning says
+  whether all history was recovered.
 - **`ccusage --ledger-info`.** Prints the ledger's location, size, records per provider
   and account, and the dates it covers. It then compares the ledger with your transcripts:
   `orphans` counts usage whose transcripts are already gone and that now exists only in
-  the ledger, and `unrecorded` counts parsed usage not in the ledger yet. **Run it before
-  shortening Claude Code's retention.** When `unrecorded` is 0, it is safe to lower
-  `cleanupPeriodDays`. If it is not 0, launch ccusage (or run `ccusage --once`) first.
-  The command only reads and makes no network calls.
+  the ledger, and `unrecorded` counts parsed usage not in the ledger yet. It also names
+  every disabled root, whose transcripts ccusage does not read or record. **Run it before
+  shortening Claude Code's retention.** It is safe to lower `cleanupPeriodDays` only when
+  `unrecorded` is 0 and no root you want to keep is disabled; the output's last line says
+  which. Otherwise launch ccusage (or run `ccusage --once`) first. The command only reads
+  and makes no network calls.
 
 ### Changed
 
-- **One cold scan after upgrading.** Every usage record now carries a stable key, so the
-  parse cache format changed. The first launch after upgrading rescans your transcripts
-  once in the background (about 17 seconds on the reference machine). That scan also
-  fills the ledger.
+- **One cold scan after upgrading.** Every usage record now carries a stable key, and
+  Codex counting changed (see Fixed), so the parse cache format changed. The first launch
+  after upgrading rescans your transcripts once in the background (about 17 seconds on the
+  reference machine). That scan also fills the ledger.
+- **Contributors:** a parser change that re-keys, drops or lowers usage records must ship
+  with a ledger migration. CONTRIBUTING.md has the rule.
 
 ### Fixed
 

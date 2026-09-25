@@ -378,7 +378,10 @@ small SQLite file at `~/.config/cc-usage/ledger.sqlite3` with one row per usage 
 has parsed. Every view (rolling windows, the heartbeat, the Models board, By account and
 the date-range screen) combines what is still in your transcripts with what only the
 ledger remembers. A deleted transcript's usage stays in your totals, and a record is never
-counted twice, including when a transcript is moved, rotated or rewritten.
+counted twice, including when a transcript is moved, rotated or rewritten. A record never
+shows less than ccusage once saw for it either: if a resumed session copied a message
+into a newer transcript with lower counts, and the original is deleted, the ledger's
+higher values still count.
 
 - **Tokens only.** A row holds the event's key, provider, account, timestamp, model id and
   token counts (input, output, cache read, cache creation and the 5m/1h cache-write
@@ -389,8 +392,9 @@ counted twice, including when a transcript is moved, rotated or rewritten.
   is loaded, so a pricing correction applies to all of it.
 - **Accounts.** History stays with the root it came from. Renaming a root's label keeps
   its history under the new label, and disabling a root in Settings hides its history as
-  well as its live usage. A root you removed from your config still counts, under the last
-  label it had (with a `-2` suffix if a current account uses that label).
+  well as its live usage. While a root is disabled ccusage does not read its transcripts,
+  so new usage there is not recorded. A root you removed from your config still counts,
+  under the last label it had (with a `-2` suffix if a current account uses that label).
 - **Small.** On the reference machine, 125,000 usage records take 4.7 MB (about 40 bytes
   per record when first written, about 50 per record added later). At that machine's
   current rate the ledger grows by roughly 20–30 MB a year.
@@ -407,18 +411,28 @@ ccusage --ledger-info
 It prints the ledger's location, size, record count per provider and account, and the
 dates it covers. It then compares the ledger with your transcripts. `orphans` counts
 records whose transcripts are already gone, so that usage now exists only in the ledger.
-`unrecorded` counts parsed records that are not in the ledger yet. When `unrecorded` is 0,
-the ledger holds everything ccusage can see, and it is safe to lower `cleanupPeriodDays`
-in Claude Code's `settings.json`. If it is not 0, launch ccusage (or run `ccusage --once`)
-first. `--ledger-info` only reads: it never writes the ledger, the parse cache or a
-transcript, and it makes no network calls.
+`unrecorded` counts parsed records that are not in the ledger yet. Disabled roots are
+named on their own line, because ccusage does not read them and so cannot record them.
+
+It is safe to lower `cleanupPeriodDays` in Claude Code's `settings.json` only when
+`unrecorded` is 0 **and** no root you care about is listed as disabled. The last line of
+the output says so explicitly. Otherwise, launch ccusage (or run `ccusage --once`), and
+enable any disabled root you want to keep in Settings → Accounts, first. `--ledger-info`
+only reads: it opens the ledger read-only, which may leave SQLite's empty `-wal`/`-shm`
+index files next to it. It never writes the ledger, the parse cache or a transcript, and
+it makes no network calls.
 
 Keep `ledger.sqlite3`. Unlike `parse-cache.pkl`, it cannot be rebuilt once transcripts
-have been deleted. Several ccusage windows can share it safely. If it ever becomes
-unreadable, ccusage renames it to `ledger.sqlite3.corrupt-<timestamp>` (it never deletes
-it), starts a fresh ledger from the transcripts still on disk, and shows a warning naming
-the moved file. If the config directory is read-only or the disk is full, the panel warns
-and keeps running without the ledger.
+have been deleted. Several ccusage windows can share it safely. Once a day ccusage copies
+it to `ledger.sqlite3.bak`, and a copy that fails SQLite's integrity check never replaces
+a good backup.
+
+If the ledger ever becomes unreadable, ccusage renames it to
+`ledger.sqlite3.corrupt-<timestamp>` (it never deletes it). It then builds a fresh ledger
+from every row it can still read from the damaged file, plus every row of the backup, plus
+the transcripts still on disk. The warning names the moved file and says plainly whether
+all history was recovered or what may be missing. If the config directory is read-only or
+the disk is full, the panel warns and keeps running without the ledger.
 
 ## Pricing (editable)
 
@@ -495,6 +509,7 @@ pricing.json                 editable price table
 provider-limits.json         normalized last-good Claude and Codex limits
 parse-cache.pkl              warm-start parse cache (derived; safe to delete anytime)
 ledger.sqlite3               usage history, tokens only (keep it: see Keeping history)
+ledger.sqlite3.bak           daily verified backup of the ledger
 backups/                     legacy statusline restore data, if an older version made it
 ```
 
