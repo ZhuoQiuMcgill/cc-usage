@@ -24,12 +24,17 @@ See [VERSIONING.md](VERSIONING.md) for the release policy.
   transcripts deleted before that cannot be recovered. A record never shows less than
   ccusage once saw for it. This matters when a resumed session copies a message into a
   newer transcript with lower counts and the original is later deleted.
-- **Ledger backup and recovery.** Once a day ccusage copies the ledger to
-  `ledger.sqlite3.bak` and checks the copy before it replaces the previous backup. If the
-  ledger becomes unreadable, ccusage renames it to `ledger.sqlite3.corrupt-<timestamp>`
-  (it never deletes it). It then rebuilds the ledger from every row still readable in the
-  damaged file, every row of the backup and the transcripts on disk. The warning says
-  whether all history was recovered.
+- **Ledger backup and recovery.** Once a day ccusage checks a copy of the ledger and saves
+  it as `ledger.sqlite3.bak`. The previous backup moves to `ledger.sqlite3.bak.prev`. A
+  backup is never replaced while it holds history the current ledger lacks.
+  - If the ledger becomes unreadable, ccusage renames it to
+    `ledger.sqlite3.corrupt-<timestamp>` (it never deletes it). If it has gone missing,
+    ccusage starts a new one.
+  - Either way, it then restores every readable row from the damaged file and the
+    backups. Rows written under older record-key rules are converted first.
+  - The warning says whether history is intact.
+  - A file that can't be read yet (for example, while the disk is full) is retried on
+    every scan. No backup is made until that succeeds.
 - **`ccusage --ledger-info`.** Prints the ledger's location, size, records per provider
   and account, and the dates it covers. It then compares the ledger with your transcripts:
   `orphans` counts usage whose transcripts are already gone and that now exists only in

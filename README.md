@@ -414,25 +414,48 @@ records whose transcripts are already gone, so that usage now exists only in the
 `unrecorded` counts parsed records that are not in the ledger yet. Disabled roots are
 named on their own line, because ccusage does not read them and so cannot record them.
 
-It is safe to lower `cleanupPeriodDays` in Claude Code's `settings.json` only when
-`unrecorded` is 0 **and** no root you care about is listed as disabled. The last line of
-the output says so explicitly. Otherwise, launch ccusage (or run `ccusage --once`), and
+It is safe to lower `cleanupPeriodDays` in Claude Code's `settings.json` only when all
+three of these hold:
+
+- `unrecorded` is 0;
+- no root you care about is listed as disabled;
+- no `recovering` line is shown (an unfinished ledger recovery).
+
+The last line of the output says so explicitly. Otherwise, launch ccusage (or run `ccusage --once`), and
 enable any disabled root you want to keep in Settings → Accounts, first. `--ledger-info`
 only reads: it opens the ledger read-only, which may leave SQLite's empty `-wal`/`-shm`
 index files next to it. It never writes the ledger, the parse cache or a transcript, and
 it makes no network calls.
 
 Keep `ledger.sqlite3`. Unlike `parse-cache.pkl`, it cannot be rebuilt once transcripts
-have been deleted. Several ccusage windows can share it safely. Once a day ccusage copies
-it to `ledger.sqlite3.bak`, and a copy that fails SQLite's integrity check never replaces
-a good backup.
+have been deleted. Several ccusage windows can share it safely.
 
-If the ledger ever becomes unreadable, ccusage renames it to
-`ledger.sqlite3.corrupt-<timestamp>` (it never deletes it). It then builds a fresh ledger
-from every row it can still read from the damaged file, plus every row of the backup, plus
-the transcripts still on disk. The warning names the moved file and says plainly whether
-all history was recovered or what may be missing. If the config directory is read-only or
-the disk is full, the panel warns and keeps running without the ledger.
+**Backups.** Once a day ccusage copies the ledger to `ledger.sqlite3.bak`. It checks the
+copy with SQLite's integrity check first, and the previous backup moves to
+`ledger.sqlite3.bak.prev` rather than being overwritten. Each ledger carries an ID that
+its backups inherit. A backup is never replaced unless everything in it is already in the
+current ledger. A backup from another ledger, or one that cannot be read, is merged first
+(or renamed aside and kept), and only then does rotation continue.
+
+**Recovery.** If the ledger becomes unreadable, ccusage renames it to
+`ledger.sqlite3.corrupt-<timestamp>` (it never deletes it) and starts a fresh one. It then
+merges, in this order:
+
+1. every row still readable in the damaged file;
+2. every row of the backups;
+3. the transcripts still on disk.
+
+If the ledger file is simply missing while backups exist, ccusage restores from the
+backups the same way. Rows from a ledger written with older record-key rules are converted
+to the current rules first, and rows it cannot convert are not merged; that file is kept.
+
+The warning names the moved file and says plainly whether history is intact, what may be
+lost, or that recovery is not complete yet. If a file cannot be read right now (a full
+disk, for example), it stays queued and ccusage retries on every scan. Until then it makes
+no backup, so the old backup is never replaced by a ledger that is missing history. The
+scratch copies used for recovery live next to the ledger, not in your temporary
+directory. If the config directory is read-only or the disk is full, the panel warns and
+keeps running without the ledger.
 
 ## Pricing (editable)
 
@@ -510,6 +533,7 @@ provider-limits.json         normalized last-good Claude and Codex limits
 parse-cache.pkl              warm-start parse cache (derived; safe to delete anytime)
 ledger.sqlite3               usage history, tokens only (keep it: see Keeping history)
 ledger.sqlite3.bak           daily verified backup of the ledger
+ledger.sqlite3.bak.prev      the backup before that
 backups/                     legacy statusline restore data, if an older version made it
 ```
 
