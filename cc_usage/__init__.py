@@ -5,4 +5,4 @@ subscription limits are fetched directly from Claude and Codex and cached in nor
 credential-free form.
 """
 
-__version__ = "2.5.0"
+__version__ = "2.6.0"
