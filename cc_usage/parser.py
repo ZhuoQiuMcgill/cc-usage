@@ -24,6 +24,8 @@ import hashlib
 import json
 import os
 import pickle
+import re
+import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -83,7 +85,19 @@ _READ_BUFFER_BYTES = 4 * 1024 * 1024
 # v7: the codex rate-limit snapshot is captured *per codex root* (T13) — the cache
 # stores `latest_rate_limits_by_account` keyed by account label instead of a single
 # `latest_rate_limits`; a v6 cache carries the old key and is dropped (rebuilt once).
-_CACHE_VERSION = 7
+# v8: every record carries its stable ledger key (T17) and the dedup index is keyed by
+# it for both providers; Codex keys need per-file state (the consecutive-duplicate
+# ordinal) that an older cache cannot supply, so a v7 cache is rebuilt once. That one
+# cold scan is also what backfills the usage ledger on first run.
+_CACHE_VERSION = 8
+
+# Session id embedded in a Codex rollout's file name (rollout-<ts>-<uuid>.jsonl). It is
+# the same id as the rollout's session_meta and survives the active->archive move.
+_ROLLOUT_UUID = re.compile(
+    r"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})$"
+)
+# Separator for key material: never occurs in ids, timestamps or decimal counters.
+_KEY_SEP = "\x1f"
 
 
 @dataclass(slots=True)
@@ -111,8 +125,14 @@ class UsageRecord:
     # Provider the record came from (T12), independent of the account label so
     # scope/rollup/limits can treat "is this Codex" as a first-class fact rather
     # than inferring it from `account == "codex"` (which breaks with 2 codex roots).
-    # Kept last so positional cache tuples stay append-only across versions.
     provider: str = CLAUDE_PROVIDER
+    # Stable 64-bit identity of the usage event (T17): identical every time the same
+    # event is parsed — across re-parses, Codex active->archive moves and cold
+    # rebuilds — and never derived from a file path or byte offset. It is the parser's
+    # dedup key and the usage ledger's primary key. None only for a Claude line that
+    # has neither message.id nor uuid (none exist in real transcripts); such a line
+    # counts live but cannot be ledgered. Kept last so cache tuples stay append-only.
+    lkey: int | None = None
 
     @property
     def cache_tokens(self) -> int:
@@ -200,12 +220,43 @@ def _legacy_default_roots() -> list[tuple[Path, str]]:
     return roots
 
 
-def _dedup_key(obj: dict, msg: dict) -> tuple[object, object] | None:
-    """(requestId, message.id). None when message.id is absent (can't dedup -> count)."""
+def ledger_key(material: str) -> int:
+    """Stable signed 64-bit key for one usage event's key material (T17).
+
+    BLAKE2b is stable across processes and Python versions (unlike `hash()`), and 64
+    bits fit SQLite's INTEGER PRIMARY KEY, so the ledger needs no separate index. A
+    collision needs ~4 billion events for even odds; at a million events it is ~3e-8.
+    """
+    digest = hashlib.blake2b(material.encode("utf-8"), digest_size=8).digest()
+    return int.from_bytes(digest, "big", signed=True)
+
+
+def _dedup_key(obj: dict, msg: dict) -> int | None:
+    """Stable key for one Claude usage event (T17 R3).
+
+    (requestId, message.id) when message.id is present — the key Claude Code's
+    streaming lines share (T9). Without message.id the line's own `uuid` is the stable
+    identity. None when neither exists (can't dedup -> the line counts on its own)."""
     mid = msg.get("id")
-    if not mid:
-        return None
-    return (obj.get("requestId"), mid)
+    if mid:
+        req = obj.get("requestId")
+        return ledger_key(f"c{_KEY_SEP}{'' if req is None else req}{_KEY_SEP}{mid}")
+    uuid = obj.get("uuid")
+    if isinstance(uuid, str) and uuid:
+        return ledger_key(f"u{_KEY_SEP}{uuid}")
+    return None
+
+
+def codex_session_id(source: str) -> str:
+    """A rollout's session identity: the UUID in its file name, else its file stem.
+
+    Both are a function of the basename alone, which Codex keeps when it moves a
+    rollout from sessions/ to archived_sessions/, so the key survives that move."""
+    stem = Path(source).name
+    if stem.endswith(".jsonl"):
+        stem = stem[: -len(".jsonl")]
+    match = _ROLLOUT_UUID.search(stem)
+    return match.group(1).lower() if match else stem
 
 
 def _max_opt(a: int | None, b: int | None) -> int | None:
@@ -256,11 +307,13 @@ class Parser:
         self._cache_unvalidated = False
         self.records: list[UsageRecord] = []
         self.stats = ParseStats()
-        # One kept UsageRecord per unique (requestId, message.id). A repeat key
-        # doesn't drop the line — it merges into the record stored here (T9). The
-        # values ARE the objects in self.records, so mutating in place is picked up
-        # by aggregate()/series(). Persists across scans (and, via the cache, runs).
-        self._by_key: dict[tuple[object, object], UsageRecord] = {}
+        # One kept UsageRecord per stable event key (UsageRecord.lkey, T17): a Claude
+        # message's (requestId, message.id), or a Codex event's session + position. A
+        # repeat key doesn't drop the line — it merges into the record stored here (T9).
+        # The values ARE the objects in self.records, so mutating in place is picked up
+        # by aggregate()/series(). Persists across scans (and, via the cache, runs). It
+        # is also the "live key set" the usage ledger diffs against.
+        self._by_key: dict[int, UsageRecord] = {}
         self._files: dict[str, _FileState] = {}
         # Codex token_count events carry the model in the preceding turn_context.
         self._file_models: dict[str, str] = {}
@@ -269,6 +322,19 @@ class Parser:
         # those records instead of permanently inventing a literal `codex` model.
         self._codex_pending: dict[str, list[UsageRecord]] = {}
         self._codex_totals: dict[str, tuple[int, int, int]] = {}
+        # Per-file (position, ordinal) of the last Codex record, so a consecutive exact
+        # repeat of a token_count event (Codex emits some; the parser counts both) gets
+        # a distinct, still-stable key instead of colliding with the first (T17).
+        self._codex_dup: dict[str, tuple[str, int]] = {}
+        # Records created or changed since the usage ledger last took them (T17). The
+        # scan thread marks, the ledger worker takes; the lock makes the hand-off
+        # atomic so a mark can never land in a dict the worker is already iterating.
+        self._dirty: dict[int, UsageRecord] = {}
+        self._dirty_lock = threading.Lock()
+        # Bumped whenever the record set is discarded (a cache that no longer matches
+        # disk). Records only ever *leave* the live set this way, so the ledger redoes
+        # its full orphan diff exactly when this changes.
+        self.epoch = 0
         # Newest local rate-limit snapshot per codex account label (T13): the account's
         # freshest `token_count` rate_limits payload, keyed by root label so a second
         # codex root (`codex-win`) renders its own live limits and never shares the
@@ -324,22 +390,15 @@ class Parser:
         if key is not None:
             existing = self._by_key.get(key)
             if existing is not None:
-                existing.input_tokens = max(existing.input_tokens, input_tokens)
-                existing.output_tokens = max(existing.output_tokens, output_tokens)
-                existing.cache_read = max(existing.cache_read, cache_read)
-                existing.cache_creation = max(existing.cache_creation, cache_creation_total)
-                existing._eph_5m = _max_opt(existing._eph_5m, eph_5m)
-                existing._eph_1h = _max_opt(existing._eph_1h, eph_1h)
-                existing.cost = compute_cost(
-                    input_tokens=existing.input_tokens,
-                    output_tokens=existing.output_tokens,
-                    cache_read=existing.cache_read,
-                    cache_creation_total=existing.cache_creation,
-                    ephemeral_5m=existing._eph_5m,
-                    ephemeral_1h=existing._eph_1h,
-                    rates=get_rates(existing.model_raw, self.pricing),
+                self._merge(
+                    existing,
+                    input_tokens,
+                    output_tokens,
+                    cache_read,
+                    cache_creation_total,
+                    eph_5m,
+                    eph_1h,
                 )
-                self.stats.duplicates += 1
                 return None  # merged in place; no new record to append
 
         ts = parse_timestamp(obj.get("timestamp"))
@@ -374,12 +433,79 @@ class Parser:
             cost=cost,
             _eph_5m=eph_5m,
             _eph_1h=eph_1h,
+            lkey=key,
         )
-        # Register only once a real record exists, so a first line that lacks a
-        # timestamp doesn't claim the key and strand the message's later lines.
-        if key is not None:
-            self._by_key[key] = rec
+        # `_ingest_line` registers the key only once a real record exists, so a first
+        # line that lacks a timestamp doesn't claim it and strand the later lines.
         return rec
+
+    def _merge(
+        self,
+        existing: UsageRecord,
+        input_tokens: int,
+        output_tokens: int,
+        cache_read: int,
+        cache_creation: int,
+        eph_5m: int | None,
+        eph_1h: int | None,
+    ) -> None:
+        """Fold a repeat line for an already-kept event into its record (T9).
+
+        Field-wise max of every counter (monotonic within an event, so order-free and
+        robust to the final line landing in a later scan), then recompute the cost."""
+        existing.input_tokens = max(existing.input_tokens, input_tokens)
+        existing.output_tokens = max(existing.output_tokens, output_tokens)
+        existing.cache_read = max(existing.cache_read, cache_read)
+        existing.cache_creation = max(existing.cache_creation, cache_creation)
+        existing._eph_5m = _max_opt(existing._eph_5m, eph_5m)
+        existing._eph_1h = _max_opt(existing._eph_1h, eph_1h)
+        existing.cost = compute_cost(
+            input_tokens=existing.input_tokens,
+            output_tokens=existing.output_tokens,
+            cache_read=existing.cache_read,
+            cache_creation_total=existing.cache_creation,
+            ephemeral_5m=existing._eph_5m,
+            ephemeral_1h=existing._eph_1h,
+            rates=get_rates(existing.model_raw, self.pricing),
+        )
+        self.stats.duplicates += 1
+        self._mark_dirty(existing)
+
+    # ── ledger hand-off (T17) ─────────────────────────────────────────────────
+    def _mark_dirty(self, record: UsageRecord) -> None:
+        if record.lkey is None:
+            return
+        with self._dirty_lock:
+            self._dirty[record.lkey] = record
+
+    def has_dirty(self) -> bool:
+        return bool(self._dirty)
+
+    def take_dirty(self) -> dict[int, UsageRecord]:
+        """Hand the records changed since the last take to the ledger writer."""
+        with self._dirty_lock:
+            dirty, self._dirty = self._dirty, {}
+        return dirty
+
+    def restore_dirty(self, dirty: dict[int, UsageRecord]) -> None:
+        """Give back records a failed ledger write did not store, so the next write
+        retries them. A record re-marked meanwhile is the same object; keep that."""
+        if not dirty:
+            return
+        with self._dirty_lock:
+            for key, record in dirty.items():
+                self._dirty.setdefault(key, record)
+
+    def has_key(self, key: int | None) -> bool:
+        """Whether an event with this stable key is in the live parsed set."""
+        return key in self._by_key
+
+    def live_index(self) -> dict[int, UsageRecord]:
+        """A copy of the live key -> record index, safe to iterate off the scan thread.
+
+        `dict(d)` copies in one C-level step, so a concurrent scan inserting a key can
+        neither tear the copy nor raise "changed size during iteration"."""
+        return dict(self._by_key)
 
     @staticmethod
     def _codex_int(value: object) -> int:
@@ -452,6 +578,8 @@ class Parser:
                 ephemeral_1h=record._eph_1h,
                 rates=rates,
             )
+            # The ledger row still says codex-unattributed; re-store it (T17 R4).
+            self._mark_dirty(record)
         # Rebuild rather than discard one name blindly: another file may still contain
         # genuinely unattributed records, and the authoritative model may itself be
         # unpriced (for example codex-auto-review).
@@ -486,10 +614,13 @@ class Parser:
                 self._codex_int(total.get("cached_input_tokens")),
                 self._codex_int(total.get("output_tokens")),
             )
+        last_tuple = None
         if isinstance(last, dict):
             raw_input = self._codex_int(last.get("input_tokens"))
-            cache_read = min(raw_input, self._codex_int(last.get("cached_input_tokens")))
+            cached_input = self._codex_int(last.get("cached_input_tokens"))
+            cache_read = min(raw_input, cached_input)
             output_tokens = self._codex_int(last.get("output_tokens"))
+            last_tuple = (raw_input, cached_input, output_tokens)
         elif current_total is not None:
             previous = self._codex_totals.get(source, (0, 0, 0))
             raw_input = max(0, current_total[0] - previous[0])
@@ -504,6 +635,38 @@ class Parser:
 
         # Codex input_tokens includes cached_input_tokens; keep cached input separate.
         input_tokens = raw_input - cache_read
+
+        # Stable key (T17 R3): the rollout's session id + this event's position in it.
+        # The position is the event's own timestamp plus the cumulative and per-turn
+        # counters it reports — all line content, so identical on every re-parse,
+        # after an active->archive move and on a cold rebuild. Timestamps alone are
+        # not unique (a third of real events share one with a sibling); with the
+        # counters they are, except for Codex's consecutive exact repeats, which the
+        # ordinal separates the same way on every parse.
+        position = _KEY_SEP.join(
+            (
+                str(obj.get("timestamp")),
+                ",".join(map(str, current_total)) if current_total is not None else "",
+                ",".join(map(str, last_tuple)) if last_tuple is not None else "",
+            )
+        )
+        previous_position = self._codex_dup.get(source)
+        ordinal = (
+            previous_position[1] + 1
+            if previous_position is not None and previous_position[0] == position
+            else 0
+        )
+        self._codex_dup[source] = (position, ordinal)
+        key = ledger_key(
+            f"x{_KEY_SEP}{codex_session_id(source)}{_KEY_SEP}{position}{_KEY_SEP}{ordinal}"
+        )
+        existing = self._by_key.get(key)
+        if existing is not None:
+            # The same event read again — a rewritten/truncated rollout re-read from the
+            # top, or one session present under two paths at once mid-move. Fold it in
+            # rather than count it twice.
+            self._merge(existing, input_tokens, output_tokens, cache_read, 0, 0, 0)
+            return None
         model_raw = self._file_models.get(source, "codex-unattributed")
         model_norm = normalize_model(model_raw) or "codex-unattributed"
         rates = get_rates(model_raw, self.pricing)
@@ -531,6 +694,7 @@ class Parser:
             cost=cost,
             _eph_5m=0,
             _eph_1h=0,
+            lkey=key,
         )
 
     def _ingest_line(
@@ -575,6 +739,9 @@ class Parser:
             rec.account = account_label
             rec.provider = CODEX_PROVIDER if is_codex else CLAUDE_PROVIDER
             self.records.append(rec)
+            if rec.lkey is not None:
+                self._by_key[rec.lkey] = rec
+                self._mark_dirty(rec)
             if is_codex and source not in self._file_models:
                 self._codex_pending.setdefault(source, []).append(rec)
             self.stats.records += 1
@@ -605,7 +772,13 @@ class Parser:
 
         start = state.offset
         if st.st_size < start:
+            # Rewritten shorter: re-read from the top. Reset the file's Codex position
+            # state so its events regenerate the same keys and fold into the records
+            # already held instead of being counted again (T17).
             start = 0
+            self._codex_totals.pop(sp, None)
+            self._codex_dup.pop(sp, None)
+            self._file_models.pop(sp, None)
 
         consumed = 0
         try:
@@ -753,8 +926,13 @@ class Parser:
         self._file_models = {}
         self._codex_pending = {}
         self._codex_totals = {}
+        self._codex_dup = {}
         self.latest_rate_limits_by_account = {}
         self._cache_unvalidated = False
+        # Records just left the live set; the ledger must redo its orphan diff. The
+        # dirty set is deliberately kept: an unwritten update to a record whose file is
+        # gone is exactly the history the ledger must still receive.
+        self.epoch += 1
 
     def _reconcile_cached_paths(self, current_paths: set[str]) -> bool:
         """Accept Codex active→archive moves without invalidating the whole cache.
@@ -791,6 +969,8 @@ class Parser:
                 self._codex_pending[new] = self._codex_pending.pop(old)
             if old in self._codex_totals:
                 self._codex_totals[new] = self._codex_totals.pop(old)
+            if old in self._codex_dup:
+                self._codex_dup[new] = self._codex_dup.pop(old)
         return True
 
     # ── persistent cache (M6 across process runs) ─────────────────────────────
@@ -831,21 +1011,12 @@ class Parser:
             return False
         files = data.get("files")
         records = data.get("records")
-        keys = data.get("keys")
         codex = data.get("codex")
-        if (
-            not isinstance(files, dict)
-            or records is None
-            or keys is None
-            or not isinstance(codex, dict)
-        ):
+        if not isinstance(files, dict) or records is None or not isinstance(codex, dict):
             return False
         try:
             recs = [UsageRecord(*item) for item in records]
-            by_key: dict[tuple[object, object], UsageRecord] = {}
-            for rec, key in zip(recs, keys, strict=True):
-                if key is not None:
-                    by_key[tuple(key)] = rec
+            by_key = {rec.lkey: rec for rec in recs if rec.lkey is not None}
             self.records = recs
             self._by_key = by_key
             self._files = {
@@ -855,11 +1026,15 @@ class Parser:
             file_models = codex.get("file_models", {})
             pending = codex.get("pending", {})
             totals = codex.get("totals", {})
+            dup = codex.get("dup", {})
             latest_by_account = codex.get("latest_rate_limits_by_account")
+            unflushed = data.get("unflushed", [])
             if (
                 not isinstance(file_models, dict)
                 or not isinstance(pending, dict)
                 or not isinstance(totals, dict)
+                or not isinstance(dup, dict)
+                or not isinstance(unflushed, list)
             ):
                 raise TypeError("invalid Codex cache state")
             self._file_models = {str(key): str(value) for key, value in file_models.items()}
@@ -868,6 +1043,12 @@ class Parser:
                 for source, indices in pending.items()
             }
             self._codex_totals = {str(key): tuple(value) for key, value in totals.items()}
+            self._codex_dup = {
+                str(key): (str(value[0]), int(value[1])) for key, value in dup.items()
+            }
+            # Records the ledger had not yet stored when this cache was written (a
+            # failed or skipped ledger write): queue them again so none is lost.
+            self._dirty = {int(key): by_key[int(key)] for key in unflushed if key in by_key}
             self.latest_rate_limits_by_account = (
                 {
                     str(label): capture
@@ -899,9 +1080,6 @@ class Parser:
         swallowed — the cache is an optimisation, never load-bearing."""
         if self.cache_path is None:
             return
-        # Reverse index: the dedup key (if any) that points at each record, so a
-        # warm start can rebuild self._by_key with the same object identity (T9).
-        rec_key = {id(r): k for k, r in self._by_key.items()}
         rec_index = {id(r): index for index, r in enumerate(self.records)}
         data = {
             "version": _CACHE_VERSION,
@@ -925,10 +1103,13 @@ class Parser:
                     r._eph_1h,
                     r.account,
                     r.provider,
+                    r.lkey,
                 )
                 for r in self.records
             ],
-            "keys": [rec_key.get(id(r)) for r in self.records],
+            # Keys of records not yet in the usage ledger (normally none: the engine
+            # writes the ledger before saving this cache).
+            "unflushed": [key for key in list(self._dirty) if key in self._by_key],
             "codex": {
                 "file_models": self._file_models,
                 "pending": {
@@ -936,6 +1117,7 @@ class Parser:
                     for source, records in self._codex_pending.items()
                 },
                 "totals": self._codex_totals,
+                "dup": self._codex_dup,
                 "latest_rate_limits_by_account": self.latest_rate_limits_by_account,
             },
         }
