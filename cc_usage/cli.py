@@ -188,6 +188,8 @@ def run_ledger_info(config, out=None) -> int:
         say(f"  backup      {path.name}.bak from {stamp}")
     else:
         say("  backup      none yet (ccusage makes one a day while it runs)")
+    for name in summary.pending or []:
+        say(f"  recovering  {name}: not merged yet (its history is safe in that file)")
 
     out.flush()
     print("  (comparing with your transcripts…)", file=sys.stderr)
@@ -223,6 +225,11 @@ def run_ledger_info(config, out=None) -> int:
             f"Disabled roots are not recorded ({names}). Enable them in Settings → "
             "Accounts and launch ccusage, or their usage is lost when their transcripts "
             "are deleted."
+        )
+    if summary.pending:
+        advice.append(
+            "A ledger recovery is not finished (see `recovering` above). Launch ccusage "
+            "so it can complete; ccusage makes no backup until it does."
         )
     if advice:
         advice.append("Do this before you shorten Claude Code's transcript retention.")

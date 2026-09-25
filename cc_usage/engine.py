@@ -148,6 +148,10 @@ class Engine:
         self._ledger_synced_epoch = -1
         self._ledger_full_at = 0.0
         self._ledger_retry = False
+        # Recovery sources still queued in the ledger (retried every sync), and a
+        # backup owed right after a recovery completes.
+        self._recovery_pending = False
+        self._backup_after_recovery = False
         self._identity_cache: tuple[tuple, dict[str, tuple[str, str, str]]] | None = None
         # Ledger-only history (T17): records whose transcripts are gone, rebuilt from the
         # ledger and priced with the current table. Rebound (never mutated) by the ledger
@@ -466,14 +470,16 @@ class Engine:
         if not scanned:
             return  # mid root-swap: the rescan's worker syncs the new parser
         ledger = self._ledger
-        recovered: str | None = None
         try:
             try:
                 result = self._ledger_pass(parser)
-            except LedgerCorrupt as exc:
-                recovered = self._recover_ledger(exc)
-                # A fresh file: the retry's full diff backfills every live record. A
-                # second LedgerCorrupt here is not retried again (it is unavailable).
+            except LedgerCorrupt:
+                # Rename it aside (never delete it) and queue it for recovery; opening
+                # the fresh ledger queues the backups too. The retried pass works the
+                # queue first, then backfills every live record into the fresh file.
+                moved = ledger.move_aside()
+                if moved is not None:
+                    ledger.queue(moved.name, "damaged")
                 self._ledger_synced_parser = None
                 try:
                     result = self._ledger_pass(parser)
@@ -492,9 +498,9 @@ class Engine:
                 "ledger", f"usage ledger unavailable ({exc}); running without it"
             )
             return
-        self._ledger_retry = False
+        self._ledger_retry = self._recovery_pending
         self.record_worker_warning("ledger", None)
-        self._backup_ledger(force=recovered is not None)
+        self._backup_ledger()
         if result is None:
             return
         orphans, history_accounts = result
@@ -505,33 +511,38 @@ class Engine:
             self._history_accounts = history_accounts
             self._refresh_account_flags()
 
-    def _recover_ledger(self, exc: LedgerError) -> str | None:
-        """Move an unreadable ledger aside and rebuild it from everything still
-        readable: the damaged file's intact pages, then the daily backup. Returns the
-        warning shown (sticky for the session), or None if another ccusage already
-        replaced the file. Raises LedgerUnavailable if it cannot even be moved."""
+    def _work_recovery_queue(self) -> bool:
+        """Merge whatever the ledger's recovery queue can take now; True if that added
+        rows (the orphan view must be rebuilt). The warning it leaves is sticky: it says
+        what came back, and stays "NOT complete" until every source is merged."""
         ledger = self._ledger
-        moved = ledger.move_aside()
-        if moved is None:
-            return None
-        try:
-            report = ledger.recover(moved)
-        except LedgerError as failure:
-            message = (
-                f"the usage ledger was damaged ({exc}); moved it to {moved}, but "
-                f"recovering its history failed ({failure}); it stays in that file"
-            )
-        else:
-            message = report.describe()
-        self.record_worker_warning("ledger moved", message)
-        return message
+        if not ledger.pending():
+            self._recovery_pending = False
+            return False
+        report = ledger.process_pending()
+        if report is None:
+            self._recovery_pending = False
+            return False
+        self._recovery_pending = bool(report.still_pending)
+        if report.sources:
+            self.record_worker_warning("ledger recovery", report.describe())
+        if not report.still_pending:
+            self._backup_after_recovery = True
+        return report.merged_any
 
-    def _backup_ledger(self, *, force: bool = False) -> None:
-        """Refresh ``ledger.sqlite3.bak`` at most once a day (worker path only)."""
+    def _backup_ledger(self) -> None:
+        """Rotate the ledger's backups at most once a day — at once after a completed
+        recovery or a key-scheme migration (worker path only). The ledger itself holds
+        off while any backup slot has unmerged history."""
         ledger = self._ledger
+        force = self._backup_after_recovery or ledger.migrated
         try:
             if force or ledger.backup_due():
-                ledger.backup()
+                if ledger.backup():
+                    self._backup_after_recovery = False
+                    ledger.migrated = False
+                else:
+                    self._ledger_retry = True  # a held slot was queued: merge it next
         except LedgerError as exc:
             self.record_worker_warning("ledger backup", f"usage ledger backup failed: {exc}")
             return
@@ -583,6 +594,7 @@ class Engine:
         full = ledger.ensure_current()
         full = full or self._ledger_synced_parser is not parser
         full = full or self._ledger_synced_epoch != epoch
+        full = self._work_recovery_queue() or full
         if (
             not full
             and ledger.is_open

@@ -47,14 +47,28 @@ Bump the parse cache's `_CACHE_VERSION` too. A ledger whose scheme has no migrat
 is refused (the panel warns and runs without it) rather than double counted; a ledger
 written by a *newer* scheme is left untouched.
 
-Recovery: a daily backup (``ledger.sqlite3.bak``, SQLite's online backup API, verified
-before it replaces the previous one) is taken from the worker. An unreadable ledger is
-renamed aside — never deleted — and every readable row is salvaged from it, plus every
-row of the backup, into the fresh ledger through the same max merge.
+Backups and recovery. Once a day the worker writes ``ledger.sqlite3.bak`` with SQLite's
+online backup API, verifies it with ``quick_check`` and rotates the previous one to
+``ledger.sqlite3.bak.prev``. Every ledger has a random ``ledger_id`` (its *lineage*,
+copied into its backups) and records in ``meta.merged`` the lineages whose rows it has
+fully absorbed. A backup slot is only ever replaced when the file in it is *covered* —
+its lineage is this ledger's own or one it merged — so the only good copy of some
+history is never overwritten.
+
+Recovery is a queue (``meta.pending``) that survives restarts. An unreadable ledger is
+renamed aside (never deleted) and queued, together with the backups; so is a backup
+found to be uncovered, and so are the backups when a ledger has to be created while
+they exist (the ledger file went missing). Each queued file is read from a scratch copy
+next to the ledger (never TMPDIR), salvaged by key range around damaged pages, checked
+with ``quick_check``, migrated to the current key scheme, and merged by the same max
+rule. A file that cannot be read for an environmental reason (disk full, permissions)
+stays queued and is retried; while anything is queued no backup is rotated. A file
+whose key scheme is unknown or cannot be migrated is refused and kept.
 """
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import sqlite3
@@ -142,8 +156,9 @@ _ROW_COLUMNS = "key, acct, ts, model, inp, outp, cr, cc, e5, e1"
 def _migrate_scheme_0(conn: sqlite3.Connection) -> None:
     """Scheme 0 -> 1: the pre-release T17 build keyed Codex events with an ordinal and
     stored Codex re-emissions as usage. Neither can be re-keyed from a stored row, so
-    its Codex rows are dropped; the next full sync re-records every rollout still on
-    disk under scheme 1. Claude keys did not change and are kept."""
+    its Codex rows are dropped, and the next full sync re-records only the Codex usage
+    whose rollouts are still on disk (scheme 0 never shipped, so no released ledger has
+    Codex history that exists nowhere else). Claude keys did not change and are kept."""
     conn.execute(
         "DELETE FROM usage WHERE acct IN (SELECT id FROM accounts WHERE provider = ?)",
         (CODEX_PROVIDER,),
@@ -173,6 +188,16 @@ class LedgerCorrupt(LedgerError):
 class LedgerUnavailable(LedgerError):
     """Disk full, read-only or unopenable location, or an incompatible ledger: run
     without it."""
+
+
+class RecoveryFailed(LedgerError):
+    """A recovery source could not be read for an environmental reason (disk full,
+    permissions, I/O). It stays queued and is retried; nothing may treat it as merged."""
+
+
+class SourceRefused(LedgerError):
+    """A recovery source's rows cannot be merged safely (its record key scheme is
+    unknown, newer, or has no migration). The file is kept untouched."""
 
 
 _SQLITE_HEADER = b"SQLite format 3\x00"
@@ -229,6 +254,21 @@ def _text(value: str) -> str:
 def _meta(conn: sqlite3.Connection, key: str) -> str | None:
     row = conn.execute("SELECT v FROM meta WHERE k = ?", (key,)).fetchone()
     return row[0] if row is not None else None
+
+
+def _set_meta(conn: sqlite3.Connection, key: str, value: str) -> None:
+    conn.execute(
+        "INSERT INTO meta (k, v) VALUES (?, ?) ON CONFLICT (k) DO UPDATE SET v = excluded.v",
+        (key, value),
+    )
+
+
+def _json_list(raw: str | None) -> list:
+    try:
+        value = json.loads(raw) if raw else []
+    except ValueError:
+        return []
+    return value if isinstance(value, list) else []
 
 
 @dataclass(frozen=True, slots=True)
@@ -309,36 +349,79 @@ def orphan_record(
 
 
 @dataclass
-class Recovery:
-    """What `Ledger.recover` got back after an unreadable ledger was moved aside."""
+class SourceResult:
+    """What happened to one queued recovery source."""
 
-    moved: Path
-    salvaged: int  # rows read back from the damaged file
-    salvage_complete: bool  # every part of the damaged file was readable
-    from_backup: int  # rows only the backup still had
-    backup_time: float | None  # mtime of the backup used, if any
+    name: str
+    why: str  # "damaged" (the moved-aside ledger), "missing" or "held" (a backup)
+    status: str  # "merged", "unreadable", "failed" (retried), "refused", "gone"
+    rows: int = 0  # rows read back and merged
+    new_rows: int = 0  # of those, rows this ledger did not have yet
+    complete: bool = False  # every part of the file was readable (quick_check ok)
+    reason: str = ""
+    mtime: float | None = None
+    kept_as: str | None = None  # a backup slot file set aside instead of merged
+
+
+@dataclass
+class RecoveryReport:
+    """The outcome of one pass over the recovery queue."""
+
+    sources: list[SourceResult]
+    still_pending: list[str]
+    directory: Path | None = None  # where the sources live (named in full when damaged)
+
+    @property
+    def merged_any(self) -> bool:
+        return any(source.new_rows for source in self.sources)
 
     def describe(self) -> str:
-        parts = [f"the usage ledger was damaged; moved it to {self.moved}"]
-        if self.salvage_complete:
-            parts.append(f"recovered all {self.salvaged:,} rows from it — history intact")
-            return "; ".join(parts)
-        backup = (
-            f" and {self.from_backup:,} more from the backup of "
-            f"{time.strftime('%Y-%m-%d %H:%M', time.localtime(self.backup_time))}"
-            if self.backup_time is not None
-            else ""
-        )
-        parts.append(f"recovered {self.salvaged:,} readable rows{backup}")
-        if self.backup_time is not None:
+        """One plain sentence for the panel: what happened and whether history is
+        intact, partly lost, or not recovered yet."""
+        sources = self.sources
+        damaged = [s for s in sources if s.why == "damaged"]
+        parts: list[str] = []
+        if damaged:
+            where = self.directory / damaged[0].name if self.directory else damaged[0].name
+            parts.append(f"the usage ledger was damaged and moved to {where}")
+        elif any(s.why == "missing" for s in sources):
+            parts.append("the usage ledger was missing, so a new one was started")
+        for s in sources:
+            when = (
+                f" (from {time.strftime('%Y-%m-%d %H:%M', time.localtime(s.mtime))})"
+                if s.mtime is not None and s.why != "damaged"
+                else ""
+            )
+            if s.status == "merged":
+                extent = "all of it" if s.complete else "parts of it were unreadable"
+                parts.append(f"recovered {s.rows:,} rows from {s.name}{when}, {extent}")
+            elif s.status == "unreadable":
+                parts.append(f"nothing in {s.name} was readable")
+            elif s.status == "failed":
+                parts.append(
+                    f"could NOT read {s.name} yet ({s.reason}); its history is safe in "
+                    "that file, ccusage retries on every scan and makes no backup until "
+                    "it succeeds"
+                )
+            elif s.status == "refused":
+                parts.append(f"did not merge {s.name} ({s.reason}); the file is kept")
+            if s.kept_as:
+                parts.append(f"{s.name} was set aside as {s.kept_as}")
+        if any(s.status == "failed" for s in sources):
+            parts.append("recovery is NOT complete")
+        elif damaged and all(s.status == "merged" and s.complete for s in damaged):
+            parts.append("history intact")
+        elif any(s.status == "merged" and s.why != "damaged" for s in sources):
             parts.append(
-                "usage recorded only in the damaged part after the backup, for "
+                "usage recorded after that backup for transcripts already deleted may "
+                "be lost" if not damaged else
+                "usage recorded only in the unreadable part after that backup, for "
                 "transcripts already deleted, may be lost"
             )
-        else:
+        elif damaged:
             parts.append(
-                "part of it was unreadable and there was no backup: history of deleted "
-                "transcripts in that part is lost"
+                "there was no usable backup: history of deleted transcripts in the "
+                "unreadable part is lost"
             )
         return "; ".join(parts)
 
@@ -354,9 +437,13 @@ class Ledger:
     def __init__(self, path: Path):
         self.path = Path(path)
         self.backup_path = self.path.with_name(self.path.name + ".bak")
+        self.backup_prev = self.path.with_name(self.path.name + ".bak.prev")
         self._conn: sqlite3.Connection | None = None
         self._file_id: tuple[int, int] | None = None
         self._data_version: int | None = None
+        # Set when this process ran a key-scheme migration: the engine then takes a
+        # backup at once, so no backup is left behind on the old scheme.
+        self.migrated = False
 
     # ── connection ───────────────────────────────────────────────────────────
     @property
@@ -421,6 +508,7 @@ class Ledger:
             conn.execute("PRAGMA synchronous = NORMAL")
             conn.execute(f"PRAGMA journal_size_limit = {_JOURNAL_SIZE_LIMIT}")
             self._ensure_schema(conn)
+            self._ensure_key_scheme(conn)
             self._data_version = conn.execute("PRAGMA data_version").fetchone()[0]
         except sqlite3.Error as exc:
             conn.close()
@@ -431,8 +519,7 @@ class Ledger:
         self._conn = conn
         return conn
 
-    @staticmethod
-    def _ensure_schema(conn: sqlite3.Connection) -> None:
+    def _ensure_schema(self, conn: sqlite3.Connection) -> None:
         version = conn.execute("PRAGMA user_version").fetchone()[0]
         if version > SCHEMA_VERSION:
             raise LedgerUnavailable(
@@ -452,6 +539,15 @@ class Ledger:
                         "INSERT INTO meta (k, v) VALUES ('key_scheme', ?), ('ledger_id', ?)",
                         (str(KEY_SCHEME), uuid.uuid4().hex),
                     )
+                    # A new ledger next to existing backups means the ledger went
+                    # missing (or was just moved aside): their history comes back first.
+                    backups = [
+                        {"file": slot.name, "why": "missing"}
+                        for slot in (self.backup_path, self.backup_prev)
+                        if slot.exists()
+                    ]
+                    if backups:
+                        _set_meta(conn, "pending", json.dumps(backups))
                 elif version == 1:
                     # A pre-release ledger: scheme 0 by definition; migrated just below.
                     conn.execute(_META)
@@ -465,10 +561,8 @@ class Ledger:
             except BaseException:
                 _rollback(conn)
                 raise
-        Ledger._ensure_key_scheme(conn)
 
-    @staticmethod
-    def _ensure_key_scheme(conn: sqlite3.Connection) -> None:
+    def _ensure_key_scheme(self, conn: sqlite3.Connection) -> None:
         """Run the key-scheme migrations this ledger needs, once, atomically."""
         stored = int(_meta(conn, "key_scheme") or 0)
         if stored == KEY_SCHEME:
@@ -489,15 +583,12 @@ class Ledger:
                         f"migration to v{version + 1}; leaving it untouched"
                     )
                 migrate(conn)
-            conn.execute(
-                "INSERT INTO meta (k, v) VALUES ('key_scheme', ?) "
-                "ON CONFLICT (k) DO UPDATE SET v = excluded.v",
-                (str(KEY_SCHEME),),
-            )
+            _set_meta(conn, "key_scheme", str(KEY_SCHEME))
             conn.execute("COMMIT")
         except BaseException:
             _rollback(conn)
             raise
+        self.migrated = True
 
     def close(self) -> None:
         conn, self._conn = self._conn, None
@@ -676,6 +767,162 @@ class Ledger:
             raise _classify(exc) from exc
 
     # ── backup and recovery ──────────────────────────────────────────────────
+    def lineage(self) -> str | None:
+        conn = self._open()
+        try:
+            return _meta(conn, "ledger_id")
+        except sqlite3.Error as exc:
+            raise _classify(exc) from exc
+
+    def merged_lineages(self) -> set[str]:
+        conn = self._open()
+        try:
+            return {str(v) for v in _json_list(_meta(conn, "merged"))}
+        except sqlite3.Error as exc:
+            raise _classify(exc) from exc
+
+    def pending(self) -> list[dict]:
+        """Recovery sources still to merge: [{"file": name, "why": reason}, ...]."""
+        conn = self._open()
+        try:
+            raw = _json_list(_meta(conn, "pending"))
+        except sqlite3.Error as exc:
+            raise _classify(exc) from exc
+        return [e for e in raw if isinstance(e, dict) and isinstance(e.get("file"), str)]
+
+    def _update_meta_lists(
+        self,
+        *,
+        add_pending: list[dict] = (),
+        drop_pending: set[str] = frozenset(),
+        add_merged: set[str] = frozenset(),
+    ) -> None:
+        """Edit the pending queue / merged set under the write lock (read-modify-write
+        against whatever another process wrote meanwhile)."""
+        conn = self._open()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                pending = [
+                    e
+                    for e in _json_list(_meta(conn, "pending"))
+                    if isinstance(e, dict) and e.get("file") not in drop_pending
+                ]
+                names = {e.get("file") for e in pending}
+                front = [e for e in add_pending if e["file"] not in names]
+                _set_meta(conn, "pending", json.dumps(front + pending))
+                if add_merged:
+                    merged = {str(v) for v in _json_list(_meta(conn, "merged"))} | add_merged
+                    _set_meta(conn, "merged", json.dumps(sorted(merged)))
+                conn.execute("COMMIT")
+            except BaseException:
+                _rollback(conn)
+                raise
+        except sqlite3.Error as exc:
+            raise _classify(exc) from exc
+
+    def queue(self, name: str, why: str) -> None:
+        """Queue a file in the ledger's directory for recovery (idempotent)."""
+        self._update_meta_lists(add_pending=[{"file": name, "why": why}])
+
+    def recover(self, moved: Path) -> RecoveryReport:
+        """Queue a moved-aside ledger (after the backups a new ledger queues itself)
+        and run the queue once."""
+        self.queue(moved.name, "damaged")
+        return self.process_pending()
+
+    def process_pending(self) -> RecoveryReport | None:
+        """Merge every queued recovery source that can be read now.
+
+        A source read successfully leaves the queue; a damaged or refused backup slot is
+        renamed aside (kept) so the slot can hold a new backup; a complete backup's
+        lineage is recorded as merged. A source that could not be read for an
+        environmental reason stays queued. Write errors propagate (the queue is kept)."""
+        entries = self.pending()
+        if not entries:
+            return None
+        results: list[SourceResult] = []
+        done: set[str] = set()
+        merged: set[str] = set()
+        slots = {self.backup_path.name, self.backup_prev.name}
+        for entry in entries:
+            name, why = entry["file"], str(entry.get("why") or "held")
+            path = self.path.parent / name
+            if not path.exists():
+                results.append(SourceResult(name, why, "gone"))
+                done.add(name)
+                continue
+            try:
+                result, lineage = self._merge_source(path, why)
+            except RecoveryFailed as exc:
+                results.append(SourceResult(name, why, "failed", reason=str(exc)))
+                continue
+            except SourceRefused as exc:
+                result, lineage = SourceResult(name, why, "refused", reason=str(exc)), None
+            done.add(name)
+            fully = result.status == "merged" and result.complete
+            if fully and lineage:
+                merged.add(lineage)
+            if name in slots and not (fully and lineage):
+                # A slot may only keep a file a later backup can recognise as covered;
+                # anything else is renamed aside (kept) so it can never block, or be
+                # overwritten by, a rotation.
+                label = (
+                    "unmerged" if result.status == "refused"
+                    else "merged" if fully
+                    else "damaged"
+                )
+                result.kept_as = self._set_aside(path, label)
+            results.append(result)
+        self._update_meta_lists(drop_pending=done, add_merged=merged)
+        return RecoveryReport(results, [e["file"] for e in self.pending()], self.path.parent)
+
+    def _set_aside(self, path: Path, label: str) -> str | None:
+        """Rename a file to ``<name>.<label>-<timestamp>`` (never delete it)."""
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        target = path.with_name(f"{path.name}.{label}-{stamp}")
+        n = 2
+        while target.exists():
+            target = path.with_name(f"{path.name}.{label}-{stamp}-{n}")
+            n += 1
+        try:
+            os.rename(path, target)
+        except OSError:
+            return None
+        return target.name
+
+    def _merge_source(self, path: Path, why: str) -> tuple[SourceResult, str | None]:
+        source = _read_source(path, self.path.parent)
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            mtime = None
+        if source.unreadable:
+            return SourceResult(path.name, why, "unreadable", mtime=mtime), None
+        if source.accounts is None or source.models is None:
+            # Its id tables are damaged: a backup of the same lineage can stand in.
+            for slot in (self.backup_path, self.backup_prev):
+                if slot == path or not slot.exists():
+                    continue
+                tables = _read_tables(slot)
+                if tables is not None and source.ledger_id and tables[0] == source.ledger_id:
+                    source.accounts = {**tables[1], **(source.accounts or {})}
+                    source.models = {**tables[2], **(source.models or {})}
+                    break
+        rows = _migrated_rows(source, path.name)
+        present = {row[0] for row in self.rows([row.key for row in rows])}
+        self.write(rows)
+        result = SourceResult(
+            path.name,
+            why,
+            "merged",
+            rows=len(rows),
+            new_rows=sum(1 for row in rows if row.key not in present),
+            complete=source.complete,
+            mtime=mtime,
+        )
+        return result, source.ledger_id
+
     def backup_due(self, now: float | None = None) -> bool:
         try:
             age = (time.time() if now is None else now) - self.backup_path.stat().st_mtime
@@ -683,12 +930,28 @@ class Ledger:
             return True
         return age >= BACKUP_INTERVAL_SECS
 
-    def backup(self) -> None:
-        """Copy the ledger to ``ledger.sqlite3.bak`` with SQLite's online backup API.
+    def backup(self) -> bool:
+        """Rotate backups: verify a fresh copy, move ``.bak`` to ``.bak.prev``, install
+        the copy as ``.bak``. Returns False when it had to hold off.
 
-        The copy is made beside the target, checked with ``PRAGMA quick_check``, and
-        only then renamed over the previous backup, so a damaged source never replaces
-        a good backup. Worker threads only."""
+        It holds off while the recovery queue is not empty, and when a backup slot holds
+        a file that is not covered (its lineage is neither this ledger's nor one it has
+        merged — or it is unreadable): that file is queued for merging instead, and the
+        rotation happens on a later sync once it is covered. So the only good copy of any
+        history is never overwritten. Worker threads only."""
+        if self.pending():
+            return False
+        covered = {self.lineage()} | self.merged_lineages()
+        held = []
+        for slot in (self.backup_path, self.backup_prev):
+            if slot.exists():
+                tables = _read_tables(slot)
+                if tables is None or tables[0] not in covered:
+                    held.append(slot.name)
+        if held:
+            for name in held:
+                self.queue(name, "held")
+            return False
         conn = self._open()
         tmp = self.backup_path.with_name(f"{self.backup_path.name}.{os.getpid()}.tmp")
         try:
@@ -701,6 +964,8 @@ class Ledger:
                 target.close()
             if check != "ok":
                 raise LedgerCorrupt(f"backup copy failed its integrity check: {check}")
+            if self.backup_path.exists():
+                os.replace(self.backup_path, self.backup_prev)
             os.replace(tmp, self.backup_path)
         except sqlite3.Error as exc:
             raise _classify(exc) from exc
@@ -711,40 +976,7 @@ class Ledger:
                 tmp.unlink()
             except OSError:
                 pass
-
-    def recover(self, moved: Path) -> Recovery:
-        """Salvage every readable row from a moved-aside ledger — and every row of the
-        backup — into this (fresh) ledger through the normal max merge."""
-        salvage = _read_salvage(moved)
-        backup = _read_salvage(self.backup_path) if self.backup_path.exists() else None
-        if (
-            backup is not None
-            and salvage.ledger_id is not None
-            and salvage.ledger_id == backup.ledger_id
-        ):
-            # Same lineage: the backup's id tables can stand in for damaged ones.
-            salvage.accounts = {**(backup.accounts or {}), **(salvage.accounts or {})}
-            salvage.models = {**(backup.models or {}), **(salvage.models or {})}
-        rows = salvage.to_rows()
-        self.write(rows)
-        seen = {row.key for row in rows}
-        from_backup = 0
-        backup_time = None
-        if backup is not None:
-            backup_rows = backup.to_rows()
-            self.write(backup_rows)
-            from_backup = sum(1 for row in backup_rows if row.key not in seen)
-            try:
-                backup_time = self.backup_path.stat().st_mtime
-            except OSError:
-                backup_time = None
-        return Recovery(
-            moved=moved,
-            salvaged=len(rows),
-            salvage_complete=salvage.complete,
-            from_backup=from_backup,
-            backup_time=backup_time,
-        )
+        return True
 
 
 # ── salvage ────────────────────────────────────────────────────────────────────
@@ -759,7 +991,9 @@ class _Salvaged:
     accounts: dict[int, tuple[str, str, str]] | None
     models: dict[int, str] | None
     ledger_id: str | None
+    key_scheme: int | None  # None: unknown (its meta could not be read)
     complete: bool
+    unreadable: bool = False
 
     def to_rows(self) -> list[LedgerRow]:
         rows: list[LedgerRow] = []
@@ -772,7 +1006,9 @@ class _Salvaged:
                 self.complete = False
                 continue
             provider, identity, label = account
-            rows.append(LedgerRow(key, provider, identity, label, ts, name, inp, outp, cr, cc, e5, e1))
+            rows.append(
+                LedgerRow(key, provider, identity, label, ts, name, inp, outp, cr, cc, e5, e1)
+            )
         return rows
 
 
@@ -790,30 +1026,56 @@ def _plausible(row: tuple) -> bool:
     return all(v is None or (isinstance(v, int) and 0 <= v < _TOKENS_MAX) for v in (e5, e1))
 
 
-def _read_salvage(path: Path) -> _Salvaged:
-    """Read whatever a (possibly damaged) ledger file still yields.
+def _read_tables(path: Path) -> tuple[str | None, dict, dict] | None:
+    """(ledger_id, accounts, models) of an intact ledger/backup file, read-only; None if
+    any of it cannot be read."""
+    try:
+        conn = sqlite3.connect(f"{Path(path).resolve().as_uri()}?mode=ro", uri=True)
+    except sqlite3.Error:
+        return None
+    try:
+        lineage = _meta(conn, "ledger_id")
+        accounts = {
+            row[0]: (row[1], row[2], row[3])
+            for row in conn.execute("SELECT id, provider, identity, label FROM accounts")
+        }
+        models = dict(conn.execute("SELECT id, name FROM models"))
+    except sqlite3.Error:
+        return None
+    finally:
+        conn.close()
+    return lineage, accounts, models
 
-    Works on a scratch copy so the moved-aside evidence is never modified. The usage
-    table is read by key range; a range that hits a damaged page is split and retried
-    until the unreadable part is narrowed down, so one bad page costs only its own rows.
-    """
-    empty = _Salvaged([], None, None, None, False)
-    with tempfile.TemporaryDirectory(prefix="ccusage-salvage-") as scratch:
-        copy = Path(scratch) / "ledger.sqlite3"
+
+def _read_source(path: Path, scratch_parent: Path) -> _Salvaged:
+    """Read whatever a (possibly damaged) ledger or backup file still yields.
+
+    Works on a scratch copy — made next to the ledger, never in TMPDIR, which may be a
+    small RAM disk — so the source is never modified. Any failure to make or open that
+    copy is environmental and raises `RecoveryFailed`: the caller must not mistake it
+    for "nothing to recover"."""
+    try:
+        holder = tempfile.TemporaryDirectory(
+            prefix=".ccusage-salvage-", dir=scratch_parent, ignore_cleanup_errors=True
+        )
+    except OSError as exc:
+        raise RecoveryFailed(f"cannot make a scratch copy of {path.name}: {exc}") from exc
+    with holder as scratch:
+        copy = Path(scratch) / "source.sqlite3"
         try:
             shutil.copyfile(path, copy)
             for suffix in ("-wal", "-shm"):
                 side = Path(f"{path}{suffix}")
                 if side.exists():
                     shutil.copyfile(side, Path(f"{copy}{suffix}"))
-        except OSError:
-            return empty
+        except OSError as exc:
+            raise RecoveryFailed(f"could not copy {path.name}: {exc}") from exc
         try:
             conn = sqlite3.connect(str(copy), isolation_level=None)
-        except sqlite3.Error:
-            return empty
+        except sqlite3.Error as exc:
+            raise RecoveryFailed(f"could not open a copy of {path.name}: {exc}") from exc
         try:
-            return _salvage_connection(conn)
+            return _salvage_connection(conn, path.name)
         finally:
             conn.close()
 
@@ -825,31 +1087,56 @@ _SALVAGE_MIN_WIDTH = 2**46
 _SALVAGE_MAX_FAILURES = 20_000
 
 
-def _salvage_connection(conn: sqlite3.Connection) -> _Salvaged:
+def _salvage_connection(conn: sqlite3.Connection, name: str) -> _Salvaged:
+    def damage_or_raise(exc: sqlite3.Error) -> None:
+        """Damage is expected and survivable; anything else (I/O, disk full, out of
+        memory) means the read itself failed and must be retried later."""
+        if not isinstance(_classify(exc), LedgerCorrupt):
+            raise RecoveryFailed(f"reading {name} failed: {exc}") from exc
+
     try:
+        # Validate each cell's size as it is read, so a damaged page raises instead of
+        # silently yielding fewer rows.
+        conn.execute("PRAGMA cell_size_check = ON")
         conn.execute("SELECT count(*) FROM sqlite_master").fetchone()
-    except sqlite3.Error:
-        return _Salvaged([], None, None, None, False)  # not a database any more
+        tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master")}
+        version = conn.execute("PRAGMA user_version").fetchone()[0]
+    except sqlite3.Error as exc:
+        damage_or_raise(exc)
+        return _Salvaged([], None, None, None, None, False, unreadable=True)
     complete = True
 
     def read(sql: str) -> list[tuple] | None:
         nonlocal complete
         try:
             return list(conn.execute(sql))
-        except sqlite3.Error:
+        except sqlite3.Error as exc:
+            damage_or_raise(exc)
             complete = False
             return None
 
     account_rows = read("SELECT id, provider, identity, label FROM accounts")
     model_rows = read("SELECT id, name FROM models")
-    meta_rows = read("SELECT k, v FROM meta")
+    meta = None
+    if "meta" in tables:
+        meta_rows = read("SELECT k, v FROM meta")
+        meta = dict(meta_rows) if meta_rows is not None else None
     accounts = (
         {row[0]: (row[1], row[2], row[3]) for row in account_rows}
         if account_rows is not None
         else None
     )
     models = {row[0]: row[1] for row in model_rows} if model_rows is not None else None
-    ledger_id = dict(meta_rows).get("ledger_id") if meta_rows is not None else None
+    ledger_id = meta.get("ledger_id") if meta else None
+    if "meta" not in tables:
+        key_scheme = 0 if version == 1 else None  # the pre-release layout had no meta
+    elif meta is None or "key_scheme" not in meta:
+        key_scheme = None
+    else:
+        try:
+            key_scheme = int(meta["key_scheme"])
+        except ValueError:
+            key_scheme = None
 
     raw: list[tuple] = []
     step = 2**58  # 64 top-level ranges over the signed 64-bit key space
@@ -861,7 +1148,8 @@ def _salvage_connection(conn: sqlite3.Connection) -> _Salvaged:
             part = conn.execute(
                 f"SELECT {_ROW_COLUMNS} FROM usage WHERE key BETWEEN ? AND ?", (lo, hi)
             ).fetchall()
-        except sqlite3.Error:
+        except sqlite3.Error as exc:
+            damage_or_raise(exc)
             failures += 1
             width = hi - lo + 1
             if width <= _SALVAGE_MIN_WIDTH or failures > _SALVAGE_MAX_FAILURES:
@@ -877,7 +1165,63 @@ def _salvage_connection(conn: sqlite3.Connection) -> _Salvaged:
                 raw.append(row)
             else:
                 complete = False
-    return _Salvaged(raw, accounts, models, ledger_id, complete)
+    # A range scan can skip cells on some damaged pages without any error. Only a
+    # clean integrity check lets the salvage call itself complete.
+    try:
+        check = conn.execute("PRAGMA quick_check").fetchall()
+    except sqlite3.Error as exc:
+        damage_or_raise(exc)
+        check = []
+    if check != [("ok",)]:
+        complete = False
+    return _Salvaged(raw, accounts, models, ledger_id, key_scheme, complete)
+
+
+def _migrated_rows(source: _Salvaged, name: str) -> list[LedgerRow]:
+    """The source's rows under the *current* key scheme, or `SourceRefused`.
+
+    Rows from an older scheme are rebuilt in a clean in-memory ledger and run through
+    `KEY_SCHEME_MIGRATIONS` exactly as a live ledger would be, so recovery can never
+    re-import rows the compatibility rule says must be re-keyed or dropped."""
+    scheme = source.key_scheme
+    if scheme is None:
+        raise SourceRefused(f"the record key scheme of {name} is unreadable")
+    if scheme > KEY_SCHEME:
+        raise SourceRefused(f"{name} uses record key scheme v{scheme}, newer than this ccusage")
+    if scheme < KEY_SCHEME:
+        missing = [v for v in range(scheme, KEY_SCHEME) if v not in KEY_SCHEME_MIGRATIONS]
+        if missing:
+            raise SourceRefused(
+                f"{name} uses record key scheme v{missing[0]} and there is no migration"
+            )
+        try:
+            mem = sqlite3.connect(":memory:", isolation_level=None)
+            try:
+                for statement in _SCHEMA:
+                    mem.execute(statement)
+                mem.executemany(
+                    "INSERT INTO accounts (id, provider, identity, label) VALUES (?, ?, ?, ?)",
+                    [(i, *a) for i, a in (source.accounts or {}).items()],
+                )
+                mem.executemany(
+                    "INSERT INTO models (id, name) VALUES (?, ?)",
+                    list((source.models or {}).items()),
+                )
+                mem.executemany(
+                    f"INSERT OR IGNORE INTO usage ({_ROW_COLUMNS}) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    source.raw,
+                )
+                mem.execute("BEGIN")
+                for version in range(scheme, KEY_SCHEME):
+                    KEY_SCHEME_MIGRATIONS[version](mem)
+                mem.execute("COMMIT")
+                source.raw = list(mem.execute(f"SELECT {_ROW_COLUMNS} FROM usage"))
+            finally:
+                mem.close()
+        except sqlite3.Error as exc:
+            raise RecoveryFailed(f"migrating the rows of {name} failed: {exc}") from exc
+    return source.to_rows()
 
 
 # ── read-only inspection (`ccusage --ledger-info`) ─────────────────────────────
@@ -894,6 +1238,7 @@ class LedgerSummary:
     keys: dict[int, int]  # key -> account id
     account_ids: dict[int, tuple[str, str, str]]
     backup_time: float | None = None
+    pending: list[str] | None = None  # recovery sources not merged yet
 
 
 def ledger_files_size(path: Path) -> int:
@@ -948,6 +1293,11 @@ def _read_summary_once(path: Path) -> LedgerSummary:
                 "SELECT id, provider, identity, label FROM accounts"
             )
         }
+        pending = [
+            str(e.get("file"))
+            for e in _json_list(_meta(conn, "pending"))
+            if isinstance(e, dict) and e.get("file")
+        ]
         keys = dict(conn.execute("SELECT key, acct FROM usage"))
         per_account: dict[int, int] = {}
         for account_id in keys.values():
@@ -979,4 +1329,5 @@ def _read_summary_once(path: Path) -> LedgerSummary:
         keys=keys,
         account_ids=account_ids,
         backup_time=backup_time,
+        pending=pending,
     )

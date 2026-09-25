@@ -693,7 +693,7 @@ def test_corrupt_ledger_never_takes_the_panel_down(world):
             assert app.is_running
             assert len(eng.records) == 9
             notes = [t.plain for t in app.query_one("#notes", Static).renderable.renderables]
-            assert any("corrupt-" in t and "moved it to" in t for t in notes)
+            assert any("corrupt-" in t and "moved to" in t for t in notes)
 
     asyncio.run(scenario())
     eng.close()
@@ -1107,7 +1107,8 @@ def test_resumed_copy_with_lower_counters_keeps_the_stored_max(world):
     assert cold.parser.has_key(m4.lkey)  # still live (from the copy), at the stored max
     assert m4.output_tokens == 70 and m4.cache_read == 5000
     # And the ledger was never lowered by the zeroed copy.
-    assert [row for row in ledger_rows(world.ledger) if row[0] == m4.lkey][0][5:8] == (700, 70, 5000)
+    [stored] = [row for row in ledger_rows(world.ledger) if row[0] == m4.lkey]
+    assert stored[5:8] == (700, 70, 5000)
 
 
 def test_cut_back_streaming_reply_keeps_its_final_count_after_a_cold_rebuild(world):
@@ -1259,10 +1260,12 @@ def test_partially_damaged_ledger_is_salvaged_row_by_row(tmp_path):
     moved = led.move_aside()
     report = led.recover(moved)
     led.close()
-    assert not report.salvage_complete and report.from_backup == 0
-    assert 5000 - 200 < report.salvaged < 5000  # only the scribbled page is lost
-    assert _usage_count(path) == report.salvaged
-    assert "no backup" in report.describe()
+    [source] = report.sources  # no backup existed
+    assert source.why == "damaged" and source.status == "merged" and not source.complete
+    assert 5000 - 200 < source.rows < 5000  # only the scribbled page is lost
+    assert _usage_count(path) == source.rows
+    assert "no usable backup" in report.describe()
+    assert "history intact" not in report.describe()
     stored = {row[0]: row for row in ledger_rows(path)}
     original = {r.key: r for r in rows}
     assert all(original[k].inp == row[5] for k, row in stored.items())  # values intact
@@ -1286,7 +1289,8 @@ def test_damaged_ledger_is_restored_from_the_backup(world):
     moved = list(world.state.glob("ledger.sqlite3.corrupt-*"))
     assert len(moved) == 1
     [note] = [w for w in eng.worker_warnings if "damaged" in w]
-    assert str(moved[0]) in note and "from the backup of" in note
+    assert str(moved[0]) in note and "rows from ledger.sqlite3.bak (from " in note
+    assert "may be lost" in note and "history intact" not in note
     assert _usage_count(world.ledger) == 9 + 3000
 
     # Even a ledger that is garbage from its first byte comes back from the backup.
@@ -1610,3 +1614,395 @@ def test_warm_start_backfills_a_lost_ledger(world, damage):
     assert eng.prime_cache()  # warm: nothing is re-parsed, so nothing is "dirty"
     eng.sync_ledger()
     assert len(ledger_rows(world.ledger)) == 9
+
+
+# ── critic round 2: the recovery layer ───────────────────────────────────────────
+def _history_world(world: World, n: int = 3000):
+    """A ledger holding `n` rows of deleted-transcript history, with a daily backup."""
+    eng = world.scanned()
+    eng._ledger.write(_synthetic_rows(world, n))
+    eng._ledger_synced_parser = None
+    eng.sync_ledger()
+    before = views(eng)
+    assert before["records"] == 9 + n
+    eng._ledger.backup()
+    eng.close()
+    return before
+
+
+def _bak_rows(path: Path) -> int:
+    conn = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
+    try:
+        return conn.execute("SELECT count(*) FROM usage").fetchone()[0]
+    finally:
+        conn.close()
+
+
+# 1a + 1c: a salvage copy that fails is a FAILED recovery, retried, never "nothing"
+def test_failed_salvage_copy_is_reported_retried_and_never_mistaken_for_empty(
+    world, monkeypatch
+):
+    import errno
+
+    before = _history_world(world)
+    bak = world.state / "ledger.sqlite3.bak"
+    good = bak.read_bytes()
+    _corrupt_a_usage_leaf(world.ledger)
+    real_copy = ledger_module.shutil.copyfile
+    destinations: list[Path] = []
+
+    def full_disk(src, dst, *a, **k):
+        destinations.append(Path(dst))
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    monkeypatch.setattr(ledger_module.shutil, "copyfile", full_disk)
+    eng = world.scanned(cache="fresh.pkl")
+    [note] = [w for w in eng.worker_warnings if "damaged" in w]
+    assert "could NOT read" in note and "No space left" in note
+    assert "recovery is NOT complete" in note and "recovered" not in note
+    # (c) the scratch copy is made next to the ledger, not in TMPDIR
+    assert destinations and all(d.parent.parent == world.state for d in destinations)
+    for _ in range(3):  # later syncs retry, and never rotate the only good backup away
+        eng._ledger_synced_parser = None
+        eng.sync_ledger()
+    assert eng._ledger.backup() is False
+    assert bak.read_bytes() == good
+    assert eng.ledger_pending  # the app keeps scheduling syncs until it succeeds
+
+    monkeypatch.setattr(ledger_module.shutil, "copyfile", real_copy)  # space is back
+    eng.sync_ledger()
+    assert_same(views(eng), before)  # every orphan is back
+    [note] = [w for w in eng.worker_warnings if "damaged" in w]
+    assert "NOT complete" not in note and "recovered" in note
+    # …and only now is the old backup rotated, into .bak.prev, not destroyed.
+    assert (world.state / "ledger.sqlite3.bak.prev").read_bytes() == good
+    assert _bak_rows(bak) == 9 + 3000
+    eng.close()
+
+
+# 1b + 4: backups rotate, and a slot holding unmerged history is never overwritten
+def test_backups_rotate_and_a_foreign_backup_is_merged_before_it_is_replaced(world, tmp_path):
+    from cc_usage.ledger import Ledger
+
+    eng = world.scanned()
+    bak = world.state / "ledger.sqlite3.bak"
+    prev = world.state / "ledger.sqlite3.bak.prev"
+    first = bak.read_bytes()
+
+    def age_backup():
+        old = bak.stat().st_mtime - ledger_module.BACKUP_INTERVAL_SECS - 1
+        os.utime(bak, (old, old))
+
+    age_backup()
+    with (world.alpha / "s1.jsonl").open("a", encoding="utf-8") as fh:
+        fh.write(claude_line("r7", "m7", NOW - 1 * H, 10, 1))
+    eng.scan()
+    eng.sync_ledger()
+    assert prev.read_bytes() == first and _bak_rows(bak) == 10  # rotated, not replaced
+
+    # A backup from another ledger lands in the slot (restored by hand, say).
+    other = Ledger(tmp_path / "other" / "ledger.sqlite3")
+    other.write(_synthetic_rows(world, 50))
+    other.backup()
+    other.close()
+    foreign = (tmp_path / "other" / "ledger.sqlite3.bak").read_bytes()
+    bak.write_bytes(foreign)
+    age_backup()
+    eng.sync_ledger()
+    assert bak.read_bytes() == foreign  # held: its rows are not in this ledger yet
+    eng.sync_ledger()  # the next sync merges it, then rotates
+    assert prev.read_bytes() == foreign
+    assert _bak_rows(bak) == 10 + 50
+    assert len(eng.records) == 10 + 50  # its history is in every view
+    eng.close()
+
+
+def test_missing_ledger_is_restored_from_its_backup(world):
+    before = _history_world(world, 40)
+    bak = world.state / "ledger.sqlite3.bak"
+    good = bak.read_bytes()
+    for side in world.state.glob("ledger.sqlite3"):
+        side.unlink()
+    for side in world.state.glob("ledger.sqlite3-*"):
+        side.unlink()
+    eng = world.engine()
+    assert eng.prime_cache()
+    eng.sync_ledger()
+    assert_same(views(eng), before)  # the 40 orphans came back from the backup
+    [note] = [w for w in eng.worker_warnings if "missing" in w]
+    assert "recovered 49 rows from ledger.sqlite3.bak" in note
+    # The history-less ledger never replaced the backup: it was merged, then rotated.
+    assert (world.state / "ledger.sqlite3.bak.prev").read_bytes() == good
+    assert _bak_rows(bak) == 9 + 40
+    eng.close()
+
+
+# 2: recovered rows obey the key-scheme rule
+def _make_scheme0(path: Path, world: World) -> None:
+    """Turn a ledger file into the pre-release layout (schema v1, no meta) with one
+    old-scheme Codex row whose key no longer matches any live event."""
+    conn = sqlite3.connect(path)
+    conn.execute("DROP TABLE meta")
+    conn.execute("PRAGMA user_version = 1")
+    acct = conn.execute("SELECT id FROM accounts WHERE provider = 'codex'").fetchone()[0]
+    model = conn.execute("SELECT id FROM models LIMIT 1").fetchone()[0]
+    conn.executemany(
+        "INSERT INTO usage VALUES (?, ?, ?, ?, 777, 7, 0, 0, 0, 0)",
+        [(900_000 + i, acct, round((NOW - 5 * H) * 1000), model) for i in range(25)],
+    )
+    conn.commit()
+    conn.close()
+
+
+def test_damaged_old_scheme_ledger_is_migrated_before_its_rows_are_merged(world):
+    before = _history_world(world)
+    for side in world.state.glob("ledger.sqlite3.bak*"):
+        side.unlink()  # this history lives only in the damaged ledger
+    _make_scheme0(world.ledger, world)
+    _corrupt_a_usage_leaf(world.ledger)
+    eng = world.scanned(cache="fresh.pkl")
+    codex = [r for r in eng.records if r.provider == CODEX_PROVIDER]
+    assert len(codex) == 3  # the live events only: no old-scheme Codex orphans
+    assert not {900_000 + i for i in range(25)} & {r.lkey for r in eng.records}
+    claude_before = before["windows"]["all"][0]
+    assert eng.snapshot(now=NOW).windows["all"].input_tokens <= claude_before  # nothing extra
+    eng.close()
+
+
+def test_old_scheme_backup_is_migrated_and_a_future_one_is_refused(world):
+    _history_world(world, 40)
+    bak = world.state / "ledger.sqlite3.bak"
+    _make_scheme0(bak, world)
+    world.ledger.unlink()
+    eng = world.scanned()
+    assert len(eng.records) == 9 + 40  # the Claude history back, old Codex rows dropped
+    eng.close()
+
+    # A backup written by a future scheme is kept, set aside, and not merged.
+    conn = sqlite3.connect(bak)
+    conn.execute("UPDATE meta SET v = '99' WHERE k = 'key_scheme'")
+    conn.commit()
+    conn.close()
+    future = bak.read_bytes()
+    world.ledger.unlink()
+    for side in world.state.glob("ledger.sqlite3-*"):
+        side.unlink()
+    (world.state / "ledger.sqlite3.bak.prev").unlink(missing_ok=True)
+    again = world.scanned(cache="fresh.pkl")
+    [note] = [w for w in again.worker_warnings if "missing" in w]
+    assert "did not merge ledger.sqlite3.bak" in note and "newer than this ccusage" in note
+    [kept] = list(world.state.glob("ledger.sqlite3.bak.unmerged-*"))
+    assert kept.read_bytes() == future
+    assert len(again.records) == 9
+    again.close()
+
+
+def test_a_key_scheme_migration_is_backed_up_at_once(world):
+    world.scanned().close()  # the first sync took today's backup
+    bak = world.state / "ledger.sqlite3.bak"
+    prev = world.state / "ledger.sqlite3.bak.prev"
+    assert not prev.exists()
+    conn = sqlite3.connect(world.ledger)  # the same ledger, on the older key scheme
+    conn.execute("UPDATE meta SET v = '0' WHERE k = 'key_scheme'")
+    conn.commit()
+    conn.close()
+    conn = sqlite3.connect(bak)
+    conn.execute("UPDATE meta SET v = '0' WHERE k = 'key_scheme'")
+    conn.commit()
+    conn.close()
+    world.scanned().close()  # migrates; the daily backup is not due, but is taken now
+    assert _meta_scheme(bak) == ledger_module.KEY_SCHEME
+    assert _meta_scheme(prev) == 0  # the pre-migration backup is rotated, not lost
+
+
+# 3: salvage never calls itself complete while rows are missing
+def test_salvage_is_complete_only_when_nothing_is_missing(tmp_path):
+    from cc_usage.ledger import Ledger, LedgerRow
+    from cc_usage.parser import ledger_key
+
+    pristine = tmp_path / "pristine.sqlite3"
+    led = Ledger(pristine)
+    led.write([
+        LedgerRow(ledger_key(f"k{i}"), "claude", "id", "personal", 1_780_000_000_000 + i,
+                  "claude-opus-4-8", 100 + i, 1, 2, 3, None, 0)
+        for i in range(3000)
+    ])
+    led.close()
+    conn = sqlite3.connect(pristine)
+    page_size = conn.execute("PRAGMA page_size").fetchone()[0]
+    pages = conn.execute("PRAGMA page_count").fetchone()[0]
+    conn.close()
+    base = pristine.read_bytes()
+    trials = lost_quietly = 0
+    for page in (pages - 1, pages - 7, pages // 2):
+        for offset, blob in (
+            (0, b"\x0d\x00\x00\x00"), (3, b"\x00\x05"), (5, b"\x0f\xf0"), (8, b"\xff" * 8),
+            (12, b"\x00" * 16), (40, b"\x07" * 4), (page_size - 8, b"\x00" * 8),
+            (page_size - 60, b"\xff" * 12), (page_size // 2, b"\x81\x81\x81\x81"),
+            (page_size - 200, b"\x00" * 3),
+        ):
+            data = bytearray(base)
+            at = (page - 1) * page_size + offset
+            data[at:at + len(blob)] = blob
+            trial = tmp_path / f"trial-{trials}.sqlite3"
+            trial.write_bytes(bytes(data))
+            source = ledger_module._read_source(trial, tmp_path)
+            rows = source.to_rows()
+            # (Bytes changed inside one record's payload, with the page structure
+            # intact, alter a value without losing a row; no integrity check can see
+            # that. What must never happen is rows going missing unannounced.)
+            if len(rows) < 3000:
+                assert not source.complete, (page, offset)
+                lost_quietly += 1
+            trials += 1
+    assert lost_quietly >= 10  # the damage patterns really do lose rows
+
+
+# 5: the salvage narrows a failing range down to the damaged page
+def test_salvage_loses_only_about_one_page(tmp_path):
+    from cc_usage.ledger import Ledger, LedgerRow
+    from cc_usage.parser import ledger_key
+
+    path = tmp_path / "ledger.sqlite3"
+    led = Ledger(path)
+    led.write([
+        LedgerRow(ledger_key(f"n{i}"), "claude", "id", "personal", 1_780_000_000_000 + i,
+                  "claude-opus-4-8", i, 1, 2, 3, None, 0)
+        for i in range(40_000)
+    ])
+    led.close()
+    _corrupt_a_usage_leaf(path)
+    source = ledger_module._read_source(path, tmp_path)
+    kept = len(source.to_rows())
+    # A leaf holds ~120 of these rows; one of the 64 top-level key ranges holds ~625.
+    assert 40_000 - 300 < kept < 40_000
+    assert not source.complete
+
+
+def test_ledger_info_reports_an_unfinished_recovery(world, info):
+    world.scanned().close()
+    ledger_module.Ledger(world.ledger).queue("ledger.sqlite3.corrupt-20260101-000000", "damaged")
+    code, out = info()
+    flat = " ".join(out.split())
+    assert code == 0
+    assert "recovering ledger.sqlite3.corrupt-20260101-000000: not merged yet" in flat
+    assert "A ledger recovery is not finished" in flat
+    assert "Every parsed usage record" not in flat
+
+
+def test_no_backup_is_made_while_a_recovery_is_unfinished(world, monkeypatch):
+    import errno
+
+    _history_world(world)
+    for side in world.state.glob("ledger.sqlite3.bak*"):
+        side.unlink()  # no backup at all: the damaged file is the only copy
+    _corrupt_a_usage_leaf(world.ledger)
+
+    def full_disk(src, dst, *a, **k):
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    monkeypatch.setattr(ledger_module.shutil, "copyfile", full_disk)
+    eng = world.scanned(cache="fresh.pkl")
+    eng._backup_after_recovery = True  # even when a backup would be forced
+    eng.sync_ledger()
+    assert not (world.state / "ledger.sqlite3.bak").exists()
+    assert eng._ledger.backup() is False
+    eng.close()
+
+
+def test_a_source_whose_key_scheme_is_unreadable_is_refused_and_kept(world):
+    _history_world(world, 40)
+    bak = world.state / "ledger.sqlite3.bak"
+    conn = sqlite3.connect(bak)  # schema v2 but no key scheme recorded: unknown rules
+    conn.execute("DELETE FROM meta WHERE k = 'key_scheme'")
+    conn.commit()
+    conn.close()
+    unknown = bak.read_bytes()
+    (world.state / "ledger.sqlite3.bak.prev").unlink(missing_ok=True)
+    world.ledger.unlink()
+    for side in world.state.glob("ledger.sqlite3-*"):
+        side.unlink()
+    eng = world.scanned(cache="fresh.pkl")
+    [note] = [w for w in eng.worker_warnings if "missing" in w]
+    assert "did not merge ledger.sqlite3.bak" in note and "key scheme" in note
+    assert "unreadable" in note
+    [kept] = list(world.state.glob("ledger.sqlite3.bak.unmerged-*"))
+    assert kept.read_bytes() == unknown
+    assert len(eng.records) == 9  # none of its rows were guessed at
+    eng.close()
+
+
+def _without_cell_size_check(monkeypatch):
+    real = ledger_module._salvage_connection
+
+    class NoCheck:
+        def __init__(self, conn):
+            self._conn = conn
+
+        def execute(self, sql, *args):
+            if "cell_size_check" in sql:
+                return self._conn.execute("SELECT 1")
+            return self._conn.execute(sql, *args)
+
+        def __getattr__(self, name):
+            return getattr(self._conn, name)
+
+    monkeypatch.setattr(
+        ledger_module, "_salvage_connection", lambda conn, name: real(NoCheck(conn), name)
+    )
+
+
+def test_salvage_validates_cell_sizes_before_reading_rows(tmp_path, monkeypatch):
+    """With cell_size_check on, a damaged cell raises instead of being skipped, so the
+    salvage narrows around it and keeps its neighbours."""
+    from cc_usage.ledger import Ledger, LedgerRow
+    from cc_usage.parser import ledger_key
+
+    pristine = tmp_path / "pristine.sqlite3"
+    led = Ledger(pristine)
+    led.write([
+        LedgerRow(ledger_key(f"k{i}"), "claude", "id", "personal", 1_780_000_000_000 + i,
+                  "claude-opus-4-8", 100 + i, 1, 2, 3, None, 0)
+        for i in range(3000)
+    ])
+    led.close()
+    base = pristine.read_bytes()
+    page_size = 4096
+
+    # White box: the pragma is on before the usage table is read.
+    real_connect = ledger_module.sqlite3.connect
+    order: list[str] = []
+
+    class Recording(sqlite3.Connection):
+        def execute(self, sql, *args):
+            order.append(sql)
+            return super().execute(sql, *args)
+
+    def connect(target, *args, **kwargs):
+        if str(target).endswith("source.sqlite3"):
+            kwargs["factory"] = Recording
+        return real_connect(target, *args, **kwargs)
+
+    monkeypatch.setattr(ledger_module.sqlite3, "connect", connect)
+    ledger_module._read_source(pristine, tmp_path)
+    monkeypatch.setattr(ledger_module.sqlite3, "connect", real_connect)
+    first_usage = next(i for i, sql in enumerate(order) if "FROM usage" in sql)
+    assert any("cell_size_check = ON" in sql for sql in order[:first_usage])
+
+    # Behaviour: on damage where it matters it recovers more rows, never fewer.
+    gains = []
+    for page, offset, blob in ((11, 533, "eab6"), (11, 228, "74f177ed595284bc"),
+                               (16, 232, "0761613658eae0f0"), (16, 237, "60c7c855")):
+        data = bytearray(base)
+        at = (page - 1) * page_size + offset
+        raw = bytes.fromhex(blob)
+        data[at:at + len(raw)] = raw
+        trial = tmp_path / f"t{page}-{offset}.sqlite3"
+        trial.write_bytes(bytes(data))
+        with_check = len(ledger_module._read_source(trial, tmp_path).raw)
+        with monkeypatch.context() as m:
+            _without_cell_size_check(m)
+            without = len(ledger_module._read_source(trial, tmp_path).raw)
+        assert with_check >= without
+        gains.append(with_check - without)
+    assert max(gains) > 0
