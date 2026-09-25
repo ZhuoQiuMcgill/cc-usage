@@ -154,6 +154,7 @@ def aggregate_accounts(
     window: str,
     claude_labels: list[str],
     codex_labels: list[str] | None = None,
+    history_accounts: list[tuple[str, str]] | None = None,
 ) -> list[AccountAgg]:
     """Per-account rollup for one rolling `window` (T11 R4, generalised in T12).
 
@@ -161,29 +162,41 @@ def aggregate_accounts(
     in-window activity, so the block shows an idle account as a `0`/`$0.00` row —
     plus a row per Codex account in `codex_labels` that has records in the window.
     Codex rows stay conditional on in-window data (a single idle `~/.codex` adds no
-    row, keeping the zero-noise single-account render byte-identical). Rows are
-    sorted by cost desc then tokens desc. Records whose account is not a listed
-    label (a disabled root, or the empty default) are ignored. `window` is a
-    WINDOWS name; anything unknown is treated as all-time.
+    row, keeping the zero-noise single-account render byte-identical).
+    `history_accounts` are (label, provider) pairs known only from the usage ledger —
+    roots no longer configured (T17) — and, like Codex rows, appear only when they have
+    in-window records. Rows are sorted by cost desc then tokens desc. Records whose
+    account is not a listed label (a disabled root, or the empty default) are ignored.
+    `window` is a WINDOWS name; anything unknown is treated as all-time.
     """
     secs = _WINDOW_SECS.get(window)
     aggs = {label: AccountAgg(label=label) for label in claude_labels}
     codex_aggs = {label: AccountAgg(label=label, is_codex=True) for label in (codex_labels or [])}
-    codex_seen: set[str] = set()
+    conditional: dict[tuple[str, bool], AccountAgg] = {
+        (label, True): agg for label, agg in codex_aggs.items()
+    }
+    history_order: list[tuple[str, bool]] = []
+    for label, provider in history_accounts or []:
+        slot = (label, provider == CODEX_PROVIDER)
+        if slot not in conditional and (slot[1] or label not in aggs):
+            conditional[slot] = AccountAgg(label=label, is_codex=slot[1])
+            history_order.append(slot)
+    seen: set[tuple[str, bool]] = set()
     for r in records:
         if secs is not None and (now - r.ts) > secs:
             continue
-        if r.provider == CODEX_PROVIDER:
-            agg = codex_aggs.get(r.account)
-            if agg is not None:
-                agg._add(r)
-                codex_seen.add(r.account)
-        else:
-            agg = aggs.get(r.account)
-            if agg is not None:
-                agg._add(r)
+        is_codex = r.provider == CODEX_PROVIDER
+        agg = None if is_codex else aggs.get(r.account)
+        if agg is None:
+            slot = (r.account, is_codex)
+            agg = conditional.get(slot)
+            if agg is None:
+                continue
+            seen.add(slot)
+        agg._add(r)
     rows = list(aggs.values())
-    rows += [codex_aggs[label] for label in (codex_labels or []) if label in codex_seen]
+    rows += [codex_aggs[label] for label in (codex_labels or []) if (label, True) in seen]
+    rows += [conditional[slot] for slot in history_order if slot in seen]
     rows.sort(key=lambda a: (a.cost, a.total_tokens), reverse=True)
     return rows
 

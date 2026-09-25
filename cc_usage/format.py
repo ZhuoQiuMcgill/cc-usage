@@ -81,3 +81,13 @@ def human_duration(seconds: float) -> str:
     if m > 0:
         return f"{m}m{sec:02d}s"
     return f"{sec}s"
+
+
+def human_bytes(value: int) -> str:
+    """Byte count -> `512 B` / `1.5 KB` / `4.7 MB` (binary units)."""
+    amount = float(max(0, value))
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if amount < 1024 or unit == "TB":
+            return f"{amount:.0f} {unit}" if unit == "B" else f"{amount:.1f} {unit}"
+        amount /= 1024
+    return f"{amount:.1f} TB"

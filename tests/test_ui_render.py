@@ -578,6 +578,12 @@ class _OnceEngine:
     def save_cache(self):
         pass
 
+    def sync_ledger(self):
+        pass
+
+    def close(self):
+        pass
+
     def snapshot(self):
         return _board_state()
 

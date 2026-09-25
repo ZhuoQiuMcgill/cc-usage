@@ -29,7 +29,7 @@ from textual.widgets import Footer, Rule, Static
 
 from .config import Config
 from .engine import Engine
-from .format import human_duration
+from .format import human_bytes, human_duration
 from .parser import ScanCancelled, ScanProgress
 from .render import (
     account_scope_line,
@@ -119,6 +119,9 @@ class CCUsageApp(App):
         # Set when a root toggle lands while a scan is in flight: the old worker is
         # cancelled and its completion callback relaunches the scan exactly once.
         self._rescan_pending = False
+        # A post-refresh ledger write is running (T17): one at a time; whatever a later
+        # scan changes stays queued in the parser for the next one.
+        self._ledger_in_flight = False
 
     @property
     def config(self) -> Config:
@@ -164,15 +167,6 @@ class CCUsageApp(App):
         except Exception:
             return
 
-    @staticmethod
-    def _format_bytes(value: int) -> str:
-        amount = float(max(0, value))
-        for unit in ("B", "KB", "MB", "GB", "TB"):
-            if amount < 1024 or unit == "TB":
-                return f"{amount:.0f} {unit}" if unit == "B" else f"{amount:.1f} {unit}"
-            amount /= 1024
-        return f"{amount:.1f} TB"
-
     def _render_scan_progress(self, update: ScanProgress) -> None:
         if update.phase == "discovering":
             self._update_scan_status("discovering transcripts…  ·  c cancel")
@@ -191,7 +185,7 @@ class CCUsageApp(App):
         bar = "█" * filled + "░" * (width - filled)
         counts = (
             f"{update.files_done:,}/{update.files_total:,} files  ·  "
-            f"{self._format_bytes(update.bytes_done)}/{self._format_bytes(update.bytes_total)}"
+            f"{human_bytes(update.bytes_done)}/{human_bytes(update.bytes_total)}"
         )
         if narrow:
             message = f"scan  {bar}  {fraction:>4.0%}\n{counts}  ·  c cancel"
@@ -220,6 +214,12 @@ class CCUsageApp(App):
             self._progress_last_emit = now
             self._call_ui(self._render_scan_progress, update)
 
+        if self.engine.is_scanned:
+            # Warm start: the cached totals are already on screen. Bring in the ledger's
+            # history of deleted transcripts before the (slower) reconcile scan, so it
+            # shows within moments instead of after the whole tree is walked (T17).
+            self._guarded("ledger sync failed", self.engine.sync_ledger)
+            self._call_ui(self.render_panel)
         try:
             self.engine.scan(progress=report, cancelled=self._scan_cancel.is_set)
         except ScanCancelled:
@@ -229,6 +229,9 @@ class CCUsageApp(App):
             self._call_ui(self._on_scan_failed, exc)
             return
         self._note_worker("scan failed", None)  # recovered: drop any earlier scan warning
+        # Ledger before the parse cache: a record the ledger could not take is saved in
+        # the cache as still pending, so a restart retries it (T17).
+        self._guarded("ledger sync failed", self.engine.sync_ledger)
         self._guarded("cache save failed", self.engine.save_cache)
         self._guarded("limit refresh failed", self.engine.refresh_limits)
         self._call_ui(self._on_initial_scan_done)
@@ -345,6 +348,31 @@ class CCUsageApp(App):
         # worker's scan, so either path recovering clears the one warning.
         self._guarded("scan failed", self.engine.scan)
         self.render_panel()
+        self._request_ledger_sync()
+
+    def _request_ledger_sync(self) -> None:
+        """Store what the last UI-thread scan found, off the UI thread (T17 R8).
+
+        The refresh timer scans on the UI thread; the ledger write it implies runs on a
+        worker so a busy database (another ccusage writing) can never stall a frame.
+        Nothing to write, or a write already running -> nothing to do: changed records
+        wait in the parser for the next one. Guarded like every timer step (T14)."""
+        if self._ledger_in_flight:
+            return
+        try:
+            if not self.engine.ledger_pending:
+                return
+            self._ledger_in_flight = True
+            self.run_worker(self._background_ledger_sync, thread=True, group="ledger")
+        except Exception as exc:
+            self._ledger_in_flight = False
+            self._note_worker("ledger sync failed", exc)
+
+    def _background_ledger_sync(self) -> None:
+        try:
+            self._guarded("ledger sync failed", self.engine.sync_ledger)
+        finally:
+            self._ledger_in_flight = False
 
     def _refresh_limits(self) -> None:
         self.run_worker(self._background_limit_refresh, thread=True, exclusive=True)
@@ -503,4 +531,8 @@ class CCUsageApp(App):
 
 def run_tui(config: Config) -> None:
     """Launch the interactive TUI (default `ccusage`)."""
-    CCUsageApp(Engine(config)).run()
+    engine = Engine(config)
+    try:
+        CCUsageApp(engine).run()
+    finally:
+        engine.close()

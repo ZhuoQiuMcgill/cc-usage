@@ -8,6 +8,7 @@
     ccusage --update-prerelease install the latest prerelease build (or @main) for testing
     ccusage --update-stable    return to the latest official release
     ccusage --check-prerelease report current vs latest prerelease tag (installs nothing)
+    ccusage --ledger-info      show what the durable usage ledger holds (read-only)
     ccusage --version          print the version
     ccusage --help             usage
 
@@ -20,6 +21,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+import textwrap
 
 from . import __version__
 from .config import load_config
@@ -83,6 +85,12 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="report current vs latest prerelease tag (installs nothing)",
     )
+    p.add_argument(
+        "--ledger-info",
+        action="store_true",
+        help="show what the usage ledger holds and whether any parsed usage is missing "
+        "from it (read-only; check this before shortening Claude Code's transcript retention)",
+    )
     # Legacy cleanup only: new versions never install or depend on a statusline.
     p.add_argument("--restore-statusline", action="store_true", help=argparse.SUPPRESS)
     return p
@@ -97,12 +105,143 @@ def run_once(config) -> None:
 
     _configure_unicode_output(sys.stdout)
     engine = Engine(config)
+    try:
+        engine.scan()
+        # Record the parse in the usage ledger (T17) before the cache, so anything the
+        # ledger could not take is saved as still pending and retried next run.
+        engine.sync_ledger()
+        engine.refresh_limits()
+        # Persist parse state right after the (expensive) scan — before rendering — so
+        # the next launch starts warm even if the terminal render hiccups.
+        engine.save_cache()
+        Console().print(build_panel(engine.snapshot()))
+    finally:
+        engine.close()
+
+
+def run_ledger_info(config, out=None) -> int:
+    """Print what the usage ledger holds (T17 R9) and how it compares with the live
+    transcripts. Read-only and local: it opens the ledger with SQLite's read-only mode,
+    reads the parse cache without saving it, and never writes the ledger, the cache or
+    any transcript, nor touches the network."""
+    import datetime
+
+    from .engine import Engine
+    from .format import human_bytes
+    from .ledger import LedgerCorrupt, LedgerError, read_summary
+
+    out = out or sys.stdout
+    _configure_unicode_output(out)
+
+    def say(line: str = "") -> None:
+        print(line, file=out)
+
+    engine = Engine(config)
+    path = engine.ledger_path
+    say("ccusage usage ledger")
+    say(f"  file        {path}")
+    if path is None or not path.exists():
+        say("  status      no ledger yet: launch ccusage (or run `ccusage --once`) to create it")
+        return 0
+    try:
+        summary = read_summary(path)
+    except LedgerCorrupt as exc:
+        say(f"  status      unreadable: {exc}")
+        say(
+            "  The next ccusage launch moves it aside (keeping it) and rebuilds the ledger "
+            "from its readable rows and the daily backup."
+        )
+        return 1
+    except LedgerError as exc:
+        say(f"  status      cannot be read: {exc}")
+        return 1
+
+    size = summary.size_bytes
+    say(f"  size        {human_bytes(size)} ({size:,} bytes, with any WAL)")
+    providers = " · ".join(
+        f"{name} {count:,}" for name, count in sorted(summary.rows_by_provider.items())
+    )
+    say(f"  records     {summary.rows:,}" + (f"  ({providers})" if providers else ""))
+
+    identities = engine.ledger_identities()
+    current = {(prov, ident): label for label, (prov, ident, _l) in identities.items()}
+    disabled_roots = [r for r in (*engine.roots, *engine.codex_roots) if not r.enabled]
+    disabled_labels = {r.label for r in disabled_roots}
+    disabled = {key for key, label in current.items() if label in disabled_labels}
+    parts = []
+    for label, provider, identity, count in summary.accounts:
+        shown = current.get((provider, identity))
+        if shown is None:
+            parts.append(f"{label} {count:,} (root no longer configured)")
+        elif shown in disabled_labels:
+            parts.append(f"{shown} {count:,} (disabled)")
+        else:
+            parts.append(f"{shown} {count:,}")
+    if parts:
+        say(f"  accounts    {' · '.join(parts)}")
+    if summary.first_ts is not None and summary.last_ts is not None:
+        first = datetime.datetime.fromtimestamp(summary.first_ts).date().isoformat()
+        last = datetime.datetime.fromtimestamp(summary.last_ts).date().isoformat()
+        say(f"  covers      {first} → {last} (local dates)")
+    if summary.backup_time is not None:
+        stamp = datetime.datetime.fromtimestamp(summary.backup_time).strftime("%Y-%m-%d %H:%M")
+        say(f"  backup      {path.name}.bak from {stamp}")
+    else:
+        say("  backup      none yet (ccusage makes one a day while it runs)")
+    for name in summary.pending or []:
+        say(f"  recovering  {name}: not merged yet (its history is safe in that file)")
+
+    out.flush()
+    print("  (comparing with your transcripts…)", file=sys.stderr)
     engine.scan()
-    engine.refresh_limits()
-    # Persist parse state right after the (expensive) scan — before rendering — so the
-    # next launch starts warm even if the terminal render hiccups.
-    engine.save_cache()
-    Console().print(build_panel(engine.snapshot()))
+    live = engine.parser.live_index()
+    orphans = unrecorded = skipped = 0
+    for key, account_id in summary.keys.items():
+        provider, identity, _label = summary.account_ids.get(account_id, ("", "", ""))
+        if (provider, identity) in disabled:
+            skipped += 1
+        elif key not in live:
+            orphans += 1
+    for key in live:
+        if key not in summary.keys:
+            unrecorded += 1
+    say(f"  orphans     {orphans:,}  (usage whose transcripts are gone; kept only by the ledger)")
+    say(f"  unrecorded  {unrecorded:,}  (parsed usage not in the ledger yet)")
+    for root in disabled_roots:
+        say(f"  disabled    {root.label} ({root.path}): not scanned, so its usage is not recorded")
+    if skipped:
+        say(f"              {skipped:,} earlier rows from disabled roots were not compared")
+    say()
+    advice: list[str] = []
+    if unrecorded:
+        noun = "record is" if unrecorded == 1 else "records are"
+        advice.append(
+            f"{unrecorded:,} parsed usage {noun} not in the ledger yet. Launch ccusage "
+            "(or run `ccusage --once`) to record them."
+        )
+    if disabled_roots:
+        names = ", ".join(r.label for r in disabled_roots)
+        advice.append(
+            f"Disabled roots are not recorded ({names}). Enable them in Settings → "
+            "Accounts and launch ccusage, or their usage is lost when their transcripts "
+            "are deleted."
+        )
+    if summary.pending:
+        advice.append(
+            "A ledger recovery is not finished (see `recovering` above). Launch ccusage "
+            "so it can complete; ccusage makes no backup until it does."
+        )
+    if advice:
+        advice.append("Do this before you shorten Claude Code's transcript retention.")
+    else:
+        advice.append(
+            "Every parsed usage record from every enabled root is in the ledger: usage "
+            "from transcripts that Claude Code deletes later stays in ccusage."
+        )
+    for paragraph in advice:
+        for line in textwrap.wrap(paragraph, width=88):
+            say(line)
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -149,6 +288,9 @@ def main(argv: list[str] | None = None) -> int:
         return 0 if result.get("ok") else 1
 
     config = load_config()
+
+    if args.ledger_info:
+        return run_ledger_info(config)
 
     if args.once:
         run_once(config)

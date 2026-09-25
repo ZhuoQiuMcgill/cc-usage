@@ -28,6 +28,7 @@ Claude account.
 
 from __future__ import annotations
 
+import hashlib
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -70,6 +71,20 @@ class Root:
     projects: Path
     source: str
     enabled: bool = True
+
+
+def root_identity(path: Path) -> str:
+    """A root's stable account identity for the usage ledger (T17 R5).
+
+    Derived from the root's *resolved* path — the same resolution discovery dedupes
+    roots by — so renaming a root's label never splits its history into two accounts,
+    and two distinct roots never merge. Stored as a digest, so the ledger holds no
+    filesystem path."""
+    try:
+        resolved = str(Path(path).expanduser().resolve())
+    except (OSError, RuntimeError):
+        resolved = str(path)
+    return hashlib.sha256(resolved.encode("utf-8")).hexdigest()[:32]
 
 
 def _derive_label(path: Path, strip_prefix: str) -> str:

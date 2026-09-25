@@ -136,6 +136,32 @@ for the change, not the tool that assisted it.
 The two commits already on `main` predate this policy; the CI check scopes to **new**
 commits only and will not retroactively fail that history.
 
+## Usage ledger compatibility (hard rule)
+
+`~/.config/cc-usage/ledger.sqlite3` is the only copy of usage whose transcripts have been
+deleted, and older ccusage versions wrote it. It keys every usage record with the stable
+key the parser derives (`UsageRecord.lkey`). It treats "stored but no longer parsed" as
+history, and it merges values by field-wise maximum. A parser change therefore corrupts
+history silently if it does any of the following without a ledger migration:
+
+- **changes how a record's key is derived**: every old row would be counted again next to
+  its re-keyed twin;
+- **stops emitting a record** it used to emit: the old row keeps counting as history;
+- **lowers a record's values**: the old, higher row wins the max merge forever.
+
+Such a change must, in the same PR:
+
+1. bump `KEY_SCHEME` in `cc_usage/parser.py`;
+2. register a function in `KEY_SCHEME_MIGRATIONS` (`cc_usage/ledger.py`) that rewrites the
+   stored rows to the new rules (delete, re-key or lower them). It runs once per ledger,
+   inside the transaction that records the new scheme;
+3. bump the parse cache's `_CACHE_VERSION`;
+4. add a test that migrates a ledger written under the old scheme.
+
+A ledger with no migration path, or one written by a newer scheme, is refused rather than
+double counted: the panel warns and runs without it. The ledger module's docstring spells
+out the details.
+
 ## Code style & tests
 
 - **Match the surrounding style.** Keep the diff legible; no dead code or speculative

@@ -227,7 +227,7 @@ class RangeScreen(Screen):
         must NOT retroactively snap an already-earlier preset start (e.g. "Last 30 days" on
         a machine with only 4 days of data still spans the literal 30 calendar days)."""
         self.engine.ensure_scanned()
-        records = self.engine.parser.records
+        records = self.engine.records  # live + ledger-only history (T17)
         if not records:
             return _today() - datetime.timedelta(days=_NO_DATA_FLOOR_DAYS)
         earliest_ts = min(r.ts for r in records)

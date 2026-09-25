@@ -8,7 +8,67 @@ See [VERSIONING.md](VERSIONING.md) for the release policy.
 
 ## [Unreleased]
 
-_No unreleased changes yet._
+### Added
+
+- **Usage history now survives transcript deletion.** Claude Code deletes transcripts
+  older than its `cleanupPeriodDays` setting (30 days by default), and until now the usage
+  in them disappeared from ccusage along with them. ccusage now keeps a usage ledger at
+  `~/.config/cc-usage/ledger.sqlite3`, with one small row per usage event it has parsed.
+  Every view (rolling windows, the heartbeat, the Models board, By account and the
+  date-range screen) combines your transcripts with the usage only the ledger still
+  remembers. A deleted, moved, rotated or rewritten transcript neither drops usage nor
+  counts it twice. The ledger holds token counts only (no prompts, responses, paths or
+  project names) and no cost: cost is recomputed from your current `pricing.json`, so
+  pricing fixes apply to all of history. On the reference machine 125,000 records take
+  4.7 MB. The first launch records everything currently in your transcripts. Usage from
+  transcripts deleted before that cannot be recovered. A record never shows less than
+  ccusage once saw for it. This matters when a resumed session copies a message into a
+  newer transcript with lower counts and the original is later deleted.
+- **Ledger backup and recovery.** Once a day ccusage checks a copy of the ledger and saves
+  it as `ledger.sqlite3.bak`. The previous backup moves to `ledger.sqlite3.bak.prev`. A
+  backup is never replaced while it holds history the current ledger lacks.
+  - If the ledger becomes unreadable, ccusage renames it to
+    `ledger.sqlite3.corrupt-<timestamp>` (it never deletes it). If it has gone missing,
+    ccusage starts a new one.
+  - Either way, it then restores every readable row from the damaged file and the
+    backups. Rows written under older record-key rules are converted first.
+  - The warning says whether history is intact.
+  - A file that can't be read yet (for example, while the disk is full) is retried on
+    every scan. No backup is made until that succeeds.
+- **`ccusage --ledger-info`.** Prints the ledger's location, size, records per provider
+  and account, and the dates it covers. It then compares the ledger with your transcripts:
+  `orphans` counts usage whose transcripts are already gone and that now exists only in
+  the ledger, and `unrecorded` counts parsed usage not in the ledger yet. It also names
+  every disabled root, whose transcripts ccusage does not read or record. **Run it before
+  shortening Claude Code's retention.** It is safe to lower `cleanupPeriodDays` only when
+  `unrecorded` is 0 and no root you want to keep is disabled; the output's last line says
+  which. Otherwise launch ccusage (or run `ccusage --once`) first. The command only reads
+  and makes no network calls.
+
+### Changed
+
+- **One cold scan after upgrading.** Every usage record now carries a stable key, and
+  Codex counting changed (see Fixed), so the parse cache format changed. The first launch
+  after upgrading rescans your transcripts once in the background (about 17 seconds on the
+  reference machine). That scan also fills the ledger.
+- **Contributors:** a parser change that re-keys, drops or lowers usage records must ship
+  with a ledger migration. CONTRIBUTING.md has the rule.
+
+### Fixed
+
+- **Codex usage was overcounted by about 3%.** Codex often writes the same `token_count`
+  event more than once: again at the same moment, or seconds later, with no new model
+  call behind it. ccusage counted each copy. A Codex event now counts only when the
+  session's cumulative token counters actually advance, so each rollout's counted usage
+  equals what its own counters report. On the reference machine this removed 430 million
+  tokens and $93.72 (2.9%) from Codex's all-time cost, across 3,295 duplicate events.
+  Claude totals are unchanged. Two cases are handled explicitly. A rollout resumed or
+  forked from another starts from its parent's total, which the parent's own rollout
+  already counts, so the child adds only its own turns. Counters that restart after a
+  context compaction count their new total.
+- **A rewritten Codex rollout no longer counts its events twice.** When a rollout shrank
+  and was read again from the top, its earlier `token_count` events were added a second
+  time. Codex events now have stable keys, so a re-read folds into the existing records.
 
 ## [2.5.0] - 2026-09-22
 
