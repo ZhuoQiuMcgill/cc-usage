@@ -8,6 +8,10 @@ See [VERSIONING.md](VERSIONING.md) for the release policy.
 
 ## [Unreleased]
 
+_No unreleased changes yet._
+
+## [2.6.1] - 2026-10-01
+
 ### Added
 
 - **Pricing for the newest Claude and GPT models.** The bundled pricing table now covers
@@ -504,7 +508,8 @@ formal, pip-installable tool.
   a GitHub Release on each `v*` tag, with PyPI publishing gated on a
   `PYPI_API_TOKEN` secret.
 
-[Unreleased]: https://github.com/ZhuoQiuMcgill/cc-usage/compare/v2.6.0...HEAD
+[Unreleased]: https://github.com/ZhuoQiuMcgill/cc-usage/compare/v2.6.1...HEAD
+[2.6.1]: https://github.com/ZhuoQiuMcgill/cc-usage/compare/v2.6.0...v2.6.1
 [2.6.0]: https://github.com/ZhuoQiuMcgill/cc-usage/compare/v2.5.0...v2.6.0
 [2.5.0]: https://github.com/ZhuoQiuMcgill/cc-usage/compare/v2.4.6...v2.5.0
 [2.4.6]: https://github.com/ZhuoQiuMcgill/cc-usage/compare/v2.4.5...v2.4.6
