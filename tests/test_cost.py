@@ -96,6 +96,31 @@ def test_bundled_pricing_prices_opus_5_5():
     assert math.isclose(cost, expected, abs_tol=1e-12)
 
 
+def test_bundled_pricing_prices_sonnet_5_5_and_mythos():
+    """Claude Sonnet 5.5 ships at Sonnet 5's $2/$10 with the standard 0.1x cache
+    read, so no explicit rate. Claude Mythos 5.1 / 5 (Project Glasswing) price
+    exactly like Fable 5.1 / 5: $10/$50, with the 5.1 point release's $0.25 cache
+    read and the 5 release's default 0.1x ($1)."""
+    import json
+    from importlib.resources import files
+
+    models = json.loads((files("cc_usage") / "data" / "pricing.json").read_text())["models"]
+    assert models["claude-sonnet-5-5"] == {"input": 2.0, "output": 10.0}
+    sonnet_5_5 = get_rates("claude-sonnet-5-5", models)
+    assert sonnet_5_5 == Rates(2.0, 10.0)
+    assert get_rates("claude-sonnet-5-5[1m]", models) == Rates(2.0, 10.0)
+    assert normalize_model("claude-sonnet-5-5") == "claude-sonnet-5-5"
+    # The derived default reproduces the published $0.20 cache hit.
+    assert math.isclose(sonnet_5_5.cache_read_rate(), 0.20, abs_tol=1e-12)
+
+    assert get_rates("claude-mythos-5-1", models) == get_rates("claude-fable-5-1", models)
+    assert get_rates("claude-mythos-5-1", models) == Rates(10.0, 50.0, cache_read=0.25)
+    assert get_rates("claude-mythos-5", models) == get_rates("claude-fable-5", models)
+    mythos_5 = get_rates("claude-mythos-5", models)
+    assert mythos_5 == Rates(10.0, 50.0)
+    assert math.isclose(mythos_5.cache_read_rate(), 1.0, abs_tol=1e-12)
+
+
 def test_bundled_pricing_prices_opus_5():
     """Claude Opus 5 (claude-opus-5) ships in the pricing table at $5/$25 and
     resolves through the tolerant matcher, including the [1m] variant Claude Code
@@ -120,7 +145,18 @@ def test_bundled_openai_pricing_uses_official_standard_rates():
     assert models["gpt-5.6-sol"]["cache_read"] == 0.5
     assert models["gpt-5.6-sol"]["cache_write"] == 6.25
     assert models["gpt-5.6-sol"]["output"] == 30.0
-    assert models["gpt-5.6-terra"]["input"] == 2.5
+    # Terra and Luna track their standing (non-promotional) rates from late July 2026.
+    assert models["gpt-5.6-terra"]["input"] == 2.0
+    assert models["gpt-5.6-terra"]["cache_read"] == 0.2
+    assert models["gpt-5.6-terra"]["cache_write"] == 2.5
+    assert models["gpt-5.6-terra"]["output"] == 12.0
+    assert models["gpt-5.6-luna"]["input"] == 0.2
+    assert models["gpt-5.6-luna"]["cache_read"] == 0.02
+    assert models["gpt-5.6-luna"]["cache_write"] == 0.25
+    assert models["gpt-5.6-luna"]["output"] == 1.2
+    assert models["gpt-5.3-codex"] == {"input": 1.75, "cache_read": 0.175, "output": 14.0}
+    assert models["gpt-5.2"] == {"input": 1.75, "cache_read": 0.175, "output": 14.0}
+    assert get_rates("gpt-5.3-codex", models) == Rates(1.75, 14.0, cache_read=0.175)
     assert models["gpt-5.5"]["output"] == 30.0
     assert models["gpt-5.4"]["input"] == 2.5
     assert models["gpt-5.4-mini"] == {
@@ -165,6 +201,56 @@ def test_bundled_pricing_prices_gpt_6_astra():
     assert rates.cache_write == rates.input * 1.25
     # Distinct from the gpt-5.6 flagship it sits above, and not aliased to it.
     assert get_rates("gpt-6-astra", models) != get_rates("gpt-5.6-sol", models)
+
+
+def test_bundled_pricing_prices_gpt_6_family():
+    """GPT-6.1 Sol, GPT-6 Sol and GPT-6 Luna carry the full OpenAI rate card,
+    with the same 272K long-context tier as Astra. GPT-6.1 Sol's cached input is
+    $0.10 (0.05x), half of GPT-6 Sol's, so the two must stay distinct rows.
+
+    Rates from https://developers.openai.com/api/docs/pricing (2026-10-01)."""
+    import json
+    from importlib.resources import files
+
+    models = json.loads((files("cc_usage") / "data" / "pricing.json").read_text())["models"]
+    tier = {
+        "long_context_threshold": 272000,
+        "long_context_input_multiplier": 2.0,
+        "long_context_output_multiplier": 1.5,
+    }
+    published = {
+        "gpt-6.1-sol": (2.0, 0.10, 2.5, 10.0),
+        "gpt-6-sol": (2.0, 0.20, 2.5, 10.0),
+        "gpt-6-luna": (0.10, 0.01, 0.125, 0.50),
+    }
+    for name, (inp, cached, write, out) in published.items():
+        assert models[name] == {
+            "input": inp,
+            "cache_read": cached,
+            "cache_write": write,
+            "output": out,
+            **tier,
+        }
+        assert get_rates(name, models) == Rates(
+            input=inp, output=out, cache_read=cached, cache_write=write, **tier
+        )
+    assert normalize_model("gpt-6.1-sol") == "gpt-6.1-sol"
+    assert get_rates("gpt-6.1-sol", models) != get_rates("gpt-6-sol", models)
+
+    # Long context doubles the cached and cache-write rates too: GPT-6.1 Sol's
+    # published long tier is $4 input / $0.20 cached / $5 writes / $15 output.
+    rates = get_rates("gpt-6.1-sol", models)
+    cost = compute_cost(
+        input_tokens=100_000,
+        output_tokens=10_000,
+        cache_read=200_000,
+        cache_creation_total=50_000,
+        ephemeral_5m=None,
+        ephemeral_1h=None,
+        rates=rates,
+    )
+    expected = (100_000 * 4.0 + 200_000 * 0.20 + 50_000 * 5.0 + 10_000 * 15.0) / 1e6
+    assert math.isclose(cost, expected, abs_tol=1e-12)
 
 
 def test_gpt_6_astra_long_context_threshold_is_exclusive():

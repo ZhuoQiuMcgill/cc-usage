@@ -336,7 +336,7 @@ def test_every_width_fits_and_never_cuts_a_number():
     rate and cost cell is whole and the unpriced marker survives; when they don't, the
     Models board is main's."""
     numbers = ["91.4M", "8.0M", "3.9B", "$2,639.20", "176.4M", "45.9M", "8.7B",
-               "$5,779.51", "30.00", "0.25", "6.00", "unpriced"]
+               "$5,779.51", "30.00", "0.20", "1.20", "unpriced"]
     shown_from = None
     for width in range(40, 131):
         out = _plain(build_panel(_board_state()), width=width)
@@ -527,7 +527,7 @@ def test_full_models_board_fits_width_76_with_longest_real_names():
     assert "…" not in out
     assert all(len(line) <= 76 for line in out.splitlines())
     rows = {
-        "gpt-5.6-terra": ["2.50", "15.00", "0.25"],
+        "gpt-5.6-terra": ["2.00", "12.00", "0.20"],
         "gpt-6-astra": ["10.00", "50.00", "1.00"],
         "Fable 5.1": ["10.00", "50.00", "0.25"],
     }

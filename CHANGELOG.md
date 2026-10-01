@@ -8,7 +8,22 @@ See [VERSIONING.md](VERSIONING.md) for the release policy.
 
 ## [Unreleased]
 
-_No unreleased changes yet._
+### Added
+
+- **Pricing for the newest Claude and GPT models.** The bundled pricing table now covers
+  `claude-sonnet-5-5` ($2 / $10 per 1M tokens), `claude-mythos-5-1` and `claude-mythos-5`
+  (priced like Fable 5.1 and Fable 5), `gpt-6.1-sol` ($2 / $10, cached input $0.10),
+  `gpt-6-sol` ($2 / $10, cached input $0.20), `gpt-6-luna` ($0.10 / $0.50),
+  `gpt-5.3-codex` and `gpt-5.2` ($1.75 / $14). The GPT-6 models carry the same 272K
+  long-context tier as `gpt-6-astra`. Their usage was previously counted but reported as
+  `unpriced`. `codex-auto-review` stays unpriced: OpenAI publishes no rate for it.
+
+### Changed
+
+- **GPT-5.6 Terra and Luna use their current rates.** `gpt-5.6-terra` is now $2 / $12 and
+  `gpt-5.6-luna` $0.20 / $1.20 per 1M tokens, the standing prices since late July 2026.
+  `gpt-5.6-sol` keeps its $5 / $30 launch rate rather than the temporary $4 / $20
+  promotional rate, because the table has no effective dates.
 
 ## [2.6.0] - 2026-09-24
 
